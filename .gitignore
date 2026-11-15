@@ -1,0 +1,28 @@
+# 构建产物
+build-mingw/
+build/
+out/
+
+# 中间文件
+*.o
+*.d
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# 可执行 / 静态库
+*.exe
+*.a
+*.dll
+*.so
+*.dylib
+
+# 编辑器 / 系统
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
