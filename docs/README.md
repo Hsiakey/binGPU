@@ -6,6 +6,7 @@
 | [abi.md](abi.md) | 句柄 / `struct_size` / 错误 / 线程与所有权 / 生命周期 / 为什么没有回调 | 绑定作者、上层作者 |
 | [raster_rules.md](raster_rules.md) | 光栅规则：顶点变换、top-left、插值、采样、混合、深度、回读 | 写后端的、写像素测试的 |
 | [backends.md](backends.md) | 后端现状表、CPU 的取舍、VK/D3D12 的开工顺序与条件、GL 为什么不迁、欠账 | 规划的人、写新后端的人 |
+| [perf.md](perf.md) | CPU 后端的吞吐基线、每条优化的收益、未做项与原因、校验和 | 要动内层循环的人 |
 
 ## 读的顺序
 

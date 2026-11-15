@@ -15,6 +15,7 @@
 # 目标：
 #   all        静态库 + 测试 + 工具
 #   test       编好后逐个跑，任何失败非 0 退出（CI 就认这个）
+#   bench      固定场景的 CPU 后端吞吐基准（同时打印像素校验和，见 docs/perf.md）
 #   abi-check  ①纯 C 编译器单独编 include/bingpu.h（混进 C++ 语法当场炸）
 #              ②grep 守规矩：头里不许 C++ 类型/命名空间/容器头
 #              ③冒烟：C 目标文件 + C++ 静态库能被 g++ 链接成可执行并跑起来
@@ -55,6 +56,10 @@ LIB_SRCS := $(wildcard $(SRC_DIR)/*.cpp)
 LIB_OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(LIB_SRCS))
 LIB_A    := $(BUILD_DIR)/libbingpu.a
 
+# 只给 CPU 后端的热循环开 -O3：其余文件都是冷路径（句柄表 / 校验 / 注册表），
+# -O3 在那里的收益是 0，只换来更长的编译时间。0.2.1 量过：-O3 让纹理路径再快 ~20%。
+$(OBJ_DIR)/bingpu_cpu.o: CXXFLAGS += -O3
+
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(INC_DIR) -I$(SRC_DIR) -c $< -o $@
@@ -80,7 +85,7 @@ $(TEST_DIR)/%$(EXT): $(OBJ_DIR)/tests/%.o $(LIB_A)
 # =============================================
 # 工具（同样是 C 源码）
 # =============================================
-TOOL_BINS := $(BIN_DIR)/bingpu_info$(EXT)
+TOOL_BINS := $(BIN_DIR)/bingpu_info$(EXT) $(BIN_DIR)/bingpu_bench$(EXT)
 
 $(OBJ_DIR)/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
@@ -93,9 +98,13 @@ $(BIN_DIR)/%$(EXT): $(OBJ_DIR)/tools/%.o $(LIB_A)
 # =============================================
 # 目标
 # =============================================
-.PHONY: all test abi-check clean
+.PHONY: all test bench abi-check clean
 
 all: $(LIB_A) $(TEST_BINS) $(TOOL_BINS)
+
+# 基准：固定场景 + 校验和（见 tools/bingpu_bench.c 的文件头）
+bench: $(BIN_DIR)/bingpu_bench$(EXT)
+	@./$(BIN_DIR)/bingpu_bench$(EXT)
 
 test: $(TEST_BINS)
 	@fail=0; \

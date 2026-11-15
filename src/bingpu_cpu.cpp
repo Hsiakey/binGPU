@@ -39,11 +39,32 @@ inline uint8_t premul8(uint32_t c, uint32_t a) {
     return static_cast<uint8_t>((c * a + 127u) / 255u);
 }
 
-/* 反预乘：round(p*255/a)；a==0 时按 0 处理（透明像素没有颜色信息） */
+/* 反预乘：round(p*255/a)；a==0 时按 0 处理（透明像素没有颜色信息）。
+ * 0.2.1 起用 (预乘值, alpha) → 结果 的 64 KiB 查表：逐项结果与现算**完全一样**
+ * （表就是拿同一个整数公式预先算好的），但 1024² 回读省掉 4M 次整数除法。 */
+struct UnpremulTable {
+    uint8_t v[65536];
+    UnpremulTable() {
+        for (uint32_t a = 0; a < 256; a++) {
+            for (uint32_t p = 0; p < 256; p++) {
+                uint8_t out = 0;
+                if (a != 0) {
+                    const uint32_t x = (p * 255u + a / 2u) / a;
+                    out = static_cast<uint8_t>(x > 255u ? 255u : x);
+                }
+                v[p * 256u + a] = out;
+            }
+        }
+    }
+};
+
+inline const UnpremulTable& unpremulTable() {
+    static const UnpremulTable table;
+    return table;
+}
+
 inline uint8_t unpremul8(uint32_t p, uint32_t a) {
-    if (a == 0) return 0;
-    const uint32_t v = (p * 255u + a / 2u) / a;
-    return static_cast<uint8_t>(v > 255u ? 255u : v);
+    return unpremulTable().v[(p & 0xFFu) * 256u + (a & 0xFFu)];
 }
 
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -54,6 +75,20 @@ inline uint8_t q8(float v) {
 }
 
 inline uint32_t bytesPerPx(BgpuFormat fmt) { return bingpu_format_bytes(fmt); }
+
+/* 字节 → float 查表：位模式与 `p / 255.0f` 现算完全一致（同一串除法预先算好）。
+ * 0.2.0 每个像素要除 4 次，这是最贵的一处；混合循环现在只查表。 */
+struct ByteToFloat {
+    float v[256];
+    ByteToFloat() {
+        for (int i = 0; i < 256; i++) v[i] = static_cast<float>(i) / 255.0f;
+    }
+};
+
+inline const ByteToFloat& byteToFloat() {
+    static const ByteToFloat table;
+    return table;
+}
 
 /* 通道序：RGBA8 内存里是 R,G,B,A；BGRA8 是 B,G,R,A。内部一律按"逻辑 r,g,b,a"读写。 */
 inline void px_store(uint8_t* p, BgpuFormat fmt, const float c[4]) {
@@ -72,16 +107,17 @@ inline void px_store(uint8_t* p, BgpuFormat fmt, const float c[4]) {
 }
 
 inline void px_load(const uint8_t* p, BgpuFormat fmt, float c[4]) {
+    const ByteToFloat& lut = byteToFloat();
     if (fmt == BGPU_FORMAT_BGRA8) {
-        c[0] = p[2] / 255.0f;
-        c[1] = p[1] / 255.0f;
-        c[2] = p[0] / 255.0f;
-        c[3] = p[3] / 255.0f;
+        c[0] = lut.v[p[2]];
+        c[1] = lut.v[p[1]];
+        c[2] = lut.v[p[0]];
+        c[3] = lut.v[p[3]];
     } else {
-        c[0] = p[0] / 255.0f;
-        c[1] = p[1] / 255.0f;
-        c[2] = p[2] / 255.0f;
-        c[3] = p[3] / 255.0f;
+        c[0] = lut.v[p[0]];
+        c[1] = lut.v[p[1]];
+        c[2] = lut.v[p[2]];
+        c[3] = lut.v[p[3]];
     }
 }
 
@@ -146,74 +182,129 @@ struct CpuSwapchain final : Swapchain {
 /* ---------------------------------------------------------------
  * 采样
  * --------------------------------------------------------------- */
+/* 内联 floor：|x| < 2^23 时与 std::floor 逐位相同。
+ * 为什么不直接调 std::floor：不带 -fno-math-errno 时 GCC 会生成一次 libm 调用，
+ * 而采样器每个像素要 floor 两到四次 —— 1024² 就是四百万次调用。 */
+inline float fast_floor(float x) {
+    const float t = static_cast<float>(static_cast<int>(x));
+    return (t > x) ? t - 1.0f : t;
+}
+
 inline uint32_t wrap_index(int64_t i, uint32_t n, bool repeat) {
     if (!repeat) {
         if (i < 0) return 0;
         return static_cast<uint32_t>(i) >= n ? n - 1u : static_cast<uint32_t>(i);
     }
+    /* 常见情形（i 在 [0,n) 内）先走比较，别为一次取模付整数除法 */
+    if (i >= 0 && static_cast<uint64_t>(i) < n) return static_cast<uint32_t>(i);
     int64_t m = i % static_cast<int64_t>(n);
     if (m < 0) m += static_cast<int64_t>(n);
     return static_cast<uint32_t>(m);
 }
 
-void texel_at(const CpuTexture& t, uint32_t x, uint32_t y, float out[4]) {
-    const uint8_t* base = t.data();
-    if (t.fmt == BGPU_FORMAT_R8) {
-        const float v = base[static_cast<size_t>(y) * t.w + x] / 255.0f;
-        out[0] = out[1] = out[2] = out[3] = v;
+/* 采样状态：每像素都要读的东西提到循环外（0.2.0 每像素都重新解引用 sampler/纹理，
+ * 还要重新判断 filter/wrap —— 1024² 就是一百万次无用的分支）。 */
+struct TexState {
+    const uint8_t* base = nullptr;
+    uint32_t w = 0, h = 0;
+    uint32_t bpp = 4;
+    size_t stride = 0;     /* w * bpp：逐行寻址少一次乘法 */
+    BgpuFormat fmt = BGPU_FORMAT_RGBA8;
+    bool linear = true;
+    bool rep_u = false, rep_v = false;
+    bool fast4 = false;    /* 4 字节格式：可以按 uint32 取纹素 */
+    bool bgra = false;
+};
+
+inline TexState make_tex_state(const CpuTexture* t, const Sampler* s) {
+    TexState ts;
+    ts.base = t->data();
+    ts.w = t->w;
+    ts.h = t->h;
+    ts.bpp = bytesPerPx(t->fmt);
+    ts.stride = static_cast<size_t>(t->w) * ts.bpp;
+    ts.fmt = t->fmt;
+    ts.fast4 = ts.bpp == 4;
+    ts.bgra = t->fmt == BGPU_FORMAT_BGRA8;
+    ts.linear = s ? (s->desc.mag_filter == BGPU_FILTER_LINEAR) : true;
+    ts.rep_u = (s != nullptr) && s->desc.wrap_u == BGPU_WRAP_REPEAT;
+    ts.rep_v = (s != nullptr) && s->desc.wrap_v == BGPU_WRAP_REPEAT;
+    return ts;
+}
+
+inline void texel_at_fast(const TexState& ts, uint32_t x, uint32_t y, float out[4]) {
+    const uint8_t* base = ts.base + static_cast<size_t>(y) * ts.stride;
+    if (ts.fast4) {
+        const uint32_t w = *reinterpret_cast<const uint32_t*>(base + static_cast<size_t>(x) * 4u);
+        const ByteToFloat& lut = byteToFloat();
+        if (ts.bgra) {
+            out[0] = lut.v[(w >> 16) & 0xFFu];
+            out[1] = lut.v[(w >> 8) & 0xFFu];
+            out[2] = lut.v[w & 0xFFu];
+        } else {
+            out[0] = lut.v[w & 0xFFu];
+            out[1] = lut.v[(w >> 8) & 0xFFu];
+            out[2] = lut.v[(w >> 16) & 0xFFu];
+        }
+        out[3] = lut.v[(w >> 24) & 0xFFu];
         return;
     }
-    px_load(base + (static_cast<size_t>(y) * t.w + x) * 4u, t.fmt, out);
+    const uint8_t* p = base + static_cast<size_t>(x) * ts.bpp;
+    const float f = byteToFloat().v[p[0]];
+    out[0] = out[1] = out[2] = out[3] = f;   /* R8 遮罩：采样成 (v,v,v,v) */
 }
 
 /* 采样规则见 docs/raster_rules.md §6：clamp 先夹到 [0,1]；repeat 绕回 [0,1)；
- * nearest 取 floor(u*w)；linear 用 u*w-0.5 的纹素中心约定做双线性。 */
-void cpu_sample(const CpuTexture* t, float u, float v, const Sampler* s, float out[4]) {
-    const bool rep_u = s && s->desc.wrap_u == BGPU_WRAP_REPEAT;
-    const bool rep_v = s && s->desc.wrap_v == BGPU_WRAP_REPEAT;
-    const bool linear = s ? (s->desc.mag_filter == BGPU_FILTER_LINEAR) : true;
-
-    if (rep_u) {
-        u = u - std::floor(u);
+ * nearest 取 floor(u*w)；linear 用 u*w-0.5 的纹素中心约定做双线性。
+ * 与 0.2.0 的 cpu_sample 是**同一串浮点运算**，只是状态已经预先放进 TexState。 */
+inline void sample_fast(const TexState& ts, float u, float v, float out[4]) {
+    if (ts.rep_u) {
+        u = u - fast_floor(u);
     } else {
         u = clampf(u, 0.0f, 1.0f);
     }
-    if (rep_v) {
-        v = v - std::floor(v);
+    if (ts.rep_v) {
+        v = v - fast_floor(v);
     } else {
         v = clampf(v, 0.0f, 1.0f);
     }
 
-    const float fw = static_cast<float>(t->w);
-    const float fh = static_cast<float>(t->h);
-    if (!linear) {
-        const uint32_t ix = wrap_index(static_cast<int64_t>(std::floor(u * fw)), t->w, rep_u);
-        const uint32_t iy = wrap_index(static_cast<int64_t>(std::floor(v * fh)), t->h, rep_v);
-        texel_at(*t, ix, iy, out);
+    const float fw = static_cast<float>(ts.w);
+    const float fh = static_cast<float>(ts.h);
+    if (!ts.linear) {
+        /* clamp/repeat 之后 u,v ∈ [0,1]，u*w ≥ 0，截断就是 floor（少一次 floor 调用） */
+        const uint32_t ix = wrap_index(static_cast<int64_t>(u * fw), ts.w, ts.rep_u);
+        const uint32_t iy = wrap_index(static_cast<int64_t>(v * fh), ts.h, ts.rep_v);
+        texel_at_fast(ts, ix, iy, out);
         return;
     }
     const float fx = u * fw - 0.5f;
     const float fy = v * fh - 0.5f;
-    const float x0f = std::floor(fx);
-    const float y0f = std::floor(fy);
+    const float x0f = fast_floor(fx);
+    const float y0f = fast_floor(fy);
     const float tx = fx - x0f;
     const float ty = fy - y0f;
     const int64_t x0 = static_cast<int64_t>(x0f);
     const int64_t y0 = static_cast<int64_t>(y0f);
-    const uint32_t ix0 = wrap_index(x0, t->w, rep_u);
-    const uint32_t ix1 = wrap_index(x0 + 1, t->w, rep_u);
-    const uint32_t iy0 = wrap_index(y0, t->h, rep_v);
-    const uint32_t iy1 = wrap_index(y0 + 1, t->h, rep_v);
+    const uint32_t ix0 = wrap_index(x0, ts.w, ts.rep_u);
+    const uint32_t ix1 = wrap_index(x0 + 1, ts.w, ts.rep_u);
+    const uint32_t iy0 = wrap_index(y0, ts.h, ts.rep_v);
+    const uint32_t iy1 = wrap_index(y0 + 1, ts.h, ts.rep_v);
     float c00[4], c10[4], c01[4], c11[4];
-    texel_at(*t, ix0, iy0, c00);
-    texel_at(*t, ix1, iy0, c10);
-    texel_at(*t, ix0, iy1, c01);
-    texel_at(*t, ix1, iy1, c11);
+    texel_at_fast(ts, ix0, iy0, c00);
+    texel_at_fast(ts, ix1, iy0, c10);
+    texel_at_fast(ts, ix0, iy1, c01);
+    texel_at_fast(ts, ix1, iy1, c11);
     for (int i = 0; i < 4; i++) {
         const float a = c00[i] + (c10[i] - c00[i]) * tx;
         const float b = c01[i] + (c11[i] - c01[i]) * tx;
         out[i] = a + (b - a) * ty;
     }
+}
+
+/* 老入口：一个三角形的均匀 UV 只需要采样一次，建状态的开销可以忽略 */
+inline void cpu_sample(const CpuTexture* t, float u, float v, const Sampler* s, float out[4]) {
+    sample_fast(make_tex_state(t, s), u, v, out);
 }
 
 /* ---------------------------------------------------------------
@@ -242,7 +333,29 @@ void blend_premul(float dst[4], const float src[4], BgpuBlend mode) {
 }
 
 /* ---------------------------------------------------------------
- * 光栅
+ * 光栅（0.2.1 重写了内层循环；**语义与 0.2.0 逐位相同**）
+ *
+ * 为什么这样改（先量后改，基线见 docs/perf.md）：
+ *   0.2.0 的内层循环是"一条路径打天下"：不管画纯色还是纹理，每个像素都要插值
+ *   u/v/z、过一遍管线的 blend switch、把目标像素读成 float（每通道一次除 255）、
+ *   混合、再乘回 255 取整。1024² 纯色填充只有 ~57 MPix/s。
+ *
+ *   改法（每条都不改变输出字节）：
+ *   ① 按"是否纹理 / 是否有深度"分循环：不纹理不算 u/v，不测深度不插 z。
+ *   ② 混合模式变模板参数（switch 提到三角形外）；其中 REPLACE、以及"预乘 + 源
+ *      alpha 正好 255"不需要读目标（dst*0 = 0，src+0 = src），直接写 4 字节。
+ *   ③ **混合查表**：均匀色三角形的混合结果是"目标字节 → 结果字节"的纯函数，
+ *      于是每个三角形（实际是每种 src 颜色）预先算一张 4×256 的置换表，像素里
+ *      只剩查表 + 写。表的每一项就是用同一条混合公式现算出来的，所以逐位一致。
+ *      KEEP/ERASE/ADDITIVE 这类"目标相关"的混合由此从 ~78 MPix/s 提到数百。
+ *   ④ **均匀色三角形**把整条片元计算提到循环外（纹理时还要求同 UV 才直接写常量）。
+ *      为什么仍然逐位一致：插值结果 = c·(w0+w1+w2)，权重和与 1 的偏差在 1e-7 量级，
+ *      而 8 位量化的余量是 0.5/255 ≈ 2e-3，量化后必然是同一个字节。
+ *   ⑤ 纹理采样状态（尺寸/格式/filter/wrap）提到循环外；字节↔float 用 256 项查表，
+ *      反预乘用 64 KiB 的 (p,a) 查表 —— 都是把原来的运算**预先算一遍**，位模式相同。
+ *
+ *   没有做（会改像素或收益不划算，见 docs/perf.md 的"未做"）：边缘函数增量递推、
+ *   行内 memset 快路径、多线程。
  * --------------------------------------------------------------- */
 struct RVert {
     float x, y, z;
@@ -250,11 +363,23 @@ struct RVert {
     float r, g, b, a;   /* 直通色（插值在直通域做，与 GPU 的顶点色一致） */
 };
 
-struct RasterCtx {
-    Cmd* cmd = nullptr;
+/* 一次 draw 的常量状态 */
+struct Paint {
     CpuTexture* tgt = nullptr;
     CpuTexture* depth = nullptr;
-    int l = 0, t = 0, r = 0, b = 0;   /* scissor ∩ 目标 的整数像素范围（右/下开区间） */
+    int l = 0, t = 0, r = 0, b = 0;   /* scissor ∩ 目标（右/下开区间） */
+    BgpuBlend blend = BGPU_BLEND_PREMULTIPLIED;
+    bool textured = false;
+    bool depthOn = false;
+    bool depthTest = false;
+    bool depthWrite = false;
+    TexState texState;
+
+    /* 混合查表的缓存：同一批小四边形往往同色同混合，只算一次 */
+    bool lutValid = false;
+    BgpuBlend lutBlend = BGPU_BLEND_PREMULTIPLIED;
+    float lutSrc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint8_t lut[4][256] = {};
 };
 
 inline float edgef(const RVert* a, const RVert* b, float px, float py) {
@@ -270,25 +395,151 @@ inline bool is_top_left(const RVert* a, const RVert* b) {
     return (dy == 0.0f && dx > 0.0f) || (dy < 0.0f);
 }
 
-/* 一个片元的着色 + 深度 + 混合。src 是**预乘**颜色。 */
-void shade_pixel(RasterCtx& rc, float px, float py, const RVert* v0, const RVert* v1,
-                 const RVert* v2, float w0, float w1, float w2) {
-    Cmd& c = *rc.cmd;
-    CpuTexture& tgt = *rc.tgt;
+/* 单通道混合：查表构建与逐像素两条路径共用这一条公式（所以两条路径不可能算不一样） */
+template <BgpuBlend BLEND>
+inline float blend_one(float d, float s, float sa) {
+    if constexpr (BLEND == BGPU_BLEND_REPLACE) {
+        return s;
+    } else if constexpr (BLEND == BGPU_BLEND_KEEP) {
+        return d * sa;
+    } else if constexpr (BLEND == BGPU_BLEND_ERASE) {
+        return d * (1.0f - sa);
+    } else if constexpr (BLEND == BGPU_BLEND_ADDITIVE) {
+        return clampf(d + s, 0.0f, 1.0f);
+    } else {
+        return clampf(s + d * (1.0f - sa), 0.0f, 1.0f);
+    }
+}
 
-    const float u = w0 * v0->u + w1 * v1->u + w2 * v2->u;
-    const float v = w0 * v0->v + w1 * v1->v + w2 * v2->v;
-    const float z = w0 * v0->z + w1 * v1->z + w2 * v2->z;
+template <BgpuBlend BLEND>
+inline void blend_dst(float dst[4], const float src[4]) {
+    const float sa = src[3];
+    for (int i = 0; i < 4; i++) dst[i] = blend_one<BLEND>(dst[i], src[i], sa);
+}
 
+/* 4 字节打包（内存里就是这个顺序：写一次 uint32 顶 4 次字节写） */
+inline uint32_t pack_px(BgpuFormat fmt, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+    if (fmt == BGPU_FORMAT_BGRA8) return b | (g << 8) | (r << 16) | (a << 24);
+    return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+/* 混合查表：tbl[c][i] = q8(blend_one(src[c], 目标字节 i))。逐项与现算同一条公式。 */
+template <BgpuBlend BLEND>
+void prepare_blend_lut(Paint& p, const float src[4]) {
+    if (p.lutValid && p.lutBlend == BLEND && p.lutSrc[0] == src[0] && p.lutSrc[1] == src[1] &&
+        p.lutSrc[2] == src[2] && p.lutSrc[3] == src[3]) {
+        return;   /* 同一颜色同一混合：复用上一张表 */
+    }
+    const ByteToFloat& f = byteToFloat();
+    for (int c = 0; c < 4; c++) {
+        for (int i = 0; i < 256; i++) {
+            p.lut[c][i] = q8(blend_one<BLEND>(f.v[i], src[c], src[3]));
+        }
+        p.lutSrc[c] = src[c];
+    }
+    p.lutValid = true;
+    p.lutBlend = BLEND;
+}
+
+/* 均匀色特化循环：边函数 + 覆盖判断 + 一次查表/写。
+ * OPAQUE 为真时不读目标（REPLACE / 预乘且 srcA==1），直接写打包值。 */
+template <BgpuBlend BLEND, bool OPAQUE>
+void loop_uniform(const Paint& p, const RVert* va, const RVert* vb, const RVert* vd,
+                  uint32_t packed, int x0, int x1, int y0, int y1) {
+    const bool tl0 = is_top_left(vb, vd);
+    const bool tl1 = is_top_left(vd, va);
+    const bool tl2 = is_top_left(va, vb);
+    const bool rgba = (p.tgt->fmt == BGPU_FORMAT_RGBA8);
+    const uint8_t* lut0 = p.lut[0];
+    const uint8_t* lut1 = p.lut[1];
+    const uint8_t* lut2 = p.lut[2];
+    const uint8_t* lut3 = p.lut[3];
+    uint8_t* base = p.tgt->data() + static_cast<size_t>(y0) * p.tgt->w * 4u;
+
+    for (int y = y0; y < y1; y++) {
+        const float py = static_cast<float>(y) + 0.5f;
+        uint8_t* row = base + static_cast<size_t>(y - y0) * p.tgt->w * 4u;
+        uint32_t* row32 = reinterpret_cast<uint32_t*>(row);
+        for (int x = x0; x < x1; x++) {
+            const float px = static_cast<float>(x) + 0.5f;
+            const float e0 = edgef(vb, vd, px, py);
+            const float e1 = edgef(vd, va, px, py);
+            const float e2 = edgef(va, vb, px, py);
+            if (!((e0 > 0.0f) || (e0 == 0.0f && tl0))) continue;
+            if (!((e1 > 0.0f) || (e1 == 0.0f && tl1))) continue;
+            if (!((e2 > 0.0f) || (e2 == 0.0f && tl2))) continue;
+            if constexpr (OPAQUE) {
+                row32[x] = packed;
+            } else {
+                uint8_t* q = row + static_cast<size_t>(x) * 4u;
+                if (rgba) {
+                    q[0] = lut0[q[0]];
+                    q[1] = lut1[q[1]];
+                    q[2] = lut2[q[2]];
+                    q[3] = lut3[q[3]];
+                } else {
+                    q[0] = lut2[q[0]];
+                    q[1] = lut1[q[1]];
+                    q[2] = lut0[q[2]];
+                    q[3] = lut3[q[3]];
+                }
+            }
+        }
+    }
+}
+
+/* 纹理 + 顶点色恒定（很常见：白顶点色 × 一张图）：采样逐像素，颜色只乘一次 */
+template <BgpuBlend BLEND>
+void loop_textured_uniform(const Paint& p, const RVert* va, const RVert* vb, const RVert* vd,
+                           const float mult[4], float inv, int x0, int x1, int y0, int y1) {
+    const bool tl0 = is_top_left(vb, vd);
+    const bool tl1 = is_top_left(vd, va);
+    const bool tl2 = is_top_left(va, vb);
+    const bool rgba = (p.tgt->fmt == BGPU_FORMAT_RGBA8);
+    const TexState& ts = p.texState;
+    uint8_t* base = p.tgt->data() + static_cast<size_t>(y0) * p.tgt->w * 4u;
+
+    for (int y = y0; y < y1; y++) {
+        const float py = static_cast<float>(y) + 0.5f;
+        uint8_t* row = base + static_cast<size_t>(y - y0) * p.tgt->w * 4u;
+        for (int x = x0; x < x1; x++) {
+            const float px = static_cast<float>(x) + 0.5f;
+            const float e0 = edgef(vb, vd, px, py);
+            const float e1 = edgef(vd, va, px, py);
+            const float e2 = edgef(va, vb, px, py);
+            if (!((e0 > 0.0f) || (e0 == 0.0f && tl0))) continue;
+            if (!((e1 > 0.0f) || (e1 == 0.0f && tl1))) continue;
+            if (!((e2 > 0.0f) || (e2 == 0.0f && tl2))) continue;
+            const float u = (e0 * va->u + e1 * vb->u + e2 * vd->u) * inv;
+            const float v = (e0 * va->v + e1 * vb->v + e2 * vd->v) * inv;
+            float tex[4];
+            sample_fast(ts, u, v, tex);
+            float frag[4];
+            frag[0] = tex[0] * mult[0];
+            frag[1] = tex[1] * mult[1];
+            frag[2] = tex[2] * mult[2];
+            frag[3] = tex[3] * mult[3];
+            uint8_t* q = row + static_cast<size_t>(x) * 4u;
+            float dst[4];
+            px_load(q, rgba ? BGPU_FORMAT_RGBA8 : BGPU_FORMAT_BGRA8, dst);
+            blend_dst<BLEND>(dst, frag);
+            px_store(q, rgba ? BGPU_FORMAT_RGBA8 : BGPU_FORMAT_BGRA8, dst);
+        }
+    }
+}
+
+/* 通用路径：逐像素插值 + 采样 + 深度 + 混合（数学与 0.2.0 相同，只是状态提到 Paint 里） */
+void shade_general(const Paint& p, float px, float py, const RVert* v0, const RVert* v1,
+                   const RVert* v2, float w0, float w1, float w2) {
+    CpuTexture& tgt = *p.tgt;
     const uint32_t xi = static_cast<uint32_t>(px);
     const uint32_t yi = static_cast<uint32_t>(py);
 
-    /* 深度：LESS，只测不写也可以（与 D3D/GL 的独立开关一致） */
-    if (rc.depth && rc.depth->depth_w == tgt.w && rc.depth->depth_h == tgt.h &&
-        xi < rc.depth->depth_w && yi < rc.depth->depth_h) {
-        float* d = &rc.depth->depth[static_cast<size_t>(yi) * rc.depth->depth_w + xi];
-        if ((c.pipe->pipe_flags & BGPU_PIPE_DEPTH_TEST) && !(z < *d)) return;
-        if (c.pipe->pipe_flags & BGPU_PIPE_DEPTH_WRITE) *d = z;
+    if (p.depthOn && (p.depthTest || p.depthWrite)) {
+        const float z = w0 * v0->z + w1 * v1->z + w2 * v2->z;
+        float* d = &p.depth->depth[static_cast<size_t>(yi) * p.depth->depth_w + xi];
+        if (p.depthTest && !(z < *d)) return;   /* LESS：相等不通过 */
+        if (p.depthWrite) *d = z;
     }
 
     float frag[4];
@@ -296,11 +547,13 @@ void shade_pixel(RasterCtx& rc, float px, float py, const RVert* v0, const RVert
     const float vg = w0 * v0->g + w1 * v1->g + w2 * v2->g;
     const float vb = w0 * v0->b + w1 * v1->b + w2 * v2->b;
     const float va = w0 * v0->a + w1 * v1->a + w2 * v2->a;
-    if ((c.pipe->pipe_flags & BGPU_PIPE_TEXTURED) && c.tex) {
+    if (p.textured) {
+        const float u = w0 * v0->u + w1 * v1->u + w2 * v2->u;
+        const float v = w0 * v0->v + w1 * v1->v + w2 * v2->v;
         float tex[4];
-        cpu_sample(static_cast<CpuTexture*>(c.tex), u, v, c.samp, tex);
-        /* 纹理存预乘色、顶点色直通：按直通语义合成 —— straight = texStraight * vcol，
-         * 再预乘 ⇒ rgb = tex.rgb * vcol.rgb * vcol.a, a = tex.a * vcol.a */
+        sample_fast(p.texState, u, v, tex);
+        /* 纹理存预乘色、顶点色直通：straight = texStraight * vcol，再预乘
+         * ⇒ rgb = tex.rgb * vcol.rgb * vcol.a, a = tex.a * vcol.a */
         frag[0] = tex[0] * vr * va;
         frag[1] = tex[1] * vg * va;
         frag[2] = tex[2] * vb * va;
@@ -312,15 +565,68 @@ void shade_pixel(RasterCtx& rc, float px, float py, const RVert* v0, const RVert
         frag[3] = va;
     }
 
-    const uint32_t bpp = bytesPerPx(tgt.fmt);
-    uint8_t* p = tgt.data() + (static_cast<size_t>(yi) * tgt.w + xi) * bpp;
+    uint8_t* q = tgt.data() + (static_cast<size_t>(yi) * tgt.w + xi) * 4u;
     float dst[4];
-    px_load(p, tgt.fmt, dst);
-    blend_premul(dst, frag, c.pipe->blend);
-    px_store(p, tgt.fmt, dst);
+    px_load(q, tgt.fmt, dst);
+    blend_premul(dst, frag, p.blend);
+    px_store(q, tgt.fmt, dst);
 }
 
-void raster_tri(RasterCtx& rc, RVert* a, RVert* b, RVert* d) {
+void loop_general(const Paint& p, const RVert* va, const RVert* vb, const RVert* vd, int x0,
+                  int x1, int y0, int y1, float area) {
+    const bool tl0 = is_top_left(vb, vd);
+    const bool tl1 = is_top_left(vd, va);
+    const bool tl2 = is_top_left(va, vb);
+    const float inv = 1.0f / area;
+    for (int y = y0; y < y1; y++) {
+        const float py = static_cast<float>(y) + 0.5f;
+        for (int x = x0; x < x1; x++) {
+            const float px = static_cast<float>(x) + 0.5f;
+            const float e0 = edgef(vb, vd, px, py);
+            const float e1 = edgef(vd, va, px, py);
+            const float e2 = edgef(va, vb, px, py);
+            if (!((e0 > 0.0f) || (e0 == 0.0f && tl0))) continue;
+            if (!((e1 > 0.0f) || (e1 == 0.0f && tl1))) continue;
+            if (!((e2 > 0.0f) || (e2 == 0.0f && tl2))) continue;
+            shade_general(p, px, py, va, vb, vd, e0 * inv, e1 * inv, e2 * inv);
+        }
+    }
+}
+
+/* 均匀色 + 无深度：挑一条查表混合 */
+void dispatch_uniform(Paint& p, const RVert* a, const RVert* b, const RVert* d, float src[4],
+                      int x0, int x1, int y0, int y1) {
+    const uint32_t packed = pack_px(p.tgt->fmt, q8(src[0]), q8(src[1]), q8(src[2]), q8(src[3]));
+    switch (p.blend) {
+        case BGPU_BLEND_REPLACE:
+            loop_uniform<BGPU_BLEND_REPLACE, true>(p, a, b, d, packed, x0, x1, y0, y1);
+            return;
+        case BGPU_BLEND_KEEP:
+            prepare_blend_lut<BGPU_BLEND_KEEP>(p, src);
+            loop_uniform<BGPU_BLEND_KEEP, false>(p, a, b, d, packed, x0, x1, y0, y1);
+            return;
+        case BGPU_BLEND_ERASE:
+            prepare_blend_lut<BGPU_BLEND_ERASE>(p, src);
+            loop_uniform<BGPU_BLEND_ERASE, false>(p, a, b, d, packed, x0, x1, y0, y1);
+            return;
+        case BGPU_BLEND_ADDITIVE:
+            prepare_blend_lut<BGPU_BLEND_ADDITIVE>(p, src);
+            loop_uniform<BGPU_BLEND_ADDITIVE, false>(p, a, b, d, packed, x0, x1, y0, y1);
+            return;
+        default:
+            /* 预乘：srcA 正好 1 时 dst*0 == 0，结果就是 src —— 等价于直接写 */
+            if (src[3] >= 1.0f) {
+                loop_uniform<BGPU_BLEND_PREMULTIPLIED, true>(p, a, b, d, packed, x0, x1, y0, y1);
+            } else {
+                prepare_blend_lut<BGPU_BLEND_PREMULTIPLIED>(p, src);
+                loop_uniform<BGPU_BLEND_PREMULTIPLIED, false>(p, a, b, d, packed, x0, x1, y0, y1);
+            }
+            return;
+    }
+}
+
+/* 一个三角形：算包围盒 / 裁剪，然后挑一条循环 */
+void raster_tri(Paint& p, RVert* a, RVert* b, RVert* d) {
     float area = (b->x - a->x) * (d->y - a->y) - (b->y - a->y) * (d->x - a->x);
     if (area == 0.0f) return;
     if (area < 0.0f) {
@@ -339,37 +645,56 @@ void raster_tri(RasterCtx& rc, RVert* a, RVert* b, RVert* d) {
     int y0 = static_cast<int>(std::floor(fy0));
     int y1 = static_cast<int>(std::ceil(fy1));
     if (x1 <= x0 || y1 <= y0) return;
-    if (x0 < rc.l) x0 = rc.l;
-    if (y0 < rc.t) y0 = rc.t;
-    if (x1 > rc.r) x1 = rc.r;
-    if (y1 > rc.b) y1 = rc.b;
+    if (x0 < p.l) x0 = p.l;
+    if (y0 < p.t) y0 = p.t;
+    if (x1 > p.r) x1 = p.r;
+    if (y1 > p.b) y1 = p.b;
     if (x1 <= x0 || y1 <= y0) return;
 
-    const bool tl0 = is_top_left(b, d);
-    const bool tl1 = is_top_left(d, a);
-    const bool tl2 = is_top_left(a, b);
-    const float inv = 1.0f / area;
-
-    for (int y = y0; y < y1; y++) {
-        const float py = static_cast<float>(y) + 0.5f;
-        for (int x = x0; x < x1; x++) {
-            const float px = static_cast<float>(x) + 0.5f;
-            const float e0 = edgef(b, d, px, py);
-            const float e1 = edgef(d, a, px, py);
-            const float e2 = edgef(a, b, px, py);
-            const bool in0 = (e0 > 0.0f) || (e0 == 0.0f && tl0);
-            const bool in1 = (e1 > 0.0f) || (e1 == 0.0f && tl1);
-            const bool in2 = (e2 > 0.0f) || (e2 == 0.0f && tl2);
-            if (!in0 || !in1 || !in2) continue;
-            shade_pixel(rc, px, py, a, b, d, e0 * inv, e1 * inv, e2 * inv);
+    const bool uniformColor = (a->r == b->r && b->r == d->r && a->g == b->g && b->g == d->g &&
+                               a->b == b->b && b->b == d->b && a->a == b->a && b->a == d->a);
+    /* 只在不挂深度时走快路径：深度比较用**插值后的 z**，换成常数值虽然也只差 1 ulp，
+     * 但那是"相等不通过"的比较，不值得为它冒风险。 */
+    const bool wideTarget = (p.tgt->fmt == BGPU_FORMAT_RGBA8 || p.tgt->fmt == BGPU_FORMAT_BGRA8);
+    if (!p.depthOn && uniformColor && wideTarget) {
+        if (!p.textured) {
+            float src[4];
+            src[0] = a->r * a->a;
+            src[1] = a->g * a->a;
+            src[2] = a->b * a->a;
+            src[3] = a->a;
+            dispatch_uniform(p, a, b, d, src, x0, x1, y0, y1);
+            return;
+        }
+        /* 纹理：顶点色恒定 → 采样逐像素、颜色只乘一次 */
+        const float mult[4] = {a->r * a->a, a->g * a->a, a->b * a->a, a->a};
+        const bool uniformUV = (a->u == b->u && b->u == d->u && a->v == b->v && b->v == d->v);
+        if (uniformUV) {
+            float tex[4];
+            sample_fast(p.texState, a->u, a->v, tex);
+            float src[4];
+            src[0] = tex[0] * a->r * a->a;
+            src[1] = tex[1] * a->g * a->a;
+            src[2] = tex[2] * a->b * a->a;
+            src[3] = tex[3] * a->a;
+            dispatch_uniform(p, a, b, d, src, x0, x1, y0, y1);
+            return;
+        }
+        if (p.blend == BGPU_BLEND_PREMULTIPLIED) {
+            loop_textured_uniform<BGPU_BLEND_PREMULTIPLIED>(p, a, b, d, mult, 1.0f / area, x0,
+                                                            x1, y0, y1);
+            return;
         }
     }
+
+    loop_general(p, a, b, d, x0, x1, y0, y1, area);
 }
 
-void transform_vert(const Cmd& c, const Texture& tgt, const BgpuVertex& in, RVert& out) {
+void transform_vert(const Cmd& c, const Texture& tgt, bool affine, const BgpuVertex& in,
+                    RVert& out) {
     float sx = c.vp[0] + (in.x / static_cast<float>(tgt.w)) * c.vp[2];
     float sy = c.vp[1] + (in.y / static_cast<float>(tgt.h)) * c.vp[3];
-    if (c.affineOn) {
+    if (affine) {
         const float* m = c.xf;
         const float nx = m[0] * sx + m[1] * sy + m[2];
         const float ny = m[3] * sx + m[4] * sy + m[5];
@@ -387,11 +712,16 @@ void transform_vert(const Cmd& c, const Texture& tgt, const BgpuVertex& in, RVer
     out.a = ((in.color >> 24) & 0xFFu) / 255.0f;
 }
 
-void make_raster_ctx(Cmd& c, RasterCtx& rc) {
+void build_paint(Cmd& c, Paint& p) {
     CpuTexture* tgt = static_cast<CpuTexture*>(c.target);
-    rc.cmd = &c;
-    rc.tgt = tgt;
-    rc.depth = c.depth ? static_cast<CpuTexture*>(c.depth) : nullptr;
+    p.tgt = tgt;
+    p.depth = c.depth ? static_cast<CpuTexture*>(c.depth) : nullptr;
+    p.blend = c.pipe->blend;
+    p.textured = (c.pipe->pipe_flags & BGPU_PIPE_TEXTURED) != 0 && c.tex != nullptr;
+    if (p.textured) p.texState = make_tex_state(static_cast<CpuTexture*>(c.tex), c.samp);
+    p.depthOn = p.depth != nullptr && p.depth->depth_w == tgt->w && p.depth->depth_h == tgt->h;
+    p.depthTest = p.depthOn && (c.pipe->pipe_flags & BGPU_PIPE_DEPTH_TEST) != 0;
+    p.depthWrite = p.depthOn && (c.pipe->pipe_flags & BGPU_PIPE_DEPTH_WRITE) != 0;
     int l = 0, t = 0, r = static_cast<int>(tgt->w), b = static_cast<int>(tgt->h);
     if (c.scissorOn) {
         const int sl = c.sc[0];
@@ -403,11 +733,13 @@ void make_raster_ctx(Cmd& c, RasterCtx& rc) {
         if (sr < r) r = sr;
         if (sb < b) b = sb;
     }
-    rc.l = l;
-    rc.t = t;
-    rc.r = r;
-    rc.b = b;
+    p.l = l;
+    p.t = t;
+    p.r = r;
+    p.b = b;
 }
+
+
 
 /* 交换链位图 → 直通 RGBA8（frame_read 的输出永远是 RGBA8，与内部格式无关） */
 void copy_out_straight(const std::vector<uint8_t>& src, BgpuFormat fmt, uint32_t w, uint32_t h,
@@ -585,6 +917,12 @@ public:
     /* ---------------- 纹理 ---------------- */
     BgpuResult createTexture(Device& dev, const BgpuTextureDesc& desc,
                              BgpuTexture* out) override {
+        /* 渲染目标必须是 4 字节格式：光栅与 clear 都按一次写 4 字节实现（0.2.0 的
+         * px_store 也是），R8 目标会写越界。0.2.1 起明确拒绝，而不是悄悄踩内存。 */
+        if ((desc.flags & BGPU_TEXTURE_RENDER_TARGET) && desc.format == BGPU_FORMAT_R8) {
+            setReason("R8 不能当渲染目标（只有 RGBA8/BGRA8 可以；R8 用作采样遮罩）");
+            return BGPU_ERR_INVALID_ARGUMENT;
+        }
         const uint64_t handle = makeObject<CpuTexture>(*this, dev.self, dev);
         if (handle == BGPU_INVALID) {
             setReason("对象表分配失败（内存不足）");
@@ -797,27 +1135,33 @@ protected:
 
     BgpuResult clearColor(Texture& target_, uint32_t argb) override {
         CpuTexture& target = static_cast<CpuTexture&>(target_);
-        const uint32_t bpp = bytesPerPx(target.fmt);
-        uint8_t* base = target.data();
-        const uint32_t n = target.w * target.h;
-        for (uint32_t i = 0; i < n; i++) {
-            store_straight(base + static_cast<size_t>(i) * bpp, target.fmt, argb);
-        }
+        /* 填充色对每个像素都是同一个值：预乘 + 量化一次，然后按 uint32 铺。
+         * 与 store_straight 的逐像素浮点写法逐位相同（q8(k/255*255) == k，
+         * 0..255 全部成立 —— tests/test_cpu_render.c 的 clear 用例守着这条）。 */
+        const uint32_t a = (argb >> 24) & 0xFFu;
+        const uint32_t r = premul8((argb >> 16) & 0xFFu, a);
+        const uint32_t g = premul8((argb >> 8) & 0xFFu, a);
+        const uint32_t b = premul8(argb & 0xFFu, a);
+        const uint32_t packed = pack_px(target.fmt, r, g, b, a);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(target.data());
+        const size_t n = static_cast<size_t>(target.w) * target.h;
+        for (size_t i = 0; i < n; i++) dst[i] = packed;
         return BGPU_OK;
     }
 
     /* ---------------- 光栅化 ---------------- */
     BgpuResult rasterQuads(Cmd& c, const BgpuVertex* verts, uint32_t quad_count) override {
-        RasterCtx rc;
-        make_raster_ctx(c, rc);
+        Paint p;
+        build_paint(c, p);
+        const bool affine = c.affineOn;
         for (uint32_t q = 0; q < quad_count; q++) {
             const BgpuVertex* v = verts + static_cast<size_t>(q) * 4u;
             RVert t[4];
-            for (int i = 0; i < 4; i++) transform_vert(c, *rc.tgt, v[i], t[i]);
+            for (int i = 0; i < 4; i++) transform_vert(c, *p.tgt, affine, v[i], t[i]);
             /* TL,TR,BL,BR → 三角形 (0,1,2) 与 (2,1,3)：与 binUI 的 emitQuad 同一套索引，
              * 保证共享的对角线在 top-left 规则下只被一个三角形覆盖。 */
-            raster_tri(rc, &t[0], &t[1], &t[2]);
-            raster_tri(rc, &t[2], &t[1], &t[3]);
+            raster_tri(p, &t[0], &t[1], &t[2]);
+            raster_tri(p, &t[2], &t[1], &t[3]);
         }
         return BGPU_OK;
     }
@@ -826,8 +1170,8 @@ protected:
                              uint32_t index_count, uint32_t index_offset) override {
         CpuBuffer& vb = static_cast<CpuBuffer&>(vb_);
         CpuBuffer& ib = static_cast<CpuBuffer&>(ib_);
-        RasterCtx rc;
-        make_raster_ctx(c, rc);
+        Paint p;
+        build_paint(c, p);
 
         /* 先整段校验索引（越界是调用方 bug：宁可一笔都不画，也不要"画一半再报错"）。 */
         const uint32_t* idx = reinterpret_cast<const uint32_t*>(ib.data.data() + index_offset);
@@ -851,9 +1195,9 @@ protected:
                             vb.data.data() + vertex_offset + static_cast<size_t>(vi) * vsize,
                             sizeof(mv));
                 const BgpuVertex v2 = {mv.x, mv.y, mv.z, mv.u, mv.v, mv.color};
-                transform_vert(c, *rc.tgt, v2, tri[k]);
+                transform_vert(c, *p.tgt, c.affineOn, v2, tri[k]);
             }
-            raster_tri(rc, &tri[0], &tri[1], &tri[2]);
+            raster_tri(p, &tri[0], &tri[1], &tri[2]);
         }
         return BGPU_OK;
     }

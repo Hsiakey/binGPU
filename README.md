@@ -85,6 +85,7 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build
 |---|---|
 | `make test` | 编两个测试并逐个跑，任何失败非 0 退出 |
 | `make abi-check` | ①把 `include/bingpu.h` 当主文件用**纯 C11 + `-Werror`** 编一遍；②剥掉注释后 grep，头里不许出现 `namespace` / `class ` / `template` / `std::` / `<string>` / `<vector>`；③冒烟：C 目标文件 + C++ 静态库由 `g++` 链接成可执行并跑起来 |
+| `make bench` | CPU 后端固定场景吞吐基准 + 13 个像素校验和（数字与解读见 [docs/perf.md](docs/perf.md)） |
 | `build-mingw/bin/bingpu_info` | 人看：版本、后端可用性、caps、跑一遍最小调用序列后的 stats |
 
 `test_abi` 钉的是契约（`struct_size`、无效/已销毁句柄、状态机、线程本地错误槽、

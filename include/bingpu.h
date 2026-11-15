@@ -1,6 +1,6 @@
 #pragma once
 /* ============================================================
- * bingpu.h —— binGPU 公共 C ABI（v0.2.0，ABI 1）
+ * bingpu.h —— binGPU 公共 C ABI（v0.2.1，ABI 1）
  *
  * binGPU 是"设备 / 交换链 / 资源 / 管线 / 命令 / 呈现"这一层：把同一件事
  * （建窗口面、上传纹理、切混合状态、离屏、present）从每个渲染器里抽出来，
@@ -72,8 +72,8 @@ extern "C" {
 
 #define BINGPU_VERSION_MAJOR 0
 #define BINGPU_VERSION_MINOR 2
-#define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.2.0"
+#define BINGPU_VERSION_PATCH 1
+#define BINGPU_VERSION_STRING "0.2.1"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1 */
 #define BINGPU_ABI_VERSION 1u

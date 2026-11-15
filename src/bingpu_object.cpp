@@ -31,6 +31,19 @@ struct Slot {
 std::vector<Slot> g_slots;
 uint32_t g_live = 0;
 
+/* 进程退出时 g_slots 自己的析构会把还活着的对象统统 delete 掉（unique_ptr），
+ * 而某些对象的析构要回手掏表（CpuSwapchain 会把借出的帧目标一起摘掉）——
+ * 此时表正在被销毁，再进 destroyObject 就是 use-after-free。
+ * 这个哨兵在 g_slots **之后**构造（同 TU 声明顺序），因此**先**销毁：
+ * 它把 g_tearingDown 置位，destroyObject 直接返回，剩下的交给 unique_ptr。
+ * 为什么要管这条路径：工具/测试在报错后 exit() 时，用户往往没有逐个 destroy。 */
+bool g_tearingDown = false;
+
+struct TableGuard {
+    ~TableGuard() { g_tearingDown = true; }
+};
+TableGuard g_tableGuard;
+
 constexpr uint64_t kKindShift = 60;
 constexpr uint64_t kGenShift = 32;
 constexpr uint64_t kIndexMask = 0xFFFFFFFFull;
@@ -89,6 +102,7 @@ ObjectBase* lookupObject(uint64_t handle, uint32_t kind) noexcept {
 }
 
 void destroyObject(uint64_t handle) {
+    if (g_tearingDown) return;   /* 见 g_tearingDown：退出期由 unique_ptr 接管 */
     Slot* s = slotOf(handle, 0);
     if (!s) return;   /* 幂等：无效 / 重复销毁都是 no-op */
     ObjectBase* dying = s->obj.get();

@@ -41,6 +41,8 @@ if(MSVC)
     target_compile_options(bingpu PRIVATE /W4)
 else()
     target_compile_options(bingpu PRIVATE -Wall -Wextra -Wpedantic)
+    # 与 Makefile 一致：只有 CPU 后端的热循环值得 -O3（0.2.1 量过，纹理路径再快 ~20%）
+    set_source_files_properties(src/bingpu_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 endif()
 
 # ---- 测试（C 源码 → 用 C 编译器编 → 用 C++ 链接）----

@@ -4,6 +4,42 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.2.1] - 2026-11-15
+
+CPU 参考后端的吞吐优化轮：**四边形填充 4.6–7.3×、裁剪内小批 6.5×**，纹理路径 1.6–2.3×，
+**像素逐位不变**（`make bench` 的 13 个校验和与 0.2.0 一致，239 + 334 断言全绿）。
+`BINGPU_ABI_VERSION` 仍是 **1**。
+
+### Added
+
+- `tools/bingpu_bench.c` + `make bench`：六类固定场景（纯色五种混合 / 纹理四种采样 /
+  scatter 小批 / 索引网格 / 离屏合成 / 回读）的吞吐基准，每项 5 次取最好，并打印 13 个
+  FNV-1a 像素校验和 —— 优化前后必须逐位相同。
+- `docs/perf.md`：前后数字表、每条优化的收益、未做项与原因、复现方式。
+
+### Optimized
+
+- 光栅内核按"是否纹理 / 是否有深度"分循环（不纹理不算 UV、不测深度不插 Z）；
+  混合模式变模板参数（switch 提到三角形外）；REPLACE 与"预乘 + 源 alpha 满"不读目标。
+- 均匀色三角形：整条片元计算提到循环外；同色同混合时用 **4×256 混合查表**（表项与
+  逐像素路径同一条公式），KEEP/ERASE/ADDITIVE 从 ~78 提到 ~250–290 MPix/s。
+- 采样器：`TexState` 把尺寸/格式/filter/wrap 提到循环外；内联 floor；REPEAT 取模快路径；
+  4 字节格式按 `uint32` 取纹素。
+- 字节↔float 用 256 项查表；反预乘用 64 KiB `(p,a)` 查表；clear 预乘量化一次后按
+  `uint32` 铺。
+- `src/bingpu_cpu.cpp` 单独用 `-O3`（其余文件仍 `-O2`；量过：UV 采样路径再快 ~20%）。
+
+### Fixed
+
+- **R8 纹理当渲染目标会写越界**：`px_store`/clear 恒按 4 字节写，而 R8 是每像素 1 字节。
+  0.2.1 起 `texture_create` 直接拒绝 `R8 + RENDER_TARGET`（R8 仍可作采样遮罩）。
+
+### Kept
+
+- `include/bingpu.h` 只改 `BINGPU_VERSION_PATCH`/`BINGPU_VERSION_STRING` 与文件头注释，
+  签名/枚举/结构体布局一个字节未动；ABI 仍是 1。
+- 断言数 239 + 334 不变；零警告；LF。
+
 ## [0.2.0] - 2026-11-15
 
 **实现语言从 C11 换成 C++17，二进制 ABI 一位未变（仍是 ABI 1）。**
@@ -98,5 +134,6 @@
 - `draw_indexed` 的两个偏移是**字节**偏移（名字没体现单位，0.2.0 再改名 —— 属 ABI 变化）。
 - `depth_target` 用 `RENDER_TARGET` 纹理表示（没有专门的深度格式）。
 
+[0.2.1]: https://example.invalid/bingpu/releases/tag/v0.2.1
 [0.2.0]: https://example.invalid/bingpu/releases/tag/v0.2.0
 [0.1.0]: https://example.invalid/bingpu/releases/tag/v0.1.0
