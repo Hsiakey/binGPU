@@ -67,10 +67,10 @@ static void check_error_shape(const char* fn_name) {
 static void test_version(void) {
     printf("[version]\n");
     CHECK_EQ(BINGPU_VERSION_MAJOR, 0);
-    CHECK_EQ(BINGPU_VERSION_MINOR, 1);
+    CHECK_EQ(BINGPU_VERSION_MINOR, 2);   /* 0.2.0：实现改 C++17，ABI 仍是 1 */
     CHECK_EQ(BINGPU_VERSION_PATCH, 0);
     CHECK(strcmp(bingpu_version_string(), BINGPU_VERSION_STRING) == 0);
-    CHECK(strcmp(bingpu_version_string(), "0.1.0") == 0);
+    CHECK(strcmp(bingpu_version_string(), "0.2.0") == 0);
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
     CHECK_EQ(BINGPU_ABI_VERSION, 1u);
     /* 结构体布局是 ABI 的一部分（头里也 static_assert 了，这里再钉一次） */

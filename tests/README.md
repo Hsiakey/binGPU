@@ -1,7 +1,9 @@
 # tests
 
-两个测试都是**纯 C11 可执行文件**，直接链接 `build-mingw/libbingpu.a`，没有第三方框架：
-断言就是 `CHECK` / `CHECK_EQ`（`printf` + 计数），失败时退出码 1。
+两个测试都是**纯 C 源码**（故意的：它们同时是"C 能消费这个 ABI"的证明），编成可执行文件后
+链接 `build-mingw/libbingpu.a`（实现是 C++，所以链接由 `g++` 做，带 libstdc++；见
+`docs/abi.md` §0）。没有第三方框架：断言就是 `CHECK` / `CHECK_EQ`（`printf` + 计数），
+失败时退出码 1。
 
 ```sh
 make test                     # 编 + 跑两个，任何失败非 0 退出

@@ -13,19 +13,22 @@
   `include/bingpu.h`（头文件注释是完整契约）。
 - **要绑到别的语言**：`abi.md` → `include/bingpu.h`。重点是句柄语义、`struct_size`、
   错误槽是线程本地的、`*_destroy` 幂等。
-- **要写新后端**：`contracts.md` → `raster_rules.md` → `backends.md`。然后拿
-  `tests/test_cpu_render.c` 当规格：每条断言就是一条必须对齐的规则。
+- **要写新后端**：`contracts.md` → `raster_rules.md` → `backends.md`。新后端 = 继承
+  `BackendBase` 实现 5 个钩子 + 资源分配，然后拿 `tests/test_cpu_render.c` 当规格：
+  每条断言就是一条必须对齐的规则。
 - **要改这一层的设计**：先读 `contracts.md` 的六条，任何改动都要回答"破坏哪一条、为什么值得"。
 
 ## 源码地图（`src/`）
 
-| 文件 | 职责 |
+| 文件（C++17） | 职责 |
 |---|---|
-| `bingpu_api.c` | 公共函数入口：参数/句柄/顺序校验 → 转发到后端虚表 |
-| `bingpu_error.c` | 线程本地错误槽、`result_name`、版本、格式、**后端注册表**、`shutdown` |
-| `bingpu_object.c` | 句柄 → 对象 的表（代数失效、按设备连带销毁） |
-| `bingpu_null.c` | NULL 后端：只校验 + 计数 + 完整状态机 |
-| `bingpu_cpu.c` | CPU 参考实现：软件光栅、深度、采样、混合、回读 |
-| `bingpu_internal.h` | 内部契约（句柄编码 / 对象表 / 错误槽 / 后端虚表），**不进 `include/`** |
+| `bingpu_api.cpp` | 公共 C ABI 入口：参数/句柄/顺序校验 → 转发后端 → 顶层 try/catch（异常不越过 ABI） |
+| `bingpu_backend.h` | `class Backend`（后端接口）+ `BackendBase`（共享状态机）+ 对象类型 |
+| `bingpu_backend.cpp` | 对象构造 + 两个后端共用的命令状态机 / 参数校验 / stats 计数 |
+| `bingpu_error.cpp` | 线程本地错误槽、`result_name`、版本、格式、**后端注册表**、`shutdown` |
+| `bingpu_object.cpp` | 句柄 → 对象 的表（`unique_ptr` + RAII，代数失效、按设备连带销毁） |
+| `bingpu_null.cpp` | `NullBackend`：只校验 + 计数 + 完整状态机 |
+| `bingpu_cpu.cpp` | `CpuBackend`：软件光栅、深度、采样、混合、回读 |
+| `bingpu_internal.h` | 内部契约（句柄编码 / 对象表 / 错误槽），**不进 `include/`** |
 
 测试：`tests/test_abi.c`（契约）、`tests/test_cpu_render.c`（像素）；工具：`tools/bingpu_info.c`。

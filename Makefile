@@ -1,37 +1,38 @@
 # Makefile - binGPU (MinGW / GCC / Clang)
 #
-# 风格照 binUI：变量名、构建目录、产物三分（bin/ 工具、bin/tests/ 测试）。
-# 只用 C 编译器 —— 这个项目**没有** C++ 源文件，故意如此（见 docs/abi.md）。
+# 语言（2026-11-15 定）：**实现是 C++17**（src/*.cpp），**对外 ABI 是 C 兼容的**
+# （include/bingpu.h 必须能被纯 C 编译器单独编过 —— 见 abi-check）。两件事分开看：
+#   ABI 看"谁要 include 它"（Python/Go/Rust 绑的是扁平 C 面），
+#   实现看表达力（容器 / RAII / 异常在 C 里全是手写样板，见 docs/abi.md）。
+#
+# 测试与工具是 **C 源码**（tests/*.c、tools/*.c），故意如此：它们同时是
+# "C 能消费这个 ABI"的证明。所以构建是两段式：
+#   ① 用 gcc（纯 C）把 .c 编成目标文件；
+#   ② 用 g++ 链接（因为静态库 libbingpu.a 里是 C++ 符号，需要 libstdc++）。
+# 链接行的 RTLINK 静态链上 libgcc/libstdc++：产物自包含，换环境不会因为
+# Git for Windows 的 /mingw64/bin 抢先命中不匹配的 libstdc++-6.dll 而炸（退出码 127）。
 #
 # 目标：
 #   all        静态库 + 测试 + 工具
 #   test       编好后逐个跑，任何失败非 0 退出（CI 就认这个）
 #   abi-check  ①纯 C 编译器单独编 include/bingpu.h（混进 C++ 语法当场炸）
 #              ②grep 守规矩：头里不许 C++ 类型/命名空间/容器头
+#              ③冒烟：C 目标文件 + C++ 静态库能被 g++ 链接成可执行并跑起来
 #   clean
 
-# make 内建的 CC 默认是 `cc`。MinGW/GCC 的发行版都带 cc，但为了不依赖那个软链，
-# 当 CC 还是内建默认值时改用 gcc（用户在命令行或环境里显式指定就尊重它）。
+# make 内建的 CC 默认是 `cc`；MinGW/GCC 发行版都带 cc，但为了不依赖那个软链，
+# 当 CC/CXX 还是内建默认值时改用 gcc/g++（用户在命令行或环境里显式指定就尊重它）。
 ifeq ($(origin CC),default)
 CC := gcc
 endif
-CFLAGS   ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -MMD -MP
-LDFLAGS  ?=
-# 静态链接 C 运行时：产物常在 sh 下被执行（make 的 SHELL=sh），
-# 而 Git for Windows 的 /mingw64/bin 排在本机 MinGW 前面，
-# 会先命中版本不匹配的 libgcc DLL，表现为莫名其妙的退出码 127。
-RTLINK   ?= -static-libgcc
-
-# Git for Windows 的 sh.exe 路径带空格：mingw32-make 在 -j N 并行下会把
-# `C:/Program Files/...` 原样拼进命令行，CreateProcess 直接失败（process_begin /
-# make (e=2)，看着像"系统找不到指定的文件"）。这里固定成 8.3 短路径绕开空格；
-# 用 override 是为了调用方传 SHELL='C:/Program Files/Git/bin/sh.exe' 时也以本文件为准，
-# 否则同一份 Makefile 串行/并行行为不一致。
-ifeq ($(OS),Windows_NT)
-    ifneq ($(wildcard C:/PROGRA~1/Git/bin/sh.exe),)
-        override SHELL := C:/PROGRA~1/Git/bin/sh.exe
-    endif
+ifeq ($(origin CXX),default)
+CXX := g++
 endif
+
+CFLAGS   ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -MMD -MP
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -MMD -MP
+LDFLAGS  ?=
+RTLINK   ?= -static-libgcc -static-libstdc++
 
 SRC_DIR  := src
 INC_DIR  := include
@@ -48,39 +49,46 @@ else
 endif
 
 # =============================================
-# 静态库
+# 静态库（C++17 实现）
 # =============================================
-LIB_SRCS := $(wildcard $(SRC_DIR)/*.c)
-LIB_OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(LIB_SRCS))
+LIB_SRCS := $(wildcard $(SRC_DIR)/*.cpp)
+LIB_OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(LIB_SRCS))
 LIB_A    := $(BUILD_DIR)/libbingpu.a
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(SRC_DIR) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(INC_DIR) -I$(SRC_DIR) -c $< -o $@
 
 $(LIB_A): $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	ar rcs $@ $^
 
 # =============================================
-# 测试（纯 C11，不引第三方）
+# 测试（C 源码 → gcc 编 → g++ 链接；见文件头）
 # =============================================
-TEST_BINS := \
-    $(TEST_DIR)/test_abi$(EXT) \
-    $(TEST_DIR)/test_cpu_render$(EXT)
+TEST_NAMES := test_abi test_cpu_render
+TEST_BINS  := $(addprefix $(TEST_DIR)/,$(addsuffix $(EXT),$(TEST_NAMES)))
 
-$(TEST_DIR)/%$(EXT): $(TEST_SRC)/%.c $(LIB_A)
+$(OBJ_DIR)/tests/%.o: $(TEST_SRC)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I$(INC_DIR) -o $@ $< $(LIB_A) $(RTLINK) $(LDFLAGS)
+	$(CC) $(CFLAGS) -I$(INC_DIR) -c $< -o $@
+
+$(TEST_DIR)/%$(EXT): $(OBJ_DIR)/tests/%.o $(LIB_A)
+	@mkdir -p $(dir $@)
+	$(CXX) $(RTLINK) -o $@ $< $(LIB_A) $(LDFLAGS)
 
 # =============================================
-# 工具
+# 工具（同样是 C 源码）
 # =============================================
 TOOL_BINS := $(BIN_DIR)/bingpu_info$(EXT)
 
-$(BIN_DIR)/%$(EXT): tools/%.c $(LIB_A)
+$(OBJ_DIR)/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I$(INC_DIR) -o $@ $< $(LIB_A) $(RTLINK) $(LDFLAGS)
+	$(CC) $(CFLAGS) -I$(INC_DIR) -c $< -o $@
+
+$(BIN_DIR)/%$(EXT): $(OBJ_DIR)/tools/%.o $(LIB_A)
+	@mkdir -p $(dir $@)
+	$(CXX) $(RTLINK) -o $@ $< $(LIB_A) $(LDFLAGS)
 
 # =============================================
 # 目标
@@ -101,18 +109,27 @@ test: $(TEST_BINS)
 # 为什么留 -Wno-pragma-once-outside-header：
 #   ABI 头第一行是 #pragma once（正常头文件写法）。GCC 13+ 在"头文件被当作主文件
 #   编译"时会警告这一点，而这里的检查方式恰恰就是"把头文件当主文件单独编一遍"。
-#   我们只关心语法（C++ 设施混入），不关心这条排版类警告，所以精确关掉它而不是
-#   把 -Werror 去掉 —— 其余警告仍然是错误。
-abi-check:
+#   我们只关心语法（C++ 设施混入），所以精确关掉这条排版类警告而不是去掉 -Werror。
+abi-check: $(LIB_A)
 	@echo "--- 1) compile include/bingpu.h as pure C11 ---"
 	$(CC) -std=c11 -Wall -Wextra -Wpedantic -Werror -Wno-pragma-once-outside-header \
 	    -fsyntax-only -x c $(INC_DIR)/bingpu.h
 	@echo "--- 2) no C++ facilities in the public header ---"
-	@if grep -nE 'namespace|class |template|std::|<string>|<vector>' $(INC_DIR)/bingpu.h; then \
-	    echo "abi-check FAILED: C++ facility found in include/bingpu.h"; exit 1; \
-	else \
-	    echo "ok: no C++ facility"; \
-	fi
+	@# 先把注释剥掉再 grep：头文件的说明文字里会正常出现 std::vector 这类词（讲"实现
+	@# 用 C++、ABI 是 C"），要拦的是**声明/代码**里出现 C++ 设施。用编译器自己剥注释
+	@# （-fpreprocessed -dD -E -P）比自己写正则可靠。
+	@$(CC) -fpreprocessed -dD -E -P $(INC_DIR)/bingpu.h 2>/dev/null \
+	    | grep -nE 'namespace|class |template|std::|<string>|<vector>' \
+	    && { echo "abi-check FAILED: C++ facility found in include/bingpu.h"; exit 1; } \
+	    || echo "ok: no C++ facility"
+	@echo "--- 3) C object + C++ static library link with g++ ---"
+	@printf '%s\n' '#include <stdio.h>' '#include "bingpu.h"' \
+	    'int main(void) { printf("%s/ABI %u\\n", bingpu_version_string(), bingpu_abi_version()); return 0; }' \
+	    > $(BUILD_DIR)/abi_smoke.c
+	$(CC) -std=c11 -Wall -Wextra -Wpedantic -Werror -I$(INC_DIR) -c $(BUILD_DIR)/abi_smoke.c \
+	    -o $(BUILD_DIR)/abi_smoke.o
+	$(CXX) $(RTLINK) -o $(BUILD_DIR)/abi_smoke$(EXT) $(BUILD_DIR)/abi_smoke.o $(LIB_A)
+	@$(BUILD_DIR)/abi_smoke$(EXT)
 	@echo "abi-check passed"
 
 clean:

@@ -202,5 +202,5 @@ if (管线有 TEXTURED 且绑定了纹理) {
 - `vertex_offset` / `index_offset` 是**字节**偏移（与 `buffer_update` 的 `offset` 一致）。
   `vertex_offset` 必须是 `sizeof(BgpuMeshVertex)` 的倍数，`index_offset` 必须是 4 的倍数；
   索引是 **32 位**。越界一律 `BGPU_ERR_INVALID_ARGUMENT`。
-- 法线（`nx,ny,nz`）在 0.1.0 的固定管线里**不参与计算** —— 没有光源状态可以喂给它
+- 法线（`nx,ny,nz`）在当前的固定管线里**不参与计算** —— 没有光源状态可以喂给它
   （见 `docs/backends.md` 的欠账）。网格按"顶点色 × 纹理"着色。

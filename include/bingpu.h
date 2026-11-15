@@ -1,6 +1,6 @@
 #pragma once
 /* ============================================================
- * bingpu.h —— binGPU 公共 C ABI（v0.1.0，ABI 1）
+ * bingpu.h —— binGPU 公共 C ABI（v0.2.0，ABI 1）
  *
  * binGPU 是"设备 / 交换链 / 资源 / 管线 / 命令 / 呈现"这一层：把同一件事
  * （建窗口面、上传纹理、切混合状态、离屏、present）从每个渲染器里抽出来，
@@ -14,28 +14,33 @@
  *                       │
  *            GL / Vulkan / D3D12 / CPU（参考实现）
  *
- * 为什么这层是 C（而不是像上面三层那样 C++）：
- *   ① 它下面那三套图形 API 本来就是 C（vulkan.h 是 C、GL 是 C、D3D12 是
- *      COM —— C 风格的 vtable），顺着接口写比给 C 接口套一层 C++ 壳再隔着
- *      extern "C" 打回来省事；
- *   ② 它是最可能被别人**直接绑**的一层：bindings/ 里 Python / Go / Rust
- *      只吃 C ABI，这一层是 C 意味着它们想画 2D/3D 不必等上层扩 C 接口；
- *   ③ 形状合适：这一层传的全是数字和句柄，没有字符串容器、没有回调、
- *      没有可变长结构。
+ * 语言（2026-11-15 master 定）：**实现用 C++17**，但**对外这一圈仍是 C 兼容的
+ * 扁平 ABI**。两件事要分开看：
+ *   ① ABI 看的是"谁要 include 它"：bindings/ 里 Python / Go / Rust 只吃 C 接口，
+ *      将来别的语言要直接绑这一层，也只需要一个扁平 C 面；
+ *   ② "C 更快"不成立（binUI 的 docs/future.md 有实测：同一份 alpha 混合内核交
+ *      给 gcc -O2 和 g++ -O2，生成的汇编逐行相同，差别只在前者没法内联取样器）。
+ *      所以实现语言按**表达力**选 —— 手写容器、句柄表、生命周期在 C 里全是负债；
+ *   ③ 头文件保持 C 兼容还有个顺带的好处：上面三层都是 C++，直接 include 即可，
+ *      不需要 `extern "C"` 包装层。
+ * 于是：实现是 `.cpp`（std::vector / std::string / RAII / 内部用异常），函数边界
+ * 一律 `extern "C"` + `noexcept` + try/catch —— **异常绝不越过 ABI**：内存不足
+ * 转 BGPU_ERR_OUT_OF_MEMORY，其余转 BGPU_ERR_BACKEND_FAILED 并把原话写进错误串。
  *
  * 硬约束（写在这里，实现时别吵）：
- *   · 头文件里只有定长 POD + uint64_t 句柄 + 扁平函数。不许出现任何 C++
- *     类型/模板/命名空间/异常；`make abi-check` 会用纯 C 编译器把本文件
- *     单独编一遍，混进 C++ 语法就在那一步炸。
+ *   · 头文件里只有定长 POD + uint64_t 句柄 + 扁平函数。它必须能被**纯 C 编译器**
+ *     单独编过（`make abi-check` 会拿 gcc -x c 编一遍）：实现是 C++ 不等于这个头
+ *     可以出现 C++ 类型/模板/命名空间 —— 那会把 C 绑定这条路直接堵死。
  *   · 句柄是 uint64_t **不是指针**（跨语言传指针是被绑语言的噩梦）。
  *     0 = 无效句柄，任何拿 0 调用的函数返回 BGPU_ERR_INVALID_HANDLE。
- *   · 没有异常、没有 RAII：创建失败返回错误码；销毁顺序由调用方保证
- *     （先销毁子资源再销毁设备）。上层的 C++ 包装把这条收在一处。
  *   · 没有回调：device lost / resize 这类事件用显式轮询
  *     bingpu_poll() 在渲染线程上取。一旦有回调，就要处理"回调里再进
- *     GPU 层"的可重入问题 —— C ABI 上那是最贵的一类 bug。
- *   · 不依赖 libstdc++/libc++：实现可以是 .c，也可以是 .cpp 编出 C 符号，
- *     但不能把 C++ 运行时拖进链接（否则 Rust/Go 那条路直接断）。
+ *     GPU 层"的可重入问题 —— 那是最贵的一类 bug。
+ *   · 销毁顺序仍由调用方保证（C ABI 上没有析构）。上层的 C++ 包装把这条收在一处；
+ *     设备销毁时会连带清理名下残留资源，作为最后一道保险而不是常规路径。
+ *   · 静态库会带 C++ 运行时（libstdc++）。用 C ABI 绑它的语言在链接时要带上
+ *     这份运行时（或让本库静态链接进去）—— 这是"实现用 C++"换来的唯一外部可见代价，
+ *     已写进 docs/abi.md。
  *
  * 颜色约定（和 binUI 一致，三端逐像素一致的前提）：
  *   一律 0xAARRGGBB **直通（非预乘）**。乘 alpha 发生在写入阶段 ——
@@ -66,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 1
+#define BINGPU_VERSION_MINOR 2
 #define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.1.0"
+#define BINGPU_VERSION_STRING "0.2.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1 */
 #define BINGPU_ABI_VERSION 1u

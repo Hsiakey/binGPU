@@ -4,6 +4,60 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.2.0] - 2026-11-15
+
+**实现语言从 C11 换成 C++17，二进制 ABI 一位未变（仍是 ABI 1）。**
+公开头 `include/bingpu.h` 的签名 / 枚举 / 结构体布局全部保持，只把文件头里"为什么用 C"
+改写成了"为什么实现用 C++ 而 ABI 仍保持 C 兼容"。
+
+### Changed
+
+- `src/*.c` → `src/*.cpp`。内部改成 C++ 抽象：`src/bingpu_backend.h` 的 `class Backend`
+  （虚函数：创建设备/交换链/纹理/缓冲/采样器/管线/命令、begin/end render、draw、readback），
+  `NullBackend` / `CpuBackend` 继承它；两个后端共用的命令状态机、参数校验、stats 计数
+  收进 `BackendBase`（0.1.0 是两套手写实现，现在结构上不可能不一致）。
+- 对象表：`std::vector<std::unique_ptr<ObjectBase>>` + RAII。资源释放在析构里 ——
+  显式 `destroy` 只负责"从表里摘掉"，设备销毁连带清理复用同一份代码。
+- 错误槽：`_Thread_local char[512]` + `snprintf` → `thread_local std::string`，
+  错误串用 `std::string` 拼接（不截断）。语义不变：每次失败都写、成功不清空、格式仍是
+  `<函数>: <原因> (file:line)`，`file:line` 现在指向真正的失败位置（后端 .cpp）。
+- 像素/缓冲：`std::vector<uint8_t>`；字符串 `std::string`。
+- **异常绝不越过 ABI**：每个 `extern "C"` 入口顶层 try/catch —— `bad_alloc` →
+  `BGPU_ERR_OUT_OF_MEMORY`，其它 `std::exception` → `BGPU_ERR_BACKEND_FAILED`
+  （`what()` 进错误串），未知异常同样兜住。（公共头是冻结的 ABI，没有 `noexcept`；
+  C++ 要求声明与定义的异常规格一致，所以不能只在定义上补 —— 等价保证由 try/catch 提供。）
+- 构建：`CXX ?= g++` / `-std=c++17`；测试与工具**仍是 C 源码**（同时是"C 能消费这个 ABI"
+  的证明），用 `gcc` 编、用 `g++` 链接（`-static-libgcc -static-libstdc++`）。
+  `CMakeLists.txt` 改 `project(binGPU C CXX)`。
+- `make abi-check` 增加第三条冒烟：C 目标文件 + C++ 静态库 → `g++` 链接 → 跑起来。
+  第二条 grep 改为"先剥注释再查"（头文件的说明文字里现在会正常出现 `std::vector` 这类词，
+  要拦的是声明里出现 C++ 设施）。
+
+### Fixed（旧的 C 实现里存在、C++ 版按新写法修掉的行为差异）
+
+- **NULL 后端的 `stats.bytes_live` 只加不减**（0.1.0 的析构忘了回写）。现在纹理/缓冲/交换链
+  的析构都回写记账，`bytes_live` 真正表示"当前活着的字节数"。
+- **帧中途销毁管线/纹理会 use-after-free**（cmd 的状态里存着裸指针）。现在销毁前会通知
+  所有活对象把指向它的指针清空，之后的使用退化成 `BGPU_ERR_STATE`，不再是 UB。
+- **`draw_indexed` 的索引越界可能"画一半再报错"**（0.1.0 的 CPU 版边画边查）。现在先整段
+  校验所有索引，再光栅化：要么全画、要么一个像素都不动。
+- **`draw_indexed` 的 `vertex_offset` 对齐检查只在不存在的 NULL 分支里**。现在两个后端统一：
+  `vertex_offset` 必须是 `sizeof(BgpuMeshVertex)` 的倍数。
+- 交换链被销毁时，借出的目标纹理现在一起失效（0.1.0 会留下一个指向已释放内存的句柄）。
+
+### Kept
+
+- 常量：版本 `0.2.0`；`BINGPU_ABI_VERSION` 仍是 **1**。
+- 断言数：`test_abi` **239** 条、`test_cpu_render` **334** 条，全绿；零警告。
+- 除上面"Fixed"里列的误用路径外，**能观察到的行为一位未变**：句柄编码、销毁后失效、
+  借用目标不许销毁、stats 计数、caps 上报、错误串语义、像素规则全部保持。
+
+### Not done
+
+- **Vulkan / D3D12 后端仍只是登记状态**（`device_create` 返回 `BGPU_ERR_UNSUPPORTED` +
+  原因）；GL 不迁。路线与欠账见 `docs/backends.md`。
+- 没有 MSAA / mip 采样 / 用户着色器 / 网格光照；CPU 后端仍不呈现窗口。
+
 ## [0.1.0] - 2026-11-15
 
 第一个可用版本。目标是"把设备与呈现这一层定下来，并且有一个**可复现的像素裁判**"。
@@ -44,4 +98,5 @@
 - `draw_indexed` 的两个偏移是**字节**偏移（名字没体现单位，0.2.0 再改名 —— 属 ABI 变化）。
 - `depth_target` 用 `RENDER_TARGET` 纹理表示（没有专门的深度格式）。
 
+[0.2.0]: https://example.invalid/bingpu/releases/tag/v0.2.0
 [0.1.0]: https://example.invalid/bingpu/releases/tag/v0.1.0

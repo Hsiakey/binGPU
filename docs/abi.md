@@ -5,6 +5,58 @@
 
 ---
 
+## 0. 语言：实现是 C++17，ABI 仍是 C（2026-11-15 定）
+
+这两件事**故意分开**：
+
+| | 选什么 | 为什么 |
+|---|---|---|
+| 对外 ABI | **C 兼容**：定长 POD + `uint64_t` 句柄 + 扁平函数，纯 C 编译器能单独编过头文件 | 看的是"**谁** include 它"：`bindings/` 里 Python / Go / Rust 只吃 C 接口；C ABI 意味着它们想画可以直接绑，不必等上层扩 C 接口。C++ 写、导出 C 符号是 Vulkan loader / HarfBuzz / bgfx / Skia 的常规做法 |
+| 实现 | **C++17**：`std::vector` / `std::string` / `std::unique_ptr` / 类层次 / 内部异常 | 看的是**表达力**：这一层要的是句柄表、容器、生命周期、错误串拼接。用 C 写全是手写样板（手动 realloc + 容量字段、两条销毁路线各写一遍析构），收益为零、维护成本压在每一处 |
+
+### "C 会不会更快"——实测过，不会
+
+binUI 的 [`docs/future.md`](../../binUI/docs/future.md) 有实测：同一份 alpha 混合内核分别交给
+`gcc -O2` 与 `g++ -O2`（MinGW 15.1.0，`-S -masm=intel`），生成的 `.text` **逐行相同**，
+唯一差异是符号名。语言本身不改变汇编。
+
+真差别不是语言，是**能不能把每行的取样器内联掉**（200×1.6M 像素，取三次最好）：
+
+| 窄条带（4px × 40 万行） | 耗时 | 相对纯铺 |
+|---|---|---|
+| 纯铺一个颜色（下限） | 46.2 ms | — |
+| 取样器经**函数指针**传入（C 的唯一写法） | 51.3 ms | **+11.0%** |
+| 取样器作**模板参数**（可内联） | 46.9 ms | **+1.5%** |
+| 取样器走 `std::function` | 110.1 ms | **+138.4%** |
+
+也就是说：C++ 在这类代码上不是"更慢的选择"，反而是"能把热路径内联掉"的那一侧。
+
+### 异常策略：绝不越过 ABI
+
+- 每个 `extern "C"` 入口都是**顶层 try/catch**：
+  `std::bad_alloc` → `BGPU_ERR_OUT_OF_MEMORY`；其它 `std::exception` →
+  `BGPU_ERR_BACKEND_FAILED` 并把 `what()` 写进 `bingpu_last_error()`；未知异常同样兜住
+  （错误串写"未知异常"）。**没有任何异常能穿出这一层。**
+- 注意：公共头里这些函数**没有** `noexcept`（头是冻结的 ABI，不动；而 C++ 要求声明与
+  定义的异常规格一致，所以也不能只在定义上补）。等价保证由 try/catch 提供 ——
+  绑定的作者可以当它们是 noexcept 的。
+- 后端内部（C++ 层）该怎么抛就怎么抛：容器分配失败直接让 `bad_alloc` 冒到入口兜住，
+  比自己到处写 `if (!ptr) return OOM;` 可靠得多。
+
+### 唯一的对外代价：静态库带 C++ 运行时
+
+`libbingpu.a` 里是 C++ 符号，**链接时必须带 C++ 运行时**：
+
+- 用 C++ 驱动链接（`g++ … libbingpu.a`）最省事 —— 我们的 `Makefile`/`CMakeLists` 就是这么做的
+  （`-static-libgcc -static-libstdc++` 静态链进去，产物自包含）；
+- 用 C 驱动（`gcc … libbingpu.a`）或给别的语言绑时，要自己加 `-lstdc++`（或让它把运行时
+  静态链进去）。`make abi-check` 的第三条就是这个场景的冒烟检查：
+  C 目标文件 + C++ 静态库 → `g++` 链接 → 跑起来。
+- 这条代价是"实现用 C++"换来的、也是唯一一条；头文件本身仍然没有任何 C++ 依赖，
+  `gcc -x c` 编它不需要 libstdc++。
+
+---
+
 ## 1. 句柄：`uint64_t`，0 永远无效
 
 - 7 种句柄：`BgpuDevice / BgpuSwapchain / BgpuTexture / BgpuBuffer / BgpuSampler /
@@ -96,13 +148,13 @@ while (bingpu_poll(dev, &ev) == BGPU_OK && ev.kind != BGPU_EVENT_NONE) { ... }
 这类 bug 的代价远高于"多一次 poll"。绑定的目标语言也可以把 poll 包装成"每帧取一批事件"
 的迭代器，用起来并不会更麻烦。
 
-## 7. 已知的 ABI 粗糙处（0.1.0 记录，0.2.0 再动）
+## 7. 已知的 ABI 粗糙处（0.1.0 记录；0.2.0 只换实现语言，ABI 未动，留给 ABI 2）
 
 1. **`draw_indexed` 的两个偏移是字节偏移**（与 `buffer_update` 一致），但名字看不出单位。
-   绑定作者很容易传成"索引个数/顶点个数"。0.2.0 建议改名 `vertex_byte_offset` /
+   绑定作者很容易传成"索引个数/顶点个数"。建议改名 `vertex_byte_offset` /
    `index_byte_offset`（改名属于 ABI 变化，要 +1 —— 所以先记录，不乱动）。
 2. **没有深度纹理格式**：`depth_target` 用 `RENDER_TARGET` 纹理表示，后端自己解释成深度
-   （CPU = float32）。0.2.0 建议加 `BGPU_TEXTURE_DEPTH` 标志或 `BGPU_FORMAT_D32F`。
+   （CPU = float32）。建议加 `BGPU_TEXTURE_DEPTH` 标志或 `BGPU_FORMAT_D32F`。
 3. **`BgpuStats` 的计数是累计值**（设备生命周期内），不是"本帧"。语义已写在这里；
    要"本帧"就在上层做差。
 4. **`bingpu_device_lost` 返回 `int`**（0/1），与 `BgpuResult` 风格不一致 —— 它是查询，

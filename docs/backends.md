@@ -2,23 +2,76 @@
 
 ## 现状表
 
-| 后端 | 状态 | 能做什么 | 不能做什么 |
+| 后端 | 状态（类） | 能做什么 | 不能做什么 |
 |---|---|---|---|
-| `NULL` | **已实现**（0.1.0） | 完整状态机、参数/句柄校验、绘制计数 | 不产生像素；回读返回 `UNSUPPORTED` |
-| `CPU` | **已实现**（0.1.0） | 参考像素实现；离屏目标；深度；采样器；仿射；网格；回读 | 不能开窗口（`UNSUPPORTED`）；无 MSAA；无 mip 采样 |
+| `NULL` | **已实现**：`NullBackend` | 完整状态机、参数/句柄校验、绘制计数 | 不产生像素；回读返回 `UNSUPPORTED` |
+| `CPU` | **已实现**：`CpuBackend` | 参考像素实现；离屏目标；深度；采样器；仿射；网格；回读 | 不能开窗口（`UNSUPPORTED`）；无 MSAA；无 mip 采样 |
 | `VULKAN` | 登记，未实现 | — | 任何 `device_create` 都返回 `UNSUPPORTED` + 原因 |
 | `D3D12` | 登记，未实现 | — | 同上 |
 | `GL` | 登记，**不迁** | — | 同上（理由见下） |
 
-`AUTO` 的挑选顺序（`bgpu_vt_auto()` 的遍历顺序）：
+`AUTO` 的挑选顺序（注册表的遍历顺序，实现在 `src/bingpu_error.cpp`）：
 
 ```
 VULKAN → D3D12 → GL → CPU → NULL
 ```
 
-也就是"真实后端优先，最后才是 CPU 与 NULL"。0.1.0 里前三个都不可用，所以 `AUTO`
+也就是"真实后端优先，最后才是 CPU 与 NULL"。目前前三个都不可用，所以 `AUTO`
 落到 **CPU**。上层不该假设 AUTO 一定选到哪个 —— 拿到设备后用 `bingpu_device_info()`
 读 `backend` 字段。
+
+---
+
+## 后端在代码里长什么样（0.2.0 起是 C++ 类）
+
+```cpp
+class Backend {                       // src/bingpu_backend.h：接口，形状照 binUI 的 IBinUIGfx
+    virtual BgpuBackendKind kind() const noexcept = 0;
+    virtual const char* name() const noexcept = 0;
+    virtual bool available() const noexcept = 0;      // 登记了但没实现 → false
+    virtual BgpuResult createDevice(...);             // 设备
+    virtual BgpuResult createSwapchain(...);          // 交换链 / 帧
+    virtual BgpuResult createTexture(...);            // 资源
+    virtual BgpuResult createBuffer(...);
+    virtual BgpuResult createSampler(...);
+    virtual BgpuResult createPipeline(...);
+    virtual BgpuResult createCmd(...);                // 命令
+    virtual BgpuResult drawQuads(...);
+    virtual BgpuResult drawIndexed(...);
+    // … beginRender/endRender/setXxx/readback
+};
+
+class BackendBase : public Backend {  // 两个后端**一字不差**的那部分
+    // 命令状态机、参数校验、stats 计数，以及 5 个钩子：
+protected:
+    virtual void        presentFrame(Swapchain&);                 // CPU: back→front
+    virtual BgpuResult  prepareDepth(Texture&, Texture&, desc);   // CPU: 懒分配+清除
+    virtual BgpuResult  clearColor(Texture&, uint32_t);           // CPU: 写预乘像素
+    virtual BgpuResult  rasterQuads(Cmd&, const BgpuVertex*, n);  // CPU: 光栅
+    virtual BgpuResult  rasterIndexed(...);                       // CPU: 光栅
+};
+
+class NullBackend final : public BackendBase { /* 钩子全用基类空实现 */ };
+class CpuBackend  final : public BackendBase { /* 覆盖钩子 + 资源分配 */ };
+```
+
+为什么 0.1.0 的"两个后端各写一套状态机"不再需要：
+  当时的价值是**交叉验证**校验逻辑。这份价值现在由 `tests/test_abi.c` 固定住了
+  （同样的误用 → 同样的结果码，239 条断言）。收成一份之后，"两个后端给出不同结果码"
+  在结构上就不可能发生 —— 这比"靠人肉保持一致"可靠。
+
+资源管理一律 RAII：`CpuTexture`/`CpuBuffer`/`CpuSwapchain` 的析构负责释放像素/缓冲/位图
+并回写 `stats.bytes_live`；"显式 destroy"和"设备销毁连带清理"走的是同一份析构。
+
+将来加后端 = 新写一个类 + 在注册表里登记一行：
+
+| 后端 | 类 | 覆盖什么 |
+|---|---|---|
+| Vulkan | `VkBackend` | 全部（真实实现） |
+| D3D12 | `D3D12Backend` | 全部（真实实现） |
+| （若迁 GL） | `GlBackend` | 全部 |
+
+共享的 `BackendBase` 不用改 —— 状态机、校验、计数是后端无关的。
 
 ---
 
@@ -44,7 +97,7 @@ CPU 后端的定位不是"没有 GPU 时的降级"，而是**像素定义的权�
 | 无设备丢失 | `bingpu_device_lost()` 恒 0；`poll()` 永远 `NONE` |
 | 法线不参与 | 网格按"顶点色 × 纹理"着色（没有光源状态，见欠账） |
 
-## Vulkan：第一个真实后端（0.2.0）
+## Vulkan：第一个真实后端（排期在 0.2.0 之后）
 
 目标不是"能画"，而是"**和 CPU 逐字节一致**"。开工顺序：
 
@@ -79,11 +132,11 @@ descriptor heap、fence、swap chain flip model），它验证"状态机 + 资�
 - 真要统一的时机：**bin2d 需要 GPU 加速、且 VK/D3D12 已经稳定**之后。那时 GL 可以作为
   "没有 VK 的旧机器"的兜底后端再进来，而不是现在。
 
-## 欠账（0.1.0 明确不做，记在这里）
+## 欠账（明确不做，记在这里）
 
-1. **用户着色器 / SPIR-V**：bin3d 进 GPU 阶段的前提，0.2.0 之后。
+1. **用户着色器 / SPIR-V**：bin3d 进 GPU 阶段的前提，排在 VK 后端之后。
 2. **深度纹理格式**：现在用 `RENDER_TARGET` 纹理当深度目标（后端自己解释）。
-   建议 0.2.0 加 `BGPU_TEXTURE_DEPTH` 或 `BGPU_FORMAT_D32F`。
+   建议将来加 `BGPU_TEXTURE_DEPTH` 或 `BGPU_FORMAT_D32F`。
 3. **MSAA**：`desc.msaa_samples` 已预留，CPU 降级为 1；VK/D3D12 落地时按需打开。
    注意：**MSAA 会让"与 CPU 逐像素一致"变成"边界容忍 1px"**，需要单独设计验收方式。
 4. **网格光照**：`BgpuMeshVertex` 带法线，但没有光源/材质状态可以喂给它。

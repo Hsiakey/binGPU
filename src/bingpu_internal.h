@@ -1,168 +1,160 @@
-/* bingpu_internal.h —— binGPU 内部契约（不对外，也不进 include/）
+/* bingpu_internal.h —— 内部基础设施（句柄表 / 对象基类 / 错误槽 / 后端注册表）
  *
- * 为什么要有这一层：
- *   公共头 include/bingpu.h 是"句柄 + 扁平函数"，但实现需要三样它不能有的东西：
- *   ① 一张 句柄 → 对象 的表（句柄是 uint64_t，不能是指针）；
- *   ② 一个后端虚表（NULL / CPU / 将来的 VK 各实现一份，上层入口按句柄找到后端转发）；
- *   ③ 线程本地的错误槽（公共头只暴露字符串）。
- *   这些都放在这里，并且**只有 .c 引用** —— 一旦 include/ 里出现这层的东西，
- *   abi-check 那关会把它当 C++ 一起拦下来（本文件用到 _Thread_local 等 C11 设施）。
+ * 为什么它不在 include/ 里：
+ *   公共头 bingpu.h 是**冻结的 C ABI**（只有定长 POD + uint64_t 句柄 + 扁平函数，
+ *   必须能被纯 C 编译器单独编过）。本文件是 C++ 实现面的东西 —— 容器、unique_ptr、
+ *   std::string —— 一旦漏进 include/，`make abi-check` 那一步就会把它当 C++ 设施拦下来。
  *
- * 句柄布局（64 位，全 0 = 无效）：
- *   [63:60] 对象种类（1..7）  [59:32] 代数（28 位）  [31:0] 槽位 + 1
- *   代数在每次 destroy 时 +1：旧句柄于是"自然失效"，不需要额外的黑名单。
- *   槽位 +1 是为了让"第 0 槽"的句柄不等于 0（0 必须永远是无效句柄）。
+ * 语言/ABI 的分工（2026-11-15 定）：
+ *   ABI 看的是"谁 include 它"（Python/Go/Rust 绑的是 C 面）；实现看的是表达力
+ *   （句柄表、容器、生命周期、错误串拼接，在 C 里全是手写样板）。两者互不牵制：
+ *   C++ 写、导出 C 符号是 Vulkan loader / HarfBuzz / bgfx / Skia 的常规做法。
+ *
+ * 句柄布局（64 位，全 0 = 无效）—— 与 0.1.0 的 C 实现逐位相同，行为不变：
+ *   [63:60] 种类（1..7）  [59:32] 代数（28 位）  [31:0] 槽位 + 1
+ *   销毁时代数 +1：旧句柄自然失效，复用的槽也不会让旧句柄"复活"。
  */
-#ifndef BINGPU_INTERNAL_H
-#define BINGPU_INTERNAL_H
+#pragma once
 
-#include <stddef.h>
-#include <stdint.h>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
 
 #include "bingpu.h"
 
+namespace bgpu {
+
+class Backend;
+
 /* ---------------------------------------------------------------
- * 对象种类（句柄高 4 位）
+ * 对象基类
+ *
+ * 每个对象都记住自己的后端（`be`）与所属设备（`device`）：
+ *   · 上层入口按句柄拿到对象之后，直接用 `obj->be->xxx(...)` 转发；
+ *   · 设备销毁时按 `device` 字段扫表，连带清理（最后一道保险）。
+ * 析构函数是虚的：所有资源释放（像素/缓冲/位图）都写在子类析构里（RAII），
+ * 所以"显式 destroy"和"设备连带清理"走的是同一份代码 —— 这是 C++ 化最直接的收益：
+ * 0.1.0 的 C 版两条销毁路线必须手工保持一致，现在不可能不一致。
  * --------------------------------------------------------------- */
-enum BgpuObjKind {
-    BGPU_OBJ_DEVICE = 1,
-    BGPU_OBJ_SWAPCHAIN = 2,
-    BGPU_OBJ_TEXTURE = 3,
-    BGPU_OBJ_BUFFER = 4,
-    BGPU_OBJ_SAMPLER = 5,
-    BGPU_OBJ_PIPELINE = 6,
-    BGPU_OBJ_CMD = 7
+enum ObjKind : uint32_t {
+    kObjDevice = 1,
+    kObjSwapchain = 2,
+    kObjTexture = 3,
+    kObjBuffer = 4,
+    kObjSampler = 5,
+    kObjPipeline = 6,
+    kObjCmd = 7
 };
 
-#define BGPU_HANDLE_KIND_SHIFT 60
-#define BGPU_HANDLE_GEN_SHIFT 32
-#define BGPU_HANDLE_INDEX_MASK 0xFFFFFFFFull
+/* 借用对象（交换链借出的帧目标）不许销毁 */
+inline constexpr uint32_t kObjFlagBorrowed = 1u;
 
-/* 对象标志：借用对象不许被销毁（交换链借出的帧目标，见 docs/abi.md） */
-#define BGPU_OBJ_F_BORROWED 1u
+struct ObjectBase {
+    uint32_t kind;
+    uint32_t backend;
+    uint32_t flags = 0;
+    BgpuDevice device = BGPU_INVALID;
+    Backend* be = nullptr;
 
-/* 每个资源对象的头部：定位后端、判断"属于哪个设备"全靠它 */
-typedef struct BgpuObjectBase {
-    uint32_t kind;       /* BgpuObjKind */
-    uint32_t backend;    /* BgpuBackendKind */
-    uint32_t obj_flags;  /* BGPU_OBJ_F_* */
-    uint32_t reserved;   /* 对齐用，保持头部 24 字节 */
-    BgpuDevice device;   /* 所属设备句柄；设备自己为 0 */
-} BgpuObjectBase;
+    /* 定义内联在 bingpu_backend.h（那里 Backend 是完整类型，才能取 b.kind()） */
+    ObjectBase(uint32_t k, Backend& b, BgpuDevice owner);
+    virtual ~ObjectBase() = default;
+
+    /* 某个对象即将被销毁：别的对象里若存着指向它的裸指针，在这里清掉。
+     * 为什么需要：cmd 的状态里存着 target/depth/pipeline/texture/sampler 的指针
+     * （避免每次 draw 都查表）。如果调用方在帧中途 destroy 了管线，下一笔 draw 就会
+     * 撞上悬空指针 —— 0.1.0 的 C 版有这个洞（UB），C++ 版顺手补上：
+     * 销毁前通知所有活对象把引用清空，之后的使用变成"没有管线"的 STATE 错误。 */
+    virtual void onPeerDestroyed(ObjectBase&) {}
+};
 
 /* ---------------------------------------------------------------
  * 对象表
- *
- * 设计取舍：析构函数**存在表里**（和对象一起注册），而不是在后端虚表里再开一组
- * xxx_destroy。理由：销毁路径有两条 —— 显式 destroy 和"设备销毁时连带清理" ——
- * 两条都必须做同一件事（释放像素/缓冲 + 摘槽）；存一份就不可能两边走偏。
- * 于是后端的 destroy 义务只有"把资源指针交给 dtor"这一件。
  * --------------------------------------------------------------- */
-/* 注册新对象；失败返回 BGPU_INVALID（内存不够）。dtor 可为 NULL。 */
-uint64_t bgpu_obj_new(uint32_t kind, BgpuBackendKind backend, BgpuDevice owner,
-                      size_t bytes, void (*dtor)(void*));
-/* 按句柄取对象；种类不符 / 已销毁 / 越界一律返回 NULL。kind 传 0 表示不限种类。 */
-void* bgpu_obj_get(uint64_t handle, uint32_t kind);
-/* 销毁单个对象：调 dtor、清槽、代数 +1。无效句柄无副作用。 */
-void bgpu_obj_destroy(uint64_t handle);
-/* 销毁某设备名下所有还活着的对象（不含设备自己），返回销毁个数。 */
-uint32_t bgpu_obj_destroy_owned(BgpuDevice device);
-/* 还活着的对象数（shutdown 自检 / bingpu_info 用）。 */
-uint32_t bgpu_obj_count(void);
-/* 清空整张表（bingpu_shutdown 用；调用前必须保证对象已全部 destroy 过）。 */
-void bgpu_obj_reset(void);
+uint64_t registerObject(std::unique_ptr<ObjectBase> obj);
+ObjectBase* lookupObject(uint64_t handle, uint32_t kind) noexcept;
+void destroyObject(uint64_t handle);
+uint32_t destroyOwnedObjects(BgpuDevice device);
+uint32_t liveObjectCount() noexcept;
+void resetObjects();
+
+template <class T, class... A>
+uint64_t makeObject(A&&... args) {
+    return registerObject(std::make_unique<T>(std::forward<A>(args)...));
+}
 
 /* ---------------------------------------------------------------
  * 错误槽
  *
- * 一切失败都必须让 last_error 非空 —— 这是 docs/abi.md 里对绑定的承诺。
- * 分工：
- *   · 上层入口（api.c）发现参数/句柄/顺序问题 → bgpu_fail(...) 直接写完整串；
- *   · 后端只用自己的上下文细节写"原因"（bgpu_set_reason），由入口拼成
- *     "<函数>: <原因> (file:line)"。
- * 这样后端不需要知道公共函数叫什么，错误串又总是以调用方看见的函数名开头。
+ * 语义与 0.1.0 完全一致（`docs/abi.md` 是对外承诺）：
+ *   · 每次失败都写；成功不清空（GetLastError 语义）；
+ *   · 格式 `<函数>: <原因> (file:line)`；后端原话拼进 <原因>；
+ *   · _Thread_local —— 别的线程的失败不会串台。
+ * 实现从"定长 char 缓冲 + snprintf"换成 thread_local std::string：
+ * 不再有 512 字节上限，也不用担心截断把函数名吃掉。
+ *
+ * 错误串里那个 `<函数>` 是**公共函数名**：每个 extern "C" 入口用 ApiScope 设置，
+ * 后端内部失败时用 fail(...) 写，于是 file:line 指向真正的失败位置（后端 .cpp），
+ * 而函数名仍然是调用方看见的那个 —— 绑定作者两边都能对上。
  * --------------------------------------------------------------- */
-unsigned bgpu_error_seq(void);                 /* 单调递增；用来判断"这次调用有没有写错误" */
-void     bgpu_set_reason(const char* fmt, ...);
-const char* bgpu_take_reason(void);            /* 取走原因（取后清空），没写过返回 "" */
+class ApiScope {
+public:
+    explicit ApiScope(const char* fn) noexcept;
+    ~ApiScope() noexcept;
+    ApiScope(const ApiScope&) = delete;
+    ApiScope& operator=(const ApiScope&) = delete;
 
-BgpuResult bgpu_fail(BgpuResult result, const char* fn, const char* file, int line,
-                     const char* fmt, ...);
-BgpuResult bgpu_fail_from(BgpuResult result, const char* fn, const char* file, int line);
+private:
+    const char* prev_;
+};
 
-/* 描述结构体的最低长度校验（ABI 尾字段兼容：只要求覆盖当前已知布局） */
-static inline int bgpu_size_ok(uint32_t struct_size, size_t want) {
-    return struct_size >= (uint32_t)want;
+unsigned errorSeq() noexcept;
+const char* currentFn() noexcept;
+void setReason(std::string text);
+std::string takeReason();
+
+BgpuResult fail(BgpuResult rc, const char* file, int line, std::string msg);
+BgpuResult failFrom(BgpuResult rc, const char* file, int line);
+BgpuResult failOom(const char* file, int line);
+BgpuResult failExc(const char* file, int line, const char* what);
+BgpuResult failUnknown(const char* file, int line);
+
+/* 后端调用收口：后端返回非 OK 但没写错误串时，用结果名兜底 —— 保证 last_error 非空 */
+BgpuResult settle(BgpuResult rc, const char* file, int line, unsigned seqBefore);
+
+/* 小工具：拼接任意可打印片段（错误串用；性能不是这一层的关注点） */
+inline void appendTo(std::string& s, const char* v) { s += v ? v : "(null)"; }
+inline void appendTo(std::string& s, const std::string& v) { s += v; }
+inline void appendTo(std::string& s, std::string_view v) { s += v; }
+inline void appendTo(std::string& s, char v) { s += v; }
+template <class T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, char>, int> = 0>
+inline void appendTo(std::string& s, T v) {
+    s += std::to_string(v);
 }
 
+template <class... A>
+std::string cat(const A&... args) {
+    std::string s;
+    (appendTo(s, args), ...);
+    return s;
+}
+
+/* 两个后端共用的能力上限（避免"这里能跑那里不能"的糊味） */
+inline constexpr uint32_t BGPU_MAX_TEXTURE_SIZE = 8192u;
+inline constexpr uint32_t BGPU_MAX_QUADS_PER_DRAW = 1u << 20;
+
 /* ---------------------------------------------------------------
- * 后端虚表
- *
- * 入参都是"对象指针"（后端自己的结构体），不是句柄 —— 句柄查找/校验/设备归属
- * 留在 api.c，后端只管语义。返回码必须是 BgpuResult；失败时后端应调
- * bgpu_set_reason() 留下原话（可以不留，入口会退化成结果名）。
+ * 后端注册表（实现在 bingpu_error.cpp）
  * --------------------------------------------------------------- */
-typedef struct BgpuVt {
-    BgpuBackendKind kind;
-    const char* name;
-    int (*available)(void);
-    const char* unavailable_reason;   /* available()==0 时给调用方的解释 */
+Backend* backendOf(BgpuBackendKind kind) noexcept;
+Backend* backendAuto() noexcept;
+const char* backendUnavailableReason(BgpuBackendKind kind) noexcept;
+uint32_t backendCount() noexcept;
+BgpuBackendKind backendAt(uint32_t index) noexcept;
+const char* backendName(BgpuBackendKind kind) noexcept;
+int backendAvailable(BgpuBackendKind kind) noexcept;
 
-    /* 设备 */
-    BgpuResult (*device_create)(const BgpuDeviceDesc* desc, BgpuDevice* out_device);
-    void (*device_info)(void* dev, BgpuDeviceInfo* out);
-    void (*device_caps)(void* dev, BgpuCaps* out);
-    void (*device_stats)(void* dev, BgpuStats* out);
-    int (*device_lost)(void* dev);
-
-    /* 交换链 / 帧 */
-    BgpuResult (*swapchain_create)(void* dev, const BgpuSwapchainDesc* desc,
-                                   BgpuSwapchain* out);
-    BgpuResult (*swapchain_resize)(void* sc, uint32_t w, uint32_t h);
-    void (*swapchain_info)(void* sc, BgpuSwapchainInfo* out);
-    BgpuResult (*frame_begin)(void* sc, void* cmd, BgpuTexture* out_target);
-    BgpuResult (*frame_end)(void* sc, void* cmd);
-    BgpuResult (*frame_read)(void* sc, void* dst, size_t dst_size, uint32_t* out_stride);
-
-    /* 纹理 */
-    BgpuResult (*texture_create)(void* dev, const BgpuTextureDesc* desc, BgpuTexture* out);
-    void (*texture_info)(void* tex, BgpuTextureInfo* out);
-    BgpuResult (*texture_upload)(void* tex, const BgpuBox* box, const void* pixels,
-                                 uint32_t stride);
-    BgpuResult (*texture_read)(void* tex, void* dst, size_t dst_size, uint32_t* out_stride);
-
-    /* 缓冲 */
-    BgpuResult (*buffer_create)(void* dev, const BgpuBufferDesc* desc, BgpuBuffer* out);
-    BgpuResult (*buffer_update)(void* buf, uint32_t offset, const void* data, uint32_t size);
-
-    /* 采样器 / 管线 */
-    BgpuResult (*sampler_create)(void* dev, const BgpuSamplerDesc* desc, BgpuSampler* out);
-    BgpuResult (*pipeline_create)(void* dev, const BgpuPipelineDesc* desc, BgpuPipeline* out);
-
-    /* 命令缓冲 */
-    BgpuResult (*cmd_create)(void* dev, BgpuCmd* out);
-    BgpuResult (*cmd_begin_render)(void* cmd, const BgpuRenderBeginDesc* desc);
-    BgpuResult (*cmd_end_render)(void* cmd);
-    BgpuResult (*cmd_set_viewport)(void* cmd, float x, float y, float w, float h);
-    BgpuResult (*cmd_set_scissor)(void* cmd, int32_t x, int32_t y, int32_t w, int32_t h);
-    BgpuResult (*cmd_set_pipeline)(void* cmd, void* pipeline);
-    BgpuResult (*cmd_set_texture)(void* cmd, void* tex, void* sampler);
-    BgpuResult (*cmd_set_affine)(void* cmd, const float xf[6]);
-    BgpuResult (*cmd_draw_quads)(void* cmd, const BgpuVertex* vertices, uint32_t quad_count);
-    BgpuResult (*cmd_draw_indexed)(void* cmd, void* vb, uint32_t vertex_offset, void* ib,
-                                   uint32_t index_count, uint32_t index_offset);
-} BgpuVt;
-
-const BgpuVt* bgpu_vt(BgpuBackendKind kind);   /* 未注册的种类返回 NULL */
-const BgpuVt* bgpu_vt_auto(void);              /* AUTO 的挑选结果（见 bingpu_error.c） */
-/* "这个后端为什么不可用"的可读原因（未登记种类返回"未知后端"） */
-const char* bgpu_backend_unavailable_reason(BgpuBackendKind kind);
-
-extern const BgpuVt bgpu_null_vt;
-extern const BgpuVt bgpu_cpu_vt;
-
-/* 两个后端共用的能力上限，避免"这里能跑那里不能"的糊味 */
-#define BGPU_MAX_TEXTURE_SIZE 8192u
-#define BGPU_MAX_QUADS_PER_DRAW (1u << 20)
-
-#endif /* BINGPU_INTERNAL_H */
+}  // namespace bgpu

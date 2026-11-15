@@ -8,7 +8,7 @@
 
 ## 1. 只有一套绘制面：原语 + 状态，没有用户着色器
 
-0.1.0 的绘制能力就是：四边形（`draw_quads`）、索引网格（`draw_indexed`）、十来个状态
+目前的绘制能力就是：四边形（`draw_quads`）、索引网格（`draw_indexed`）、十来个状态
 （viewport / scissor / pipeline / texture / sampler / affine）。
 
 **为什么**：这一层的目标是"同一件事只写一遍"，不是"再做一个 RHI"。用户着色器会立刻带来
