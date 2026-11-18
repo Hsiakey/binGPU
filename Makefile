@@ -16,6 +16,7 @@
 #   all        静态库 + 测试 + 工具
 #   test       编好后逐个跑，任何失败非 0 退出（CI 就认这个）
 #   bench      固定场景的 CPU 后端吞吐基准（同时打印像素校验和，见 docs/perf.md）
+#   smoke      窗口路径烟测（VK / D3D11 / GL 各一遍；要开真窗口，不进 CI）
 #   abi-check  ①纯 C 编译器单独编 include/bingpu.h（混进 C++ 语法当场炸）
 #              ②grep 守规矩：头里不许 C++ 类型/命名空间/容器头
 #              ③冒烟：C 目标文件 + C++ 静态库能被 g++ 链接成可执行并跑起来
@@ -68,6 +69,8 @@ $(OBJ_DIR)/bingpu_cpu.o: CXXFLAGS += -O3
 $(OBJ_DIR)/bingpu_vk.o: CXXFLAGS += -Ithird_party/vulkan/include
 # D3D11 后端：d3d11.h / dxgi.h 由 MinGW-w64 自带（在默认搜索路径里），不需要额外 -I；
 # 运行期只 LoadLibrary(d3d11.dll)，不链接 d3d11.lib/dxgi.lib —— 所以链接行也不用加库。
+# GL 后端：**不 include 任何 GL 头**（MinGW 的 GL/gl.h 只有 1.1 的枚举），类型与常量在
+# bingpu_gl.cpp 里自带；运行期只 LoadLibrary(opengl32.dll/gdi32.dll)，不链接 opengl32.lib。
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
@@ -80,7 +83,7 @@ $(LIB_A): $(LIB_OBJS)
 # =============================================
 # 测试（C 源码 → gcc 编 → g++ 链接；见文件头）
 # =============================================
-TEST_NAMES := test_abi test_cpu_render test_vk_render test_d3d11_render
+TEST_NAMES := test_abi test_cpu_render test_vk_render test_d3d11_render test_gl_render
 TEST_BINS  := $(addprefix $(TEST_DIR)/,$(addsuffix $(EXT),$(TEST_NAMES)))
 
 $(OBJ_DIR)/tests/%.o: $(TEST_SRC)/%.c
@@ -94,7 +97,8 @@ $(TEST_DIR)/%$(EXT): $(OBJ_DIR)/tests/%.o $(LIB_A)
 # =============================================
 # 工具（同样是 C 源码）
 # =============================================
-TOOL_BINS := $(BIN_DIR)/bingpu_info$(EXT) $(BIN_DIR)/bingpu_bench$(EXT)
+TOOL_BINS := $(BIN_DIR)/bingpu_info$(EXT) $(BIN_DIR)/bingpu_bench$(EXT) \
+             $(BIN_DIR)/gpu_window_smoke$(EXT)
 
 $(OBJ_DIR)/tools/%.o: tools/%.c
 	@mkdir -p $(dir $@)
@@ -107,13 +111,25 @@ $(BIN_DIR)/%$(EXT): $(OBJ_DIR)/tools/%.o $(LIB_A)
 # =============================================
 # 目标
 # =============================================
-.PHONY: all test bench abi-check clean
+.PHONY: all test bench abi-check smoke clean
 
 all: $(LIB_A) $(TEST_BINS) $(TOOL_BINS)
 
 # 基准：固定场景 + 校验和（见 tools/bingpu_bench.c 的文件头）
 bench: $(BIN_DIR)/bingpu_bench$(EXT)
 	@./$(BIN_DIR)/bingpu_bench$(EXT)
+
+# 窗口路径烟测：三个真后端各跑一遍（交换链 / present / frame_read / resize）。
+# 为什么它不在 `test` 里：这一项要开真窗口，CI 机上没有桌面会话时跑不了；
+# 但每次"真后端落地"都该手动跑一次，所以给它固定的入口（见 tools/gpu_window_smoke.c）。
+smoke: $(BIN_DIR)/gpu_window_smoke$(EXT)
+	@fail=0; \
+	for b in vk d3d11 gl; do \
+	    echo "=== $$b ==="; \
+	    ./$(BIN_DIR)/gpu_window_smoke$(EXT) $$b || fail=1; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "SMOKE FAILED"; exit 1; fi; \
+	echo "window smoke passed"
 
 test: $(TEST_BINS)
 	@fail=0; \

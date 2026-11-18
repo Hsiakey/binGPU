@@ -4,6 +4,57 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.5.0] - 2026-11-18
+
+**OpenGL 后端落地**（`src/bingpu_gl.cpp`，`GlBackend`）：`docs/layering.md` §5 排的顺序里
+第三个、也是**最后一个异族**后端。GL 把"异族"推到极端：没有命令缓冲、没有 PSO、资源是
+绑定点上的全局状态，连"深度附件"都不是对象而是 framebuffer 的一个挂点 —— 而
+`tests/gpu_parity.h` 那份 12 个用例的规格**一个字没改**就跑出了与 CPU 逐像素 0 差。
+
+三个真实后端现在互相**逐位相同**：同一张复合场景（五种混合 + 接缝 + 重复纹理 + 旋转仿射 +
+深度 + 网格），GL 输出的 PNG 与 D3D11 输出的 PNG **sha256 都一样**。
+
+| 用例 | GL vs CPU |
+|---|---|
+| clear / 覆盖 / 五种混合 / 接缝 / scissor / viewport / affine / 最近+重复 / 局部上传 / 深度 / 网格 | **0 像素差** |
+| 双线性取样 | 12.158% 像素、最大通道差 **1**（与 VK/D3D11 完全同一组数字） |
+
+### Added
+
+- **`GlBackend`**：设备（WGL + **OpenGL 3.3 core**，无窗口时用一个隐藏窗口的 DC）/
+  交换链（窗口 = 默认帧缓冲 + `SwapBuffers`；HEADLESS = 离屏纹理挂 FBO）/
+  `frame_read`（窗口在 `SwapBuffers` 前读一份并翻行；离屏直接读 FBO）/
+  纹理上传与回读（内部一律 RGBA8，BGRA8 只在边界换）/ 缓冲（VBO/IBO）/
+  采样器对象 / 五种混合 + 深度 + 剔除 / `draw_quads` + `draw_indexed` / 仿射 / 深度附件。
+- **零 GL 开发包**：不 include `<GL/gl.h>`（它只有 1.1 的枚举），类型与常量自带；
+  函数一律 `wglGetProcAddress` 优先、`opengl32.dll` 兜底；**不链接** `opengl32.lib`。
+- 状态剔除（`layering.md` §6.2）：混合/深度/剔除/纹理/采样器/裁剪矩形都只在真的变了才发 GL 调用。
+- **`tools/gpu_window_smoke.c` + `make smoke`**：把"窗口路径"从临时程序升成仓库工具 ——
+  三个真后端各开一个真窗口跑 3 帧 clear 往返 + 四边形位置 + resize 后的客户区尺寸。
+  这一项要桌面会话，所以不进 `make test`，但每个真后端落地都该跑一次。
+- 三个真后端的**复合场景出图逐位相同**：同一份场景（五种混合 + 接缝 + 重复纹理 + 旋转仿射 +
+  深度 + 网格）经 VK / D3D11 / GL 渲出 320×240，三个 BMP 的 MD5 完全一致；与 CPU 参考后端比
+  只差双线性/斜边那 1.699% 像素、最大通道差 2。
+
+### Fixed（落地时踩到的）
+
+1. **`GL_SCISSOR_TEST` 的裁剪框默认值是建上下文那个窗口的大小**（离屏设备上是隐藏窗口的
+   8×8）。不每趟清成整目标的话，`clear` 只清左上角 8×8，其余像素是未初始化内容 —— clear
+   用例当场 98% 差异、其余涉及清屏的用例跟着红。现在 `begin_render` 里无条件
+   `glScissor(0,0,w,h)`（与 D3D11 每趟 `RSSetScissorRects` 对称）。
+2. **GL 的窗口原点在左下**：渲染到 FBO 时 `ndc.y = 2*s.y/h - 1`（存储行 0 = 图像顶行，
+   `glReadPixels` 自下而上正好对上，回读不用翻），渲染到默认帧缓冲时 `ndc.y = 1 - 2*s.y/h`
+   且读回要翻行。用一个 `uFlip` uniform + 一处 `flipRows` 收口，**用例表里看不出来**。
+
+### 明确没做（写进 `docs/backends.md` 的欠账）
+
+- MSAA / mip 链 / 透明窗口 / 多帧飞行（与 VK/D3D11 一致的清单）。
+- 一个 HWND 只能绑一个 GL 设备（WGL 的上下文绑在 DC 上，`contracts.md` §4 也是这么规定的）。
+
+### 版本
+
+- `0.5.0`（MINOR：新后端 = 新能力）；`BINGPU_ABI_VERSION` 仍是 **2**（GL 的枚举值 0.1.0 就在）。
+
 ## [0.4.0] - 2026-11-18
 
 **D3D11 后端落地**（`src/bingpu_d3d11.cpp`，`D3d11Backend`）：binGPU 有了第二个真后端，

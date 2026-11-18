@@ -250,5 +250,6 @@ Backend& nullBackend();
 Backend& cpuBackend();
 Backend& vkBackend();
 Backend& d3d11Backend();
+Backend& glBackend();
 
 }  // namespace bgpu

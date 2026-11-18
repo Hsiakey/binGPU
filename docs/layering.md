@@ -132,13 +132,13 @@ binUI / bin2d / bin3d 自己保证"同一份 UI/场景生成同一串 `BgpuVerte
 |---|---|---|---|---|
 | 1 | VK | 最显式，会把 ABI 的不足立刻顶出来 | ✅ **0.3.0 达成**：`raster_rules.md` 每条规则 vs CPU **0 差**（`tests/test_vk_render.c`）；窗口 + resize 烟测通过 | `binui_vk.cpp`（4534 行）→ 薄适配层 |
 | 2 | D3D11 | **异族模型的代表**，且 binUI 有现成实现（2270 行）可对拍；能反向验证"ABI 是不是太现代了" | ✅ **0.4.0 达成**：**同一份** 12 用例表 vs CPU **0 差**（`tests/test_d3d11_render.c` 全文一行 `main`）；窗口 3 帧 + resize 烟测通过 | `binui_d3d11.cpp` → 薄适配层 |
-| 3 | GL | 同为异族；旧机器兜底 | 同上 + `pixels`（18 张 GDI 基准） | `binui_gl.cpp`（2178 行）→ 薄适配层 |
+| 3 | GL | 同为异族；旧机器兜底 | ✅ **0.5.0 达成**：同一份 12 用例表 vs CPU **0 差**；窗口 3 帧 + resize 烟测通过，输出与 VK/D3D11 **逐字节相同** | `binui_gl.cpp`（2178 行）→ 薄适配层 |
 | 4 | Metal | 同族，实现最省力；但开的是**新平台** | 平台外壳 + 一套新建的像素基准 | — |
 | 待定 | D3D12 | 与 VK 同族，学不到新东西；目前没有用户 | — | — |
 
-**"异族不用模拟命令缓冲"这条推论已经由 D3D11 验证**（0.4.0）：D3D11 那边的 `BgpuCmd`
-只是"状态结构体 + 立即提交"，用例表一个字没改就逐像素对上了 CPU。这条对 GL 同样成立，
-所以 §4 的结论不是纸面推断。
+**"异族不用模拟命令缓冲"这条推论已经由 D3D11（0.4.0）和 GL（0.5.0）先后验证**：两个
+异族后端的 `BgpuCmd` 都只是"状态结构体 + 立即提交"，同一份用例表一个字没改就逐像素对上了
+CPU。§4 的结论因此不是纸面推断 —— 三个真实后端（同族 1 + 异族 2）现在互相逐位一致。
 
 **这条排期改动了 [`backends.md`](backends.md)**：原来写"VK → D3D12 → GL"，现在把 **D3D11
 提到 D3D12 之前**。理由：异族模型能验证"这套 ABI 对上一代 API 也成立"，而 D3D12 与 VK 同族，
@@ -242,9 +242,10 @@ BgpuResult bingpu_present(BgpuSwapchain sc, BgpuPresentMode mode);
 迁移完成的判据不是"代码变少"，而是：**binUI 三个后端加起来 < 800 行**（只剩"把
 `IBinUIGfx` 调用翻译成 `bingpu_cmd_*`"），且 `pixels` / `pixels-vk` / `pixels-d3d11` 三关全绿。
 
-**进度（0.4.0）**：binGPU 这边的两个前置条件已经齐了 —— VK 与 D3D11 后端都能开窗口、
-present、resize，并且与 CPU 参考后端逐像素 0 差。也就是说 `binui_vk.cpp` / `binui_d3d11.cpp`
-的**替换动作**现在可以开始了（删旧实现 → 薄适配 → 跑 binUI 的三关）。GL 还要等第三个后端。
+**进度（0.5.0）**：binGPU 这边**三个**真后端（VK / D3D11 / GL）都能开窗口、present、resize，
+并且与 CPU 参考后端逐像素 0 差 —— 与 §5 的排期完全对齐。也就是说 `binui_vk.cpp` /
+`binui_d3d11.cpp` / `binui_gl.cpp` 的**替换动作**三个都可以开始了（删旧实现 → 薄适配 →
+跑 binUI 的三关：`pixels` / `pixels-vk` / `pixels-d3d11`）。
 
 上层的两份对应文档（同一批写的，互相引用）：
 

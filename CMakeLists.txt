@@ -31,6 +31,7 @@ add_library(bingpu STATIC
     src/bingpu_cpu.cpp
     src/bingpu_d3d11.cpp
     src/bingpu_error.cpp
+    src/bingpu_gl.cpp
     src/bingpu_null.cpp
     src/bingpu_object.cpp
     src/bingpu_vk.cpp
@@ -71,7 +72,19 @@ set_target_properties(test_d3d11_render PROPERTIES LINKER_LANGUAGE CXX C_STANDAR
 target_link_libraries(test_d3d11_render PRIVATE bingpu)
 add_test(NAME d3d11_render COMMAND test_d3d11_render)
 
+add_executable(test_gl_render tests/test_gl_render.c)
+set_target_properties(test_gl_render PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11)
+target_link_libraries(test_gl_render PRIVATE bingpu)
+add_test(NAME gl_render COMMAND test_gl_render)
+
 # ---- 工具（同样是 C 源码）----
+add_executable(gpu_window_smoke tools/gpu_window_smoke.c)
+set_target_properties(gpu_window_smoke PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11)
+target_link_libraries(gpu_window_smoke PRIVATE bingpu)
+if(WIN32)
+    target_link_libraries(gpu_window_smoke PRIVATE gdi32)
+endif()
+
 add_executable(bingpu_info tools/bingpu_info.c)
 set_target_properties(bingpu_info PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11)
 target_link_libraries(bingpu_info PRIVATE bingpu)

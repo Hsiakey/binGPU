@@ -159,8 +159,7 @@ const Entry kBackends[] = {
     {BGPU_BACKEND_D3D11, "d3d11", &d3d11Backend(), nullptr},
     {BGPU_BACKEND_D3D12, "d3d12", nullptr,
      "未实现：D3D12 与 VK 同族、验证价值最低，排期见 docs/layering.md §5"},
-    {BGPU_BACKEND_GL, "gl", nullptr,
-     "未实现：GL 是异族（即时状态）的兜底后端，排在 D3D11 之后，见 docs/layering.md §4/§5"},
+    {BGPU_BACKEND_GL, "gl", &glBackend(), nullptr},
     {BGPU_BACKEND_CPU, "cpu", &cpuBackend(), nullptr},
     {BGPU_BACKEND_NULL, "null", &nullBackend(), nullptr},
 };

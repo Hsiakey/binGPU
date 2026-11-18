@@ -33,11 +33,12 @@
 | `bingpu_null.cpp` | `NullBackend`：只校验 + 计数 + 完整状态机 |
 | `bingpu_cpu.cpp` | `CpuBackend`：软件光栅、深度、采样、混合、回读 |
 | `bingpu_vk.cpp` | `VkBackend`：Vulkan 1.3（动态渲染）+ 固定管线 + 批量四边形；`__has_include` 缺头时退化成桩 |
+| `bingpu_gl.cpp` | `GlBackend`：WGL + OpenGL 3.3 core（全局绑定点状态）；自带 GL 类型/常量，不 include `<GL/gl.h>` |
 | `bingpu_d3d11.cpp` | `D3d11Backend`：即时上下文（无命令缓冲）+ 同一套固定管线；运行期 `LoadLibrary(d3d11.dll)`，不链接 d3d11.lib |
 | `bingpu_vk_shaders.h` | quad.vert/frag 的 SPIR-V 数组（`tools/gen_spv_header.py` 生成） |
 | `bingpu_d3d11_shaders.h` | quad.hlsl 的 DXBC 数组（`tools/gen_dxbc_header.py` 生成） |
 | `bingpu_internal.h` | 内部契约（句柄编码 / 对象表 / 错误槽），**不进 `include/`** |
 
 测试：`tests/test_abi.c`（契约）、`tests/test_cpu_render.c`（CPU 像素）、
-`tests/gpu_parity.h`（**GPU 后端 vs CPU 的共用用例表**）、`tests/test_vk_render.c` 与
-`tests/test_d3d11_render.c`（各一行 `main`，没有对应后端时整份跳过）；工具：`tools/bingpu_info.c`。
+`tests/gpu_parity.h`（**GPU 后端 vs CPU 的共用用例表**）、`tests/test_{vk,d3d11,gl}_render.c`
+（各一行 `main`，没有对应后端时整份跳过）；工具：`tools/bingpu_info.c`。

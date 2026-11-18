@@ -1,6 +1,6 @@
 # tests
 
-四个测试都是**纯 C 源码**（故意的：它们同时是"C 能消费这个 ABI"的证明），编成可执行文件后
+五个测试都是**纯 C 源码**（故意的：它们同时是"C 能消费这个 ABI"的证明），编成可执行文件后
 链接 `build-mingw/libbingpu.a`（实现是 C++，所以链接由 `g++` 做，带 libstdc++；见
 `docs/abi.md` §0）。没有第三方框架：断言就是 `CHECK` / `CHECK_EQ`（`printf` + 计数），
 失败时退出码 1。
@@ -11,6 +11,7 @@ build-mingw/bin/tests/test_abi
 build-mingw/bin/tests/test_cpu_render
 build-mingw/bin/tests/test_vk_render      # 没有可用 Vulkan 时整份跳过（exit 0）
 build-mingw/bin/tests/test_d3d11_render   # 没有可用 D3D11 时整份跳过（exit 0）
+build-mingw/bin/tests/test_gl_render      # 没有可用 GL 3.3 时整份跳过（exit 0）
 ```
 
 ## `test_abi.c` —— 契约
@@ -52,9 +53,9 @@ build-mingw/bin/tests/test_d3d11_render   # 没有可用 D3D11 时整份跳过�
 
 ## `gpu_parity.h` —— GPU 后端 vs CPU 的**共用**用例表
 
-`test_vk_render.c` 与 `test_d3d11_render.c` **各只有一行 `main`**，用例、判据、容差全在
-`gpu_parity.h` 里。加第四个 GPU 后端 = 再写一行；用例表不用动 —— 这是"一个定义 + 四份实现 +
-一套门禁"落到实处的地方（`docs/layering.md` §2 的 P1）。
+`test_vk_render.c`、`test_d3d11_render.c`、`test_gl_render.c` **各只有一行 `main`**，
+用例、判据、容差全在 `gpu_parity.h` 里。加第 N 个 GPU 后端 = 再写一行；用例表不用动 —— 这是
+"一个定义 + 四份实现 + 一套门禁"落到实处的地方（`docs/layering.md` §2 的 P1）。
 
 | 用例 | 钉住哪条规则 |
 |---|---|

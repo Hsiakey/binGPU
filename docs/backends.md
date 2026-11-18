@@ -12,7 +12,7 @@
 | `VULKAN` | **已实现（0.3.0）**：`VkBackend` | 设备 / 交换链 / present / 纹理上传回读 / 缓冲 / 采样器 / 五种混合 / 离屏 + 深度 / 网格（`draw_indexed`）/ 仿射 | 无 MSAA（与 CPU 一致，`msaa_samples == 1`）；无 mip；无透明窗口；单帧飞行；要求 Vulkan 1.3（动态渲染） |
 | `D3D11` | **已实现（0.4.0）**：`D3d11Backend` | 同上，走**即时上下文**（无命令缓冲 / 无 PSO） | 无 MSAA；无 mip；无透明窗口；单帧飞行；无 Deferred Context（不需要） |
 | `D3D12` | 登记，未实现 | — | 同上 |
-| `GL` | 登记，**最后迁** | — | 同上（理由见下） |
+| `GL` | **已实现（0.5.0）**：`GlBackend` | 同上，WGL + OpenGL 3.3 core（全局绑定点状态） | 无 MSAA；无 mip；无透明窗口；单帧飞行；一个 HWND 只能一个 GL 设备 |
 
 `AUTO` 的挑选顺序（注册表的遍历顺序，实现在 `src/bingpu_error.cpp`）：
 
@@ -77,7 +77,7 @@ class CpuBackend  final : public BackendBase { /* 覆盖钩子 + 资源分配 */
 |---|---|---|---|
 | 1 | Vulkan | `VkBackend` | ✅ **已完成（0.3.0）**：动态渲染 + 固定管线 + 批量四边形 + 五种混合 + 深度 + 网格 |
 | 2 | D3D11 | `D3d11Backend` | ✅ **已完成（0.4.0）**：即时上下文状态映射 + 同一套固定管线 + 交换链/present |
-| 3 | GL | `GlBackend` | 全部（状态映射；WGL） |
+| 3 | GL | `GlBackend` | ✅ **已完成（0.5.0）**：WGL + 3.3 core 状态映射 + 同一套固定管线 |
 | 4 | Metal | `MetalBackend` | 全部（原生映射；要同时开 macOS 外壳） |
 | 待定 | D3D12 | `D3D12Backend` | 全部（原生映射；与 VK 同族，验证价值最低） |
 
@@ -177,6 +177,33 @@ VK 里是命令缓冲，在这里退化成**一个状态结构体 + 立即提交
 `swapchain_info`。想低分辨率渲染再放大，就把离屏目标当画布（`contracts.md` §2 已经禁止
 交换链局部重绘，那条路本来也不该走）。
 
+## OpenGL：第三个真后端，异族里最极端的那个 —— **已落地（0.5.0）**
+
+GL 没有命令缓冲、没有 PSO、资源是**绑定点上的全局状态**，深度附件甚至不是对象而是
+framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，这种模型下 `BgpuCmd`
+同样只需要退化成"当前状态 + 立即提交" —— 实测：`tests/gpu_parity.h` 的 12 个用例**一个字
+没改**，GL 与 CPU 逐像素 0 差，而且与 VK/D3D11 的差异数字完全同一组（双线性那 498 个像素、
+最大通道差 1）。
+
+与另外两个后端的实现对照（同一件事在三种模型里长什么样）：
+
+| 事 | Vulkan | D3D11 | OpenGL |
+|---|---|---|---|
+| 上下文 | `VkInstance`/`VkDevice` | `ID3D11Device`（immediate） | WGL：隐藏窗口 → 1.1 上下文 → `wglCreateContextAttribsARB` 得 3.3 core |
+| 呈现 | `vkQueuePresentKHR` | `Present(vsync?1:0, 0)` | `SwapBuffers(dc)` + `wglSwapIntervalEXT` |
+| 离屏 | 自有 image + 视图 | 自有 texture + RTV | 自有 texture 挂 FBO（+ depth renderbuffer） |
+| 深度清除 | `loadOp = CLEAR` | `ClearDepthStencilView` | `glClear(DEPTH_BUFFER_BIT)`（窗口目标走像素格式的 24 位深度） |
+| 回读 | `vkCmdCopyImageToBuffer` | staging + `CopyResource` | `glReadPixels`（窗口要翻行） |
+| 着色器 | SPIR-V（glslc 离线） | DXBC（fxc 离线） | **GLSL 源码字符串，运行时由驱动编译**（不需要离线工具） |
+| 构建依赖 | 头在 `third_party/`，`LoadLibrary` | MinGW 自带头，`LoadLibrary` | **完全不 include GL 头**，类型/常量自带，`LoadLibrary` |
+
+两个 GL 特有的坑（都留了注释，也都写进了 CHANGELOG）：
+
+1. **`GL_SCISSOR_TEST` 的裁剪框默认值是"建上下文那个窗口"的大小**。离屏设备上那是个 8×8
+   的隐藏窗口 —— 不每趟 `glScissor(0,0,w,h)` 的话 `glClear` 只清左上角 8×8。
+2. **窗口原点在左下**：FBO 上"存储行 0 = 图像顶行"所以顶点着色器不翻、读回也不翻；
+   默认帧缓冲上要翻顶点（`uFlip=1`）且读回翻行、裁剪矩形镜像成 `h - y - hh`。
+
 ## D3D12：`layering.md` 里已排到 VK/D3D11/GL 之后
 
 0.2.2 起排期调整（理由见 [`layering.md`](layering.md) §5）：**D3D11 提到 D3D12 之前**。
@@ -223,6 +250,8 @@ present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` �
    `Shader4ComponentMapping` 字段）。**两个 GPU 后端之间是一致的**，只是与 CPU 在
    "拿 R8 当彩色纹理采样"时不同 —— 目前没有任何调用方这么用（R8 是遮罩，走的是
    `BGPU_BLEND_KEEP/ERASE` 那条路）。要修就得在 ABI 层支持纹理视图映射，和 9 一起做。
-9. **mip 链**：VK 直接 `UNSUPPORTED`，D3D11 接受 `BGPU_TEXTURE_MIPMAPS` 但降级为 1 级
+9. **mip 链**：VK 直接 `UNSUPPORTED`，D3D11/GL 接受 `BGPU_TEXTURE_MIPMAPS` 但降级为 1 级
    （与 CPU 一致）。真要 mip 就得给固定管线加 LOD 输入 —— 那是"再加一个原语"，不划算。
+10. **一个 HWND 只能绑一个 GL 设备**：WGL 的上下文绑在 DC 上，`contracts.md` §4 本来就规定
+   "一个 native_window 同一时刻只能绑一个呈现后端"。binUI 的多面板要共用一个设备，不是多个。
 

@@ -67,10 +67,10 @@ static void check_error_shape(const char* fn_name) {
 static void test_version(void) {
     printf("[version]\n");
     CHECK_EQ(BINGPU_VERSION_MAJOR, 0);
-    CHECK_EQ(BINGPU_VERSION_MINOR, 4);   /* 0.4.0：D3D11 后端，ABI 推到 2 */
-    CHECK_EQ(BINGPU_VERSION_PATCH, 0);   /* 0.4.0：D3D11 后端落地 */
+    CHECK_EQ(BINGPU_VERSION_MINOR, 5);   /* 0.5.0：GL 后端（ABI 停在 2） */
+    CHECK_EQ(BINGPU_VERSION_PATCH, 0);   /* 0.5.0：GL 后端落地 */
     CHECK(strcmp(bingpu_version_string(), BINGPU_VERSION_STRING) == 0);
-    CHECK(strcmp(bingpu_version_string(), "0.4.0") == 0);
+    CHECK(strcmp(bingpu_version_string(), "0.5.0") == 0);
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
     /* ABI 2 = 新增 BGPU_BACKEND_D3D11 枚举值（追加在末尾，既有值不变） */
     CHECK_EQ(BINGPU_ABI_VERSION, 2u);
@@ -121,9 +121,9 @@ static void test_backends(void) {
         CHECK(bingpu_backend_name(bingpu_backend_at(i)) != NULL);
         CHECK(bingpu_backend_name(bingpu_backend_at(i))[0] != '\0');
     }
-    /* CPU/NULL 永远可用；Vulkan（0.3.0）/ D3D11（0.4.0）起是真后端 —— 能不能用
-     * **取决于机器**（驱动/物理设备），所以这里只断言"是合法的 0/1"，具体能力由
-     * tests/test_{vk,d3d11}_render.c 在有卡时验证。D3D12/GL 仍登记但未实现。 */
+    /* CPU/NULL 永远可用；Vulkan（0.3.0）/ D3D11（0.4.0）/ GL（0.5.0）起是真后端 ——
+     * 能不能用**取决于机器**（驱动/物理设备），所以这里只断言"是合法的 0/1"，具体能力由
+     * tests/test_{vk,d3d11,gl}_render.c 在有卡时验证。D3D12 仍登记但未实现。 */
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_CPU), 1);
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_NULL), 1);
     {
@@ -134,8 +134,11 @@ static void test_backends(void) {
         const int d3d = bingpu_backend_available(BGPU_BACKEND_D3D11);
         CHECK(d3d == 0 || d3d == 1);
     }
+    {
+        const int gl = bingpu_backend_available(BGPU_BACKEND_GL);
+        CHECK(gl == 0 || gl == 1);
+    }
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_D3D12), 0);
-    CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_GL), 0);
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_AUTO), 0);
     CHECK(strcmp(bingpu_backend_name(BGPU_BACKEND_AUTO), "auto") == 0);
     CHECK(strcmp(bingpu_backend_name((BgpuBackendKind)77), "unknown") == 0);
@@ -216,7 +219,7 @@ static void test_struct_size(void) {
         ai2.struct_size = (uint32_t)sizeof(ai2);
         CHECK(bingpu_device_info(auto_dev, &ai2) == BGPU_OK);
         CHECK(ai2.backend == BGPU_BACKEND_CPU || ai2.backend == BGPU_BACKEND_VULKAN ||
-              ai2.backend == BGPU_BACKEND_D3D11);
+              ai2.backend == BGPU_BACKEND_D3D11 || ai2.backend == BGPU_BACKEND_GL);
         bingpu_device_destroy(auto_dev);
     }
     BgpuDevice auto_dev = BGPU_INVALID;
