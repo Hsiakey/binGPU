@@ -1163,7 +1163,10 @@ BgpuResult VkBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
                     static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * src_stride,
                     static_cast<size_t>(b.w) * bpp);
     }
-    if (!box && bpp == 4) premultiply(tmp.data(), static_cast<size_t>(b.w) * b.h);
+    /* 直通 → 预乘：**局部上传也要预乘**（CPU 是按区域预乘的；只在整张上传时预乘
+     * 会让"局部更新的半透明贴图"混出偏亮的结果 —— 0.3.0 就是这么写的，
+     * tests/gpu_parity.h 的 texture(box) 用例把它钉住了）。 */
+    if (bpp == 4) premultiply(tmp.data(), static_cast<size_t>(b.w) * b.h);
 
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory staging_mem = VK_NULL_HANDLE;

@@ -66,6 +66,8 @@ $(OBJ_DIR)/bingpu_cpu.o: CXXFLAGS += -O3
 # Vulkan 后端：头文件在 third_party/vulkan/include（不入库，scripts/fetch-deps.sh 拉）。
 # 只给这一个文件加 -I —— 其余源文件不该被第三方头污染。头不在时后端自动退化成桩。
 $(OBJ_DIR)/bingpu_vk.o: CXXFLAGS += -Ithird_party/vulkan/include
+# D3D11 后端：d3d11.h / dxgi.h 由 MinGW-w64 自带（在默认搜索路径里），不需要额外 -I；
+# 运行期只 LoadLibrary(d3d11.dll)，不链接 d3d11.lib/dxgi.lib —— 所以链接行也不用加库。
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
@@ -78,7 +80,7 @@ $(LIB_A): $(LIB_OBJS)
 # =============================================
 # 测试（C 源码 → gcc 编 → g++ 链接；见文件头）
 # =============================================
-TEST_NAMES := test_abi test_cpu_render test_vk_render
+TEST_NAMES := test_abi test_cpu_render test_vk_render test_d3d11_render
 TEST_BINS  := $(addprefix $(TEST_DIR)/,$(addsuffix $(EXT),$(TEST_NAMES)))
 
 $(OBJ_DIR)/tests/%.o: $(TEST_SRC)/%.c

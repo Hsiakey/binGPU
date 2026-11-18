@@ -10,23 +10,23 @@
 | `NULL` | **已实现**：`NullBackend` | 完整状态机、参数/句柄校验、绘制计数 | 不产生像素；回读返回 `UNSUPPORTED` |
 | `CPU` | **已实现**：`CpuBackend` | 参考像素实现；离屏目标；深度；采样器；仿射；网格；回读 | 不能开窗口（`UNSUPPORTED`）；无 MSAA；无 mip 采样 |
 | `VULKAN` | **已实现（0.3.0）**：`VkBackend` | 设备 / 交换链 / present / 纹理上传回读 / 缓冲 / 采样器 / 五种混合 / 离屏 + 深度 / 网格（`draw_indexed`）/ 仿射 | 无 MSAA（与 CPU 一致，`msaa_samples == 1`）；无 mip；无透明窗口；单帧飞行；要求 Vulkan 1.3（动态渲染） |
+| `D3D11` | **已实现（0.4.0）**：`D3d11Backend` | 同上，走**即时上下文**（无命令缓冲 / 无 PSO） | 无 MSAA；无 mip；无透明窗口；单帧飞行；无 Deferred Context（不需要） |
 | `D3D12` | 登记，未实现 | — | 同上 |
-| `GL` | 登记，**不迁** | — | 同上（理由见下） |
+| `GL` | 登记，**最后迁** | — | 同上（理由见下） |
 
 `AUTO` 的挑选顺序（注册表的遍历顺序，实现在 `src/bingpu_error.cpp`）：
 
 ```
-VULKAN → D3D12 → GL → CPU → NULL
+VULKAN → D3D11 → D3D12 → GL → CPU → NULL
 ```
 
-也就是"真实后端优先，最后才是 CPU 与 NULL"。目前前三个都不可用，所以 `AUTO`
-落到 **CPU**。上层不该假设 AUTO 一定选到哪个 —— 拿到设备后用 `bingpu_device_info()`
-读 `backend` 字段。
+也就是"真实后端优先，最后才是 CPU 与 NULL"。顺序按 [`layering.md`](layering.md) §5：
+同族里 VK 先于 D3D12，异族 D3D11 紧随 VK。0.4.0 起 `AUTO` 在这台机器上选到 **Vulkan**；
+上层不该假设 AUTO 一定选到哪个 —— 拿到设备后用 `bingpu_device_info()` 读 `backend` 字段。
 
-> 加入 D3D11 / Metal 之后这条顺序要重排（建议 `VULKAN → D3D11 → D3D12 → GL → METAL →
-> CPU → NULL`：按"能开窗口且最稳"优先，同族里 VK 先于 D3D12）。**新增 `BgpuBackendKind`
-> 枚举值 = ABI 变化**，所以这条留给 ABI 2，与 [`layering.md`](layering.md) §6 的三处修订
-> 一起做。
+> 这条顺序是 ABI 2（0.4.0）定下的：新增 `BGPU_BACKEND_D3D11 = 6` 枚举值（追加在末尾，
+> 既有值不变），`BINGPU_ABI_VERSION` 从 1 涨到 2。Metal 没进枚举 —— 它要同时开 macOS 外壳，
+> 等真的做的时候再追加。
 
 ---
 
@@ -49,7 +49,7 @@ class Backend {                       // src/bingpu_backend.h：接口，形状�
     // … beginRender/endRender/setXxx/readback
 };
 
-class BackendBase : public Backend {  // 两个后端**一字不差**的那部分
+class BackendBase : public Backend {  // 四个后端**一字不差**的那部分
     // 命令状态机、参数校验、stats 计数，以及 5 个钩子：
 protected:
     virtual void        presentFrame(Swapchain&);                 // CPU: back→front
@@ -65,7 +65,7 @@ class CpuBackend  final : public BackendBase { /* 覆盖钩子 + 资源分配 */
 
 为什么 0.1.0 的"两个后端各写一套状态机"不再需要：
   当时的价值是**交叉验证**校验逻辑。这份价值现在由 `tests/test_abi.c` 固定住了
-  （同样的误用 → 同样的结果码，239 条断言）。收成一份之后，"两个后端给出不同结果码"
+  （同样的误用 → 同样的结果码，246 条断言）。收成一份之后，"两个后端给出不同结果码"
   在结构上就不可能发生 —— 这比"靠人肉保持一致"可靠。
 
 资源管理一律 RAII：`CpuTexture`/`CpuBuffer`/`CpuSwapchain` 的析构负责释放像素/缓冲/位图
@@ -76,7 +76,7 @@ class CpuBackend  final : public BackendBase { /* 覆盖钩子 + 资源分配 */
 | 顺序 | 后端 | 类 | 覆盖什么 |
 |---|---|---|---|
 | 1 | Vulkan | `VkBackend` | ✅ **已完成（0.3.0）**：动态渲染 + 固定管线 + 批量四边形 + 五种混合 + 深度 + 网格 |
-| 2 | D3D11 | `D3D11Backend` | 全部（状态映射；immediate context） |
+| 2 | D3D11 | `D3d11Backend` | ✅ **已完成（0.4.0）**：即时上下文状态映射 + 同一套固定管线 + 交换链/present |
 | 3 | GL | `GlBackend` | 全部（状态映射；WGL） |
 | 4 | Metal | `MetalBackend` | 全部（原生映射；要同时开 macOS 外壳） |
 | 待定 | D3D12 | `D3D12Backend` | 全部（原生映射；与 VK 同族，验证价值最低） |
@@ -105,7 +105,7 @@ CPU 后端的定位不是"没有 GPU 时的降级"，而是**像素定义的权�
 | 单线程、立即执行 | `draw_quads` 当场光栅化；没有命令队列，`frame_end` 就是 `memcpy` |
 | 无 MSAA | `caps.msaa_samples == 1`；`desc.msaa_samples` 接受 4/8 但**降级为 1**（info 上报真实值） |
 | 无 mip 采样 | 固定管线没有 LOD 输入，采样永远取第 0 级；`mip_levels` 接受后降级为 1 |
-| 无窗口 | CPU 不碰 HWND/DPI/合成器（那些是"不可复现"的来源）；窗口呈现交给 VK/D3D12 |
+| 无窗口 | CPU 不碰 HWND/DPI/合成器（那些是"不可复现"的来源）；窗口呈现交给 VK / D3D11 |
 | 无设备丢失 | `bingpu_device_lost()` 恒 0；`poll()` 永远 `NONE` |
 | 法线不参与 | 网格按"顶点色 × 纹理"着色（没有光源状态，见欠账） |
 
@@ -135,6 +135,48 @@ CPU 后端的定位不是"没有 GPU 时的降级"，而是**像素定义的权�
 - 绑定层（bin2d/bin3d）已经有一层 C++ RAII 把句柄包起来 —— 否则 VK 的资源生命周期
   会漏进上层的每个调用点。
 
+## D3D11：第二个真后端，也是"异族模型"的代表 —— **已落地（0.4.0）**
+
+实现用的是 **immediate context**：没有命令缓冲、没有 PSO、没有显式同步。`BgpuCmd` 在
+VK 里是命令缓冲，在这里退化成**一个状态结构体 + 立即提交**。这正是
+[`layering.md`](layering.md) §4 那条推论的实测：
+
+> 异族后端不需要模拟命令缓冲。`BgpuCmd` 只是一个"记录器"抽象。
+
+证据：两个 GPU 后端**共用同一份用例表**（`tests/gpu_parity.h`，12 个用例），D3D11 那边
+一行用例都没改就跑出与 CPU **逐像素 0 差**（唯一带容差的是双线性取样，同一份容差）。
+`tests/test_d3d11_render.c` 全文只有一行 `main`。
+
+与 VK 后端的实现对照（"同一件事在两种模型里长什么样"）：
+
+| 事 | Vulkan | D3D11 |
+|---|---|---|
+| 管线状态 | `VkPipeline`（PSO，按 布局×混合×格式 懒建缓存） | 设备上预建 5 个 blend + 4 个 depth + 2 个 rasterizer 状态，draw 时按需绑定 |
+| 命令 | `VkCommandBuffer` 记录 → submit → 等 fence | 立即执行；`end_render` 只是清状态 |
+| 顶点流 | host-visible buffer + `vkCmdDrawIndexed` | `DEFAULT` buffer + `UpdateSubresource` + `DrawIndexed` |
+| 清屏 | `loadOp = CLEAR` | `ClearRenderTargetView`（要先绑 RTV） |
+| 深度 | D32 image + `depthCompareOp = LESS` | D32 texture + `DSV` + `D3D11_COMPARISON_LESS` |
+| 呈现 | `vkQueuePresentKHR`（FIFO/IMMEDIATE） | `Present(vsync ? 1 : 0, 0)`（blt 模型） |
+| 回读 | host buffer + `vkCmdCopyImageToBuffer` | staging texture + `CopyResource` + `Map` |
+| 构建依赖 | 头在 `third_party/`，运行期 `LoadLibrary("vulkan-1.dll")` | 头由 MinGW 自带，运行期 `LoadLibrary("d3d11.dll"/"dxgi.dll")` |
+| 着色器 | `glslc` → SPIR-V 数组 | `fxc` → DXBC 数组 |
+| 借出的帧目标 | 手动 `own_image=false` 防二次销毁 | COM 引用计数天然安全（`share()`） |
+
+两个容易踩的 D3D11 细节（都留了注释）：
+
+1. **NDC 的 y 向上**（Vulkan 向下）：`quad.hlsl` 里 `ndc.y = 1 - 2*s.y/h`；正面判定跟着翻，
+   所以 rasterizer 的 `FrontCounterClockwise = FALSE` —— 语义仍然是"TL,TR,BL 算正面"。
+2. **`ScissorEnable` 必须在 rasterizer state 里打开**，否则 `RSSetScissorRects` 静默无效；
+   另外 `ResizeBuffers` 之前必须放掉后台缓冲/RTV 的引用，否则就是 binUI 当年那个
+   `0x887A0001`。
+
+**交换链尺寸听窗口的**（两个真后端一致）：窗口模式下 `resize(w, h)` 的请求值只在
+"取不到客户区"时兜底 —— VK 那边 `VK_KHR_surface` 的 `currentExtent` 本来就非
+`0xFFFFFFFF`（surface 拥有 extent），D3D11 这边显式 `GetClientRect` 对齐同一语义。
+理由：尺寸不同的后台缓冲会被 DXGI 拉伸上屏、被 VK 直接忽略，两个后端就会给出不同的
+`swapchain_info`。想低分辨率渲染再放大，就把离屏目标当画布（`contracts.md` §2 已经禁止
+交换链局部重绘，那条路本来也不该走）。
+
 ## D3D12：`layering.md` 里已排到 VK/D3D11/GL 之后
 
 0.2.2 起排期调整（理由见 [`layering.md`](layering.md) §5）：**D3D11 提到 D3D12 之前**。
@@ -158,21 +200,29 @@ present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` �
 
 ## 欠账（明确不做，记在这里）
 
-1. **用户着色器 / SPIR-V**：bin3d 进 GPU 阶段的前提，排在 VK 后端之后。
-2. **深度纹理格式**：现在用 `RENDER_TARGET` 纹理当深度目标（后端自己解释）。
-   建议将来加 `BGPU_TEXTURE_DEPTH` 或 `BGPU_FORMAT_D32F`。
-3. **MSAA**：`desc.msaa_samples` 已预留，CPU 降级为 1；VK/D3D11 落地时按需打开。
-   注意：**MSAA 会让"与 CPU 逐像素一致"变成"边界容差"** —— 容差怎么定、为什么现在选
-   "通道差 ≤2 / 差异像素 ≤0.1%"而不选"CPU 也做 4× 参考"，见
-   [`layering.md`](layering.md) §2 的 P1。
+1. **用户着色器 / SPIR-V**：bin3d 进 GPU 阶段的前提。注意：**不是"给上层开着色器"** ——
+   bin3d 要的是光照状态（`docs/layering.md` §6 与 `../bin3D/docs/layering.md`）。
+2. **深度纹理格式**：现在用 `RENDER_TARGET` 纹理当深度目标（后端自己解释，VK 建 D32
+   image、D3D11 建 D32 texture + DSV）。建议将来加 `BGPU_TEXTURE_DEPTH` 或
+   `BGPU_FORMAT_D32F`。
+3. **MSAA**：`desc.msaa_samples` 已预留，两个真后端都报 1。要让 MSAA 进来，先解决
+   "**MSAA 会让与 CPU 逐像素一致变成边界容差**"这个问题 —— 见 [`layering.md`](layering.md) §2 的 P1。
+   目前的裁决是 (b) 容差表。
 4. **网格光照**：`BgpuMeshVertex` 带法线，但没有光源/材质状态可以喂给它。
    等 bin3d 定义光照模型后再加（那是 ABI 变化）。
-5. **多线程记录 / 多帧并行**：`max_frames_in_flight` 现在恒 1；真实后端落地时再按后端
-   自报（CPU/NULL 永远是 1）。
-6. **透明窗口 / 垂直同步 / present 节拍**：cap 位已经预留（`TRANSPARENT`/`VSYNC`/
-   `PRESENT_PACES`），CPU/NULL 都不报；VK/D3D11 落地时按真实能力填。
+5. **多帧飞行**：`max_frames_in_flight` 恒 1。VK 是"每帧 submit + 等 fence"，D3D11 是
+   "立即执行 + Present 后不等 GPU"，两者都是**先正确、再重叠**。
+6. **透明窗口 / 分层呈现**：`BGPU_DEVICE_TRANSPARENT` 在两个真后端都返回 `UNSUPPORTED`。
    **present 策略本身要升格成 ABI 的一等公民**（交换链 / 读回贴屏 / 分层窗三态 + 守卫判定），
    提案与理由见 [`layering.md`](layering.md) §6.3 —— binUI 三端各写了一遍，VK 那份在
    "窗口铺满显示器"时出过 bug（v0.19.1）。
-7. **事件队列**：`poll()` 现在恒 `NONE`；真实后端要把 `DEVICE_LOST`/`RESIZE_REQUIRED`/
-   `PRESENT_FAILED` 接到这里。
+7. **事件队列**：`poll()` 现在恒 `NONE`；两个真后端都只**记** `lost` 标志（VK 的
+   `VK_ERROR_DEVICE_LOST`、D3D11 的 `DXGI_ERROR_DEVICE_REMOVED`），还没接到事件队列。
+8. **R8 遮罩的采样广播**：CPU 把 R8 采样当作 `(v,v,v,v)`，两个 GPU 后端拿到的是
+   `(v,0,0,1)`（D3D11 那边是因为 MinGW 的 `D3D11_SHADER_RESOURCE_VIEW_DESC` 没有
+   `Shader4ComponentMapping` 字段）。**两个 GPU 后端之间是一致的**，只是与 CPU 在
+   "拿 R8 当彩色纹理采样"时不同 —— 目前没有任何调用方这么用（R8 是遮罩，走的是
+   `BGPU_BLEND_KEEP/ERASE` 那条路）。要修就得在 ABI 层支持纹理视图映射，和 9 一起做。
+9. **mip 链**：VK 直接 `UNSUPPORTED`，D3D11 接受 `BGPU_TEXTURE_MIPMAPS` 但降级为 1 级
+   （与 CPU 一致）。真要 mip 就得给固定管线加 LOD 输入 —— 那是"再加一个原语"，不划算。
+

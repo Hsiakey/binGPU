@@ -67,12 +67,13 @@ static void check_error_shape(const char* fn_name) {
 static void test_version(void) {
     printf("[version]\n");
     CHECK_EQ(BINGPU_VERSION_MAJOR, 0);
-    CHECK_EQ(BINGPU_VERSION_MINOR, 3);   /* 0.3.0：Vulkan 后端，ABI 仍是 1 */
-    CHECK_EQ(BINGPU_VERSION_PATCH, 0);   /* 0.3.0：Vulkan 后端落地，ABI 仍是 1 */
+    CHECK_EQ(BINGPU_VERSION_MINOR, 4);   /* 0.4.0：D3D11 后端，ABI 推到 2 */
+    CHECK_EQ(BINGPU_VERSION_PATCH, 0);   /* 0.4.0：D3D11 后端落地 */
     CHECK(strcmp(bingpu_version_string(), BINGPU_VERSION_STRING) == 0);
-    CHECK(strcmp(bingpu_version_string(), "0.3.0") == 0);
+    CHECK(strcmp(bingpu_version_string(), "0.4.0") == 0);
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
-    CHECK_EQ(BINGPU_ABI_VERSION, 1u);
+    /* ABI 2 = 新增 BGPU_BACKEND_D3D11 枚举值（追加在末尾，既有值不变） */
+    CHECK_EQ(BINGPU_ABI_VERSION, 2u);
     /* 结构体布局是 ABI 的一部分（头里也 static_assert 了，这里再钉一次） */
     CHECK_EQ(sizeof(BgpuVertex), 24u);
     CHECK_EQ(sizeof(BgpuMeshVertex), 36u);
@@ -112,22 +113,26 @@ static void test_format_bytes(void) {
  * ============================================================ */
 static void test_backends(void) {
     printf("[backends]\n");
-    CHECK_EQ(bingpu_backend_count(), 5u);
-    const BgpuBackendKind expect[5] = {BGPU_BACKEND_VULKAN, BGPU_BACKEND_D3D12,
+    CHECK_EQ(bingpu_backend_count(), 6u);
+    const BgpuBackendKind expect[6] = {BGPU_BACKEND_VULKAN, BGPU_BACKEND_D3D11, BGPU_BACKEND_D3D12,
                                        BGPU_BACKEND_GL, BGPU_BACKEND_CPU, BGPU_BACKEND_NULL};
-    for (uint32_t i = 0; i < 5; i++) {
+    for (uint32_t i = 0; i < 6; i++) {
         CHECK(bingpu_backend_at(i) == expect[i]);
         CHECK(bingpu_backend_name(bingpu_backend_at(i)) != NULL);
         CHECK(bingpu_backend_name(bingpu_backend_at(i))[0] != '\0');
     }
-    /* CPU/NULL 永远可用；Vulkan 0.3.0 起是真后端 —— 能不能用**取决于机器**
-     * （驱动/物理设备），所以这里只断言"是合法的 0/1"，具体能力由
-     * tests/test_vk_render.c 在有卡时验证。D3D12/GL 仍登记但未实现。 */
+    /* CPU/NULL 永远可用；Vulkan（0.3.0）/ D3D11（0.4.0）起是真后端 —— 能不能用
+     * **取决于机器**（驱动/物理设备），所以这里只断言"是合法的 0/1"，具体能力由
+     * tests/test_{vk,d3d11}_render.c 在有卡时验证。D3D12/GL 仍登记但未实现。 */
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_CPU), 1);
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_NULL), 1);
     {
         const int vk = bingpu_backend_available(BGPU_BACKEND_VULKAN);
         CHECK(vk == 0 || vk == 1);
+    }
+    {
+        const int d3d = bingpu_backend_available(BGPU_BACKEND_D3D11);
+        CHECK(d3d == 0 || d3d == 1);
     }
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_D3D12), 0);
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_GL), 0);
@@ -210,7 +215,8 @@ static void test_struct_size(void) {
         memset(&ai2, 0, sizeof(ai2));
         ai2.struct_size = (uint32_t)sizeof(ai2);
         CHECK(bingpu_device_info(auto_dev, &ai2) == BGPU_OK);
-        CHECK(ai2.backend == BGPU_BACKEND_CPU || ai2.backend == BGPU_BACKEND_VULKAN);
+        CHECK(ai2.backend == BGPU_BACKEND_CPU || ai2.backend == BGPU_BACKEND_VULKAN ||
+              ai2.backend == BGPU_BACKEND_D3D11);
         bingpu_device_destroy(auto_dev);
     }
     BgpuDevice auto_dev = BGPU_INVALID;

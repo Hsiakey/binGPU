@@ -152,9 +152,11 @@ struct Entry {
     const char* reason; /* 不可用时给调用方的解释 */
 };
 
-/* 顺序即 AUTO 的优先级：真实后端 → CPU → NULL（见 docs/backends.md） */
+/* 顺序即 AUTO 的优先级：真实后端 → CPU → NULL（见 docs/backends.md）
+ * 同族里 VK 先于 D3D12，异族 D3D11 紧随 VK 之后（`layering.md` §5 的落地顺序）。 */
 const Entry kBackends[] = {
     {BGPU_BACKEND_VULKAN, "vulkan", &vkBackend(), nullptr},
+    {BGPU_BACKEND_D3D11, "d3d11", &d3d11Backend(), nullptr},
     {BGPU_BACKEND_D3D12, "d3d12", nullptr,
      "未实现：D3D12 与 VK 同族、验证价值最低，排期见 docs/layering.md §5"},
     {BGPU_BACKEND_GL, "gl", nullptr,

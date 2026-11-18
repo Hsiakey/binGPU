@@ -70,7 +70,7 @@ namespace vkshader {{
 #endif  // BINGPU_VK_SHADERS_H
 '''
     out = ROOT / "src/bingpu_vk_shaders.h"
-    out.write_text(hdr, encoding="utf-8")
+    out.write_text(hdr, encoding="utf-8", newline="\n")   # 仓库一律 LF
     print(f"wrote {out} (vert {len(vs)} words, frag {len(fs)} words)")
 
 

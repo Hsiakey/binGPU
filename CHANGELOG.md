@@ -4,6 +4,65 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.4.0] - 2026-11-18
+
+**D3D11 后端落地**（`src/bingpu_d3d11.cpp`，`D3d11Backend`）：binGPU 有了第二个真后端，
+而且是**异族模型**（即时上下文、无命令缓冲、无 PSO）的代表 —— `docs/layering.md` §4 的
+关键推论"异族后端不需要模拟命令缓冲"这次被实测证实：`BgpuCmd` 在 D3D11 里退化成
+"一个状态结构体 + 立即提交"，**用法例表一个字都没改**就跑通了逐像素对照。
+
+验收口径照 [`docs/layering.md`](docs/layering.md) §2 的 P1（同一串命令 → 同样的像素），
+裁判仍然是 CPU 参考后端：
+
+| 用例 | VK vs CPU | D3D11 vs CPU |
+|---|---|---|
+| clear / 覆盖 / 五种混合 / top-left 接缝 / scissor / viewport / affine / 最近+重复 / 局部上传 / 深度 / 网格 | **0 像素差** | **0 像素差** |
+| 双线性取样 | 12.158% 像素、最大通道差 **1** | 同上（两个真后端**互相也逐位相同**） |
+
+### Added
+
+- **`D3d11Backend`**：设备（feature level 10.0 起，`D3D11_CREATE_DEVICE_DEBUG` 失败会自动
+  退回普通设备）/ 交换链（`IDXGIFactory::CreateSwapChain`，blt 模型 + `DXGI_SWAP_EFFECT_DISCARD`，
+  vsync 走 `Present(1,0)`）/ `frame_read`（present 时拷进 staging，与 VK 同一份语义）/
+  纹理上传与回读 / 缓冲（`DEFAULT` + `UpdateSubresource` 带 box，局部更新是原生语义）/
+  采样器 / 五种混合状态 / 4 种深度状态 / 2 种光栅化状态 / `draw_quads`（顶点流 + 32 位索引
+  展开 TL,TR,BL / BL,TR,BR）/ `draw_indexed` / 仿射 / 离屏目标 / D32 深度附件。
+- **`src/d3d11_shaders/quad.hlsl`**：与 `quad.vert`/`quad.frag` 逐行同构的 HLSL 版（差异只有
+  D3D 的 NDC y 向上 → 着色器里翻一次，以及正面判定跟着翻）。DXBC 由 `fxc` 编出后以数组入库
+  （`src/bingpu_d3d11_shaders.h` + `tools/gen_dxbc_header.py`）：**构建不需要 Windows SDK**。
+- **`tests/gpu_parity.h`**：把 VK 那 11 个用例抽成**两个 GPU 后端共用的规格**，并新增第 12 个
+  用例 `texture(box 局部上传)`。`tests/test_vk_render.c` / `tests/test_d3d11_render.c` 现在各只有
+  一行 `main` —— 加第四个后端只需再写一行，用例表不用动。
+- **ABI 2**：`BGPU_BACKEND_D3D11 = 6` 追加在枚举末尾（既有枚举值 / 结构体 / 函数签名全部不变），
+  `BINGPU_ABI_VERSION` 1 → 2。注册表顺序变成 `VULKAN → D3D11 → D3D12 → GL → CPU → NULL`。
+- 窗口路径烟测（临时程序，不入库）：两个真后端各跑 3 帧 clear 往返**逐字节相等**
+  （`FF102030` / `FF30A050` / `FF2030E0`），白色四边形落在 (100,100)，改窗口尺寸后
+  `resize` 到新的客户区（`384x221`）两边报同一个值。
+- **交换链尺寸听窗口的**（两个真后端统一）：窗口模式下 `resize(w, h)` 的请求值只在取不到
+  客户区时兜底。理由：尺寸不同的后台缓冲会被 DXGI 拉伸上屏、被 VK 忽略，两个后端的
+  `swapchain_info` 就会分叉。
+
+### Fixed
+
+- **VK 后端的局部上传没有预乘**（0.3.0 的写法：`if (!box)` 才预乘）。CPU 后端是**按区域**
+  预乘的，所以"局部更新的半透明贴图"在 VK 上会偏亮。新增的 `texture(box)` 用例当场抓到
+  （差异像素 25%、最大通道差 99），现在两个 GPU 后端都是 0 差。
+- **D3D11 的 `CopySubresourceRegion` 参数搞反**：最后一个参数是**源** box，目的区域要由
+  `DstX/DstY` 给。第一版把 box 当源传，局部上传整体挪到了 (0,0)（用例里 31% 像素差）。
+- **R8 遮罩的采样广播**：MinGW 的 `D3D11_SHADER_RESOURCE_VIEW_DESC` 没有
+  `Shader4ComponentMapping` 字段，所以 D3D11 只能拿到 `(r,0,0,1)`，而 CPU 当作 `(v,v,v,v)`。
+  这条差异与 VK 后端**完全一致**（两个 GPU 后端之间是齐的），记进 `docs/backends.md` 的欠账。
+
+### 明确没做（写进 `docs/backends.md` 的欠账）
+
+- **多帧飞行**：`max_frames_in_flight == 1`（Present 之后不等 GPU，但也不做流水线）。
+- **MSAA** / **mip 链** / **透明窗口**（分层窗口 + premultiplied composite）。
+- **Deferred Context**：`contracts.md` §6 已经禁止跨线程记录，用不上。
+
+### 版本
+
+- `0.4.0`（MINOR：新后端 = 新能力）；`BINGPU_ABI_VERSION` **2**（新增后端枚举值）。
+
 ## [0.3.0] - 2026-11-18
 
 **Vulkan 后端落地**（`src/bingpu_vk.cpp`，`VkBackend`）：binGPU 从"只有 CPU/NULL"变成

@@ -249,5 +249,6 @@ inline ObjectBase::ObjectBase(uint32_t k, Backend& b, BgpuDevice owner)
 Backend& nullBackend();
 Backend& cpuBackend();
 Backend& vkBackend();
+Backend& d3d11Backend();
 
 }  // namespace bgpu

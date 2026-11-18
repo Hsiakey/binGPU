@@ -71,12 +71,14 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 3
+#define BINGPU_VERSION_MINOR 4
 #define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.3.0"
+#define BINGPU_VERSION_STRING "0.4.0"
 
-/* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1 */
-#define BINGPU_ABI_VERSION 1u
+/* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
+ *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
+ *   ABI 2：0.4.0（新增 BGPU_BACKEND_D3D11 枚举值；既有值、结构体、签名全部不变） */
+#define BINGPU_ABI_VERSION 2u
 
 /* 句柄都是 uint64_t；0 = 无效 */
 #define BGPU_INVALID 0ull
@@ -115,8 +117,9 @@ typedef enum BgpuResult {
  *   NULL  : 只做参数校验，不产生像素。用来跑通调用序列 / 回归校验逻辑。
  *   CPU   : 软件参考实现。确定性像素，能 readback —— 无 GPU 的 CI、
  *           离屏出图、像素基准都靠它。三端"逐像素一致"的裁判也是它。
- *   VK/D3D12/GL : 声明了的真实后端（0.1.0 里 VK/D3D12 返回
- *           BGPU_ERR_UNSUPPORTED，见 docs/backends.md 的路线）。
+ *   VULKAN: 真实后端（0.3.0）。动态渲染 + 固定管线，要求 Vulkan 1.3。
+ *   D3D11 : 真实后端（0.4.0）。即时上下文模型，feature level 10.0 起。
+ *   D3D12 / GL : 声明了但还没实现（返回 BGPU_ERR_UNSUPPORTED，见 docs/backends.md）。
  * --------------------------------------------------------------- */
 typedef enum BgpuBackendKind {
     BGPU_BACKEND_AUTO = 0,   /* 让 bingpu 自己挑：CPU 之外能跑的第一个 */
@@ -124,7 +127,9 @@ typedef enum BgpuBackendKind {
     BGPU_BACKEND_CPU = 2,
     BGPU_BACKEND_VULKAN = 3,
     BGPU_BACKEND_D3D12 = 4,
-    BGPU_BACKEND_GL = 5
+    BGPU_BACKEND_GL = 5,
+    /* ABI 2：追加在末尾，既有枚举值一个都没动（所以旧的二进制调用方仍然正确） */
+    BGPU_BACKEND_D3D11 = 6
 } BgpuBackendKind;
 
 uint32_t      bingpu_backend_count(void);

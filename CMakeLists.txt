@@ -29,6 +29,7 @@ add_library(bingpu STATIC
     src/bingpu_api.cpp
     src/bingpu_backend.cpp
     src/bingpu_cpu.cpp
+    src/bingpu_d3d11.cpp
     src/bingpu_error.cpp
     src/bingpu_null.cpp
     src/bingpu_object.cpp
@@ -64,6 +65,11 @@ add_executable(test_vk_render tests/test_vk_render.c)
 set_target_properties(test_vk_render PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11)
 target_link_libraries(test_vk_render PRIVATE bingpu)
 add_test(NAME vk_render COMMAND test_vk_render)
+
+add_executable(test_d3d11_render tests/test_d3d11_render.c)
+set_target_properties(test_d3d11_render PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11)
+target_link_libraries(test_d3d11_render PRIVATE bingpu)
+add_test(NAME d3d11_render COMMAND test_d3d11_render)
 
 # ---- 工具（同样是 C 源码）----
 add_executable(bingpu_info tools/bingpu_info.c)
