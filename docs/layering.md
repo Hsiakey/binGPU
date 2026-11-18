@@ -24,12 +24,12 @@ binUI 现在的 GPU 侧是这么分的：
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `binui_vk.cpp` | 4276 | Vulkan：设备/交换链/MSAA/滤镜/呈现 |
-| `binui_d3d11.cpp` | 2270 | D3D11：同上 |
-| `binui_gl.cpp` | 2040 | GL：同上 |
-| `binui_app.h` | 1836 | 窗口外壳（三端共用同一个模板） |
-| `binui_draw_nodes.h` | 1788 | **三端共用**的节点树遍历 |
-| `binui_glyph_atlas.h` | 1169 | **三端共用**的字形图集 |
+| `binui_vk.cpp` | 4534 | Vulkan：设备/交换链/MSAA/滤镜/呈现 |
+| `binui_d3d11.cpp` | 2416 | D3D11：同上 |
+| `binui_gl.cpp` | 2178 | GL：同上 |
+| `binui_app.h` | 1957 | 窗口外壳（三端共用同一个模板） |
+| `binui_draw_nodes.h` | 1860 | **三端共用**的节点树遍历 |
+| `binui_glyph_atlas.h` | 1253 | **三端共用**的字形图集 |
 
 即：**绘制语义早就统一了**（共用遍历 + 共用图集 + 7 个原语），重复的是**设备与呈现**那一段 ——
 交换链、resize 策略、present 路径、离屏目标池、MSAA 解析，每个后端各写一遍。
@@ -130,9 +130,9 @@ binUI / bin2d / bin3d 自己保证"同一份 UI/场景生成同一串 `BgpuVerte
 
 | 顺序 | 后端 | 为什么在这个位置 | 通过标准 | 完成后删掉 |
 |---|---|---|---|---|
-| 1 | VK | 最显式，会把 ABI 的不足立刻顶出来 | `raster_rules.md` 每条规则 vs CPU **0 差**；binUI 的 `pixels-vk` + `resize-bench` + `vk-window` 三关 | `binui_vk.cpp`（4276 行）→ 薄适配层 |
+| 1 | VK | 最显式，会把 ABI 的不足立刻顶出来 | `raster_rules.md` 每条规则 vs CPU **0 差**；binUI 的 `pixels-vk` + `resize-bench` + `vk-window` 三关 | `binui_vk.cpp`（4534 行）→ 薄适配层 |
 | 2 | D3D11 | **异族模型的代表**，且 binUI 有现成实现（2270 行）可对拍；能反向验证"ABI 是不是太现代了" | 同上 + `pixels-d3d11` | `binui_d3d11.cpp` → 薄适配层 |
-| 3 | GL | 同为异族；旧机器兜底 | 同上 + `pixels`（18 张 GDI 基准） | `binui_gl.cpp`（2040 行）→ 薄适配层 |
+| 3 | GL | 同为异族；旧机器兜底 | 同上 + `pixels`（18 张 GDI 基准） | `binui_gl.cpp`（2178 行）→ 薄适配层 |
 | 4 | Metal | 同族，实现最省力；但开的是**新平台** | 平台外壳 + 一套新建的像素基准 | — |
 | 待定 | D3D12 | 与 VK 同族，学不到新东西；目前没有用户 | — | — |
 
@@ -228,7 +228,7 @@ BgpuResult bingpu_present(BgpuSwapchain sc, BgpuPresentMode mode);
 | `src/backends/binui_app.h`（窗口外壳） | 1836 | **留**（Win32 消息循环 / IME / 拖拽不属于 GPU 层） |
 | `src/backends/binui_draw_nodes.h` | 1788 | **留**（P2 的席位） |
 | `src/backends/binui_glyph_atlas.h` | 1169 | **留**（P2 的席位，bin2d 将来共用） |
-| `include/binui_path.h` | 1112 | **留**（几何，将来属 bin2d） |
+| `include/binui_path.h` | 1183 | **留**（几何，将来属 bin2d） |
 
 迁移完成的判据不是"代码变少"，而是：**binUI 三个后端加起来 < 800 行**（只剩"把
 `IBinUIGfx` 调用翻译成 `bingpu_cmd_*`"），且 `pixels` / `pixels-vk` / `pixels-d3d11` 三关全绿。

@@ -1,5 +1,7 @@
 # 构建产物
 build-mingw/
+third_party/*
+!third_party/README.md
 build/
 out/
 

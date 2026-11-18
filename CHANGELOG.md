@@ -4,6 +4,72 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.3.0] - 2026-11-18
+
+**Vulkan 后端落地**（`src/bingpu_vk.cpp`，`VkBackend`）：binGPU 从"只有 CPU/NULL"变成
+"有真后端"。`BINGPU_ABI_VERSION` 仍是 **1**。
+
+验收口径照 [`docs/layering.md`](docs/layering.md) §2 的 P1：**同一串命令 → 同样的像素**，
+裁判是 CPU 参考后端。结果：
+
+| 用例 | 差异 |
+|---|---|
+| clear / quad 覆盖 / 五种混合 / top-left 接缝 / scissor / viewport / affine / 深度 / 网格 / nearest 取样 | **0 像素差** |
+| 双线性取样（`texture(linear/clamp)`） | 12.2% 像素、最大通道差 **1**（CPU 用 double 累加、GPU 用 float 插值，两条数值路径的固有差异；容差写死在用例里） |
+
+### Added
+
+- `VkBackend`：设备（Vulkan 1.3 + `dynamicRendering`）/ 交换链（`VK_KHR_swapchain`，
+  FIFO=vsync 或 IMMEDIATE）/ present / 纹理上传与回读 / 缓冲 / 采样器 / 固定管线
+  （2 种顶点布局 × 5 种混合 + 深度测试写入 + 剔除）/ 离屏目标 / 深度附件 /
+  `draw_quads`（顶点流 + 32 位索引展开 TL,TR,BL / BL,TR,BR）/ `draw_indexed` / 仿射。
+- `src/vk_shaders/quad.{vert,frag}` + `src/bingpu_vk_shaders.h`：固定功能的两个着色器与
+  入库的 SPIR-V（`tools/gen_spv_header.py` 生成；本机没有 Vulkan SDK，用 Android NDK 的
+  `glslc` 编，和 binUI 同一套做法）。
+- `tests/test_vk_render.c`：**Vulkan vs CPU 逐像素对照**，11 个用例按 `raster_rules.md`
+  的章节顺序排；没有 Vulkan 的机器整份跳过（exit 0），CI 不会因为没显卡变红。
+- `scripts/fetch-deps.sh` + `third_party/README.md`：Vulkan 头不入库，拉一次即可；
+  **没有头也能构建** —— `__has_include` 让后端退化成"登记但不可用"的桩。
+- **HEADLESS 交换链**：没有窗口的设备也能建交换链 —— 语义不变（"帧的载体 + `frame_read`
+  出图"，`contracts.md` 的帧模型），实现退化成一张离屏纹理 + "拷到回读缓冲"代替 present。
+  bin2d 的 GPU 桥就是这种用法。
+- 状态剔除（`layering.md` §6.2 的契约在 VK 侧先落地）：管线/描述符/scissor 都只在真的
+  变了才发 `vkCmd*`；顶点流按需增长，一帧内只绑一次。
+
+### 落地时踩到并修掉的 6 个坑（都留了注释）
+
+1. **`createCmd` 复用了 `BackendBase::createCmd`** → 造出来的是基类 `Cmd`，再
+   `static_cast<VkCmdObj&>` 就是 UB（症状：`vkCmdPipelineBarrier: Invalid commandBuffer`）。
+   现在后端自己 `makeObject<VkCmdObj>`。
+2. **默认采样器做成了 `Sampler` 对象** → `destroyOwnedObjects` 先销毁它，设备析构再销毁一次
+   = double free。现在默认采样器由设备直接持有。
+3. **clear color 的通道序错了两次**：先是把顺序写死成 `B,G,R`（RGBA8 目标上红蓝对调）；
+   后来改成"BGRA 时交换分量"也不对 —— `clearValue.color.float32` 是 **R,G,B 分量序**，
+   字节序由 `VkFormat` 决定。现在只按分量写，字节序交给格式。
+4. **push constant 的 std430 对齐**：`vec2` 之后下一个 `vec4` 要从 32 开始，C++ 结构体
+   必须补 8 字节（第一版 `xf0` 落在 24，为什么"仿射坏了"查了半天）。
+5. **仿射矩阵被按列主序重排**：`cmd.xf` 的 6 个数本来就是 `[a c e | b d f]`，直接搬；
+   重排之后仿射用例整块画不出来。
+6. **交换链借出的图像被当成自有资源销毁**：`frame_begin` 的 target 是**借用**句柄
+   （`contracts.md` §2），第一版给它建了自己的 `VkImage`，`frame_begin` 又把 image 指过去，
+   退出时销毁交换链图像 → 窗口路径必崩。现在借用对象 `own_image = false`。
+7. **HEADLESS 交换链的 views 被二次销毁**：那几张 view 属于离屏纹理，交换链析构里再销毁
+   一次就是 double free。现在 `owns_images` 只在真交换链时为真。
+
+### 明确没做（写进 `docs/backends.md` 的欠账）
+
+- **多帧飞行**：现在每帧 `vkQueueSubmit` + 等 fence，`max_frames_in_flight == 1`。
+  先要正确、再要重叠；上层（binUI）目前也是单帧。
+- **MSAA**：`msaa_samples == 1`，与 CPU 参考后端一致 —— 这是"0 差验收"的前提；
+  开 MSAA 时容差怎么定见 `layering.md` §2。
+- **mip 链**：`createTexture` 带 `BGPU_TEXTURE_MIPMAPS` 直接返回 `UNSUPPORTED`。
+- **透明窗口**：`compositeAlpha = OPAQUE`；透明窗要 premultiplied composite + 分层窗口，
+  留给后面（binUI 的 VK 后端已经有这套，可参考）。
+
+### 版本
+
+- `0.3.0`（MINOR：新后端 = 新能力）；`BINGPU_ABI_VERSION` 仍是 **1**。
+
 ## [0.2.2] - 2026-11-18
 
 **只有文档**：把"这一层在哪、四家后端怎么接"写成 [`docs/layering.md`](docs/layering.md)。
@@ -11,7 +77,7 @@
 
 来源是 binUI 三个 GPU 后端（GL / VK / D3D11）跑通"逐像素一致"之后的复盘，回答了三个问题：
 
-1. **该收什么**：binUI 的绘制语义早就统一了（共用遍历 1788 行 + 共用字形图集 1169 行 +
+1. **该收什么**：binUI 的绘制语义早就统一了（共用遍历 1860 行 + 共用字形图集 1169 行 +
    7 个原语），重复的是**设备与呈现**（交换链、resize 策略、present 路径、离屏池、MSAA 解析，
    每端各一份）。五个已知 bug 里三个长在这一段，两个长在呈现策略。
 2. **往上的承诺必须分成两条**：P1 = "同一串 `BgpuVertex` → 同样的像素"（binGPU 自己承诺，
@@ -24,7 +90,7 @@
 ### Changed（排期修订，详见 `layering.md` §5）
 
 - **后端顺序改为 VK → D3D11 → GL → Metal，D3D12 待定**。原来写的是 VK → D3D12 → GL；
-  理由：D3D12 与 VK 同族、验证价值最低却要重写约 2270 行；而 D3D11 是异族模型，能反向
+  理由：D3D12 与 VK 同族、验证价值最低却要重写约 2416 行；而 D3D11 是异族模型，能反向
   验证"这套 ABI 对上一代 API 也成立"。
 - **GL 从"不迁"改为"最后迁"**：原理由是"翻译层会变成半个 GL 封装"，但 binGPU 的指令面是
   固定功能批处理（不是 RHI），适配量级约等于 binUI 的 300 行状态/present 代码。排在最后

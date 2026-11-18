@@ -32,10 +32,12 @@ add_library(bingpu STATIC
     src/bingpu_error.cpp
     src/bingpu_null.cpp
     src/bingpu_object.cpp
+    src/bingpu_vk.cpp
 )
 target_include_directories(bingpu
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan/include
 )
 if(MSVC)
     target_compile_options(bingpu PRIVATE /W4)
@@ -57,6 +59,11 @@ add_executable(test_cpu_render tests/test_cpu_render.c)
 set_target_properties(test_cpu_render PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11)
 target_link_libraries(test_cpu_render PRIVATE bingpu)
 add_test(NAME cpu_render COMMAND test_cpu_render)
+
+add_executable(test_vk_render tests/test_vk_render.c)
+set_target_properties(test_vk_render PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11)
+target_link_libraries(test_vk_render PRIVATE bingpu)
+add_test(NAME vk_render COMMAND test_vk_render)
 
 # ---- 工具（同样是 C 源码）----
 add_executable(bingpu_info tools/bingpu_info.c)

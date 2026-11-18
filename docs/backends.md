@@ -9,7 +9,7 @@
 |---|---|---|---|
 | `NULL` | **已实现**：`NullBackend` | 完整状态机、参数/句柄校验、绘制计数 | 不产生像素；回读返回 `UNSUPPORTED` |
 | `CPU` | **已实现**：`CpuBackend` | 参考像素实现；离屏目标；深度；采样器；仿射；网格；回读 | 不能开窗口（`UNSUPPORTED`）；无 MSAA；无 mip 采样 |
-| `VULKAN` | 登记，未实现 | — | 任何 `device_create` 都返回 `UNSUPPORTED` + 原因 |
+| `VULKAN` | **已实现（0.3.0）**：`VkBackend` | 设备 / 交换链 / present / 纹理上传回读 / 缓冲 / 采样器 / 五种混合 / 离屏 + 深度 / 网格（`draw_indexed`）/ 仿射 | 无 MSAA（与 CPU 一致，`msaa_samples == 1`）；无 mip；无透明窗口；单帧飞行；要求 Vulkan 1.3（动态渲染） |
 | `D3D12` | 登记，未实现 | — | 同上 |
 | `GL` | 登记，**不迁** | — | 同上（理由见下） |
 
@@ -75,7 +75,7 @@ class CpuBackend  final : public BackendBase { /* 覆盖钩子 + 资源分配 */
 
 | 顺序 | 后端 | 类 | 覆盖什么 |
 |---|---|---|---|
-| 1 | Vulkan | `VkBackend` | 全部（原生映射） |
+| 1 | Vulkan | `VkBackend` | ✅ **已完成（0.3.0）**：动态渲染 + 固定管线 + 批量四边形 + 五种混合 + 深度 + 网格 |
 | 2 | D3D11 | `D3D11Backend` | 全部（状态映射；immediate context） |
 | 3 | GL | `GlBackend` | 全部（状态映射；WGL） |
 | 4 | Metal | `MetalBackend` | 全部（原生映射；要同时开 macOS 外壳） |
@@ -109,7 +109,14 @@ CPU 后端的定位不是"没有 GPU 时的降级"，而是**像素定义的权�
 | 无设备丢失 | `bingpu_device_lost()` 恒 0；`poll()` 永远 `NONE` |
 | 法线不参与 | 网格按"顶点色 × 纹理"着色（没有光源状态，见欠账） |
 
-## Vulkan：第一个真实后端（排期在 0.2.0 之后）
+## Vulkan：第一个真实后端 —— **已落地（0.3.0）**
+
+实现用**动态渲染**（Vulkan 1.3 core，`dynamicRendering` 特性），所以不需要 render pass
+对象；管线按 `(布局, 混合, flags, 颜色格式, 深度格式)` 懒建并缓存。五条与 CPU 对照的
+验收用例全部 0 差（见 `tests/test_vk_render.c`），唯一带容差的是双线性取样
+（CPU 用 double 累加、GPU 用 float 插值，偶发 1 个通道差）。
+
+下面这段是当时的开工计划，留作记录：
 
 目标不是"能画"，而是"**和 CPU 逐字节一致**"。为什么它排第一（最显式、最能把 ABI 的不足
 顶出来），见 [`layering.md`](layering.md) §5。开工顺序：
@@ -132,7 +139,7 @@ CPU 后端的定位不是"没有 GPU 时的降级"，而是**像素定义的权�
 
 0.2.2 起排期调整（理由见 [`layering.md`](layering.md) §5）：**D3D11 提到 D3D12 之前**。
 原来的理由是"D3D12 显式程度最高，最能验证状态机"，但那条价值已经由 VK 拿到（两者同族：
-PSO + 命令缓冲 + 显式同步），D3D12 再写一遍学不到新东西，却要重写约 2270 行。而 **D3D11
+PSO + 命令缓冲 + 显式同步），D3D12 再写一遍学不到新东西，却要重写约 2416 行。而 **D3D11
 是异族模型**（immediate context、无命令缓冲），它能反向验证"这套 ABI 对上一代 API 也
 成立" —— 那才是真正的未知数。
 

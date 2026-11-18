@@ -19,7 +19,11 @@
 #   abi-check  ①纯 C 编译器单独编 include/bingpu.h（混进 C++ 语法当场炸）
 #              ②grep 守规矩：头里不许 C++ 类型/命名空间/容器头
 #              ③冒烟：C 目标文件 + C++ 静态库能被 g++ 链接成可执行并跑起来
+#   bench      固定场景的 CPU 后端吞吐基准（同时打印像素校验和，见 docs/perf.md）
 #   clean
+#
+# 第三方：Vulkan 头在 third_party/vulkan/include（不入库，scripts/fetch-deps.sh 拉；
+# 没有头时 bingpu_vk.cpp 自动退化成"不可用"的桩，其余目标不受影响）。
 
 # make 内建的 CC 默认是 `cc`；MinGW/GCC 发行版都带 cc，但为了不依赖那个软链，
 # 当 CC/CXX 还是内建默认值时改用 gcc/g++（用户在命令行或环境里显式指定就尊重它）。
@@ -59,6 +63,9 @@ LIB_A    := $(BUILD_DIR)/libbingpu.a
 # 只给 CPU 后端的热循环开 -O3：其余文件都是冷路径（句柄表 / 校验 / 注册表），
 # -O3 在那里的收益是 0，只换来更长的编译时间。0.2.1 量过：-O3 让纹理路径再快 ~20%。
 $(OBJ_DIR)/bingpu_cpu.o: CXXFLAGS += -O3
+# Vulkan 后端：头文件在 third_party/vulkan/include（不入库，scripts/fetch-deps.sh 拉）。
+# 只给这一个文件加 -I —— 其余源文件不该被第三方头污染。头不在时后端自动退化成桩。
+$(OBJ_DIR)/bingpu_vk.o: CXXFLAGS += -Ithird_party/vulkan/include
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
@@ -71,7 +78,7 @@ $(LIB_A): $(LIB_OBJS)
 # =============================================
 # 测试（C 源码 → gcc 编 → g++ 链接；见文件头）
 # =============================================
-TEST_NAMES := test_abi test_cpu_render
+TEST_NAMES := test_abi test_cpu_render test_vk_render
 TEST_BINS  := $(addprefix $(TEST_DIR)/,$(addsuffix $(EXT),$(TEST_NAMES)))
 
 $(OBJ_DIR)/tests/%.o: $(TEST_SRC)/%.c

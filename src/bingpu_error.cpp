@@ -154,12 +154,11 @@ struct Entry {
 
 /* 顺序即 AUTO 的优先级：真实后端 → CPU → NULL（见 docs/backends.md） */
 const Entry kBackends[] = {
-    {BGPU_BACKEND_VULKAN, "vulkan", nullptr,
-     "未实现：Vulkan 后端是 0.2.0 之后的第一实现，路线见 docs/backends.md"},
+    {BGPU_BACKEND_VULKAN, "vulkan", &vkBackend(), nullptr},
     {BGPU_BACKEND_D3D12, "d3d12", nullptr,
-     "未实现：D3D12 是第二个真实后端，依赖 Vulkan 版把状态机钉死之后开工"},
+     "未实现：D3D12 与 VK 同族、验证价值最低，排期见 docs/layering.md §5"},
     {BGPU_BACKEND_GL, "gl", nullptr,
-     "不迁：GL 走 binUI 现有的后端（docs/backends.md 写了不迁的理由）"},
+     "未实现：GL 是异族（即时状态）的兜底后端，排在 D3D11 之后，见 docs/layering.md §4/§5"},
     {BGPU_BACKEND_CPU, "cpu", &cpuBackend(), nullptr},
     {BGPU_BACKEND_NULL, "null", &nullBackend(), nullptr},
 };

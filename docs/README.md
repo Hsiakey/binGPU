@@ -32,6 +32,8 @@
 | `bingpu_object.cpp` | 句柄 → 对象 的表（`unique_ptr` + RAII，代数失效、按设备连带销毁） |
 | `bingpu_null.cpp` | `NullBackend`：只校验 + 计数 + 完整状态机 |
 | `bingpu_cpu.cpp` | `CpuBackend`：软件光栅、深度、采样、混合、回读 |
+| `bingpu_vk.cpp` | `VkBackend`：Vulkan 1.3（动态渲染）+ 固定管线 + 批量四边形；`__has_include` 缺头时退化成桩 |
+| `bingpu_vk_shaders.h` | quad.vert/frag 的 SPIR-V 数组（`tools/gen_spv_header.py` 生成） |
 | `bingpu_internal.h` | 内部契约（句柄编码 / 对象表 / 错误槽），**不进 `include/`** |
 
-测试：`tests/test_abi.c`（契约）、`tests/test_cpu_render.c`（像素）；工具：`tools/bingpu_info.c`。
+测试：`tests/test_abi.c`（契约）、`tests/test_cpu_render.c`（CPU 像素）、`tests/test_vk_render.c`（**Vulkan vs CPU 逐像素**，无 Vulkan 时整份跳过）；工具：`tools/bingpu_info.c`。

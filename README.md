@@ -37,7 +37,10 @@ src/                  C++17 实现
   bingpu_object.cpp   句柄表（unique_ptr + RAII，代数失效、按设备连带销毁）
   bingpu_null.cpp     NullBackend：只校验 + 计数
   bingpu_cpu.cpp      CpuBackend：软件参考实现
+  bingpu_vk.cpp       VkBackend：Vulkan 1.3（动态渲染）真后端，运行期 LoadLibrary("vulkan-1.dll")
+  bingpu_vk_shaders.h SPIR-V 数组（由 src/vk_shaders/*.vert/.frag 生成，勿手改）
   bingpu_internal.h   内部契约（不进 include/）
+src/vk_shaders/       quad.vert / quad.frag（固定功能的两个着色器；.spv 由 NDK glslc 生成）
 tests/
   test_abi.c          ABI 契约测试（239 断言）
   test_cpu_render.c   像素级测试（334 断言）
@@ -103,14 +106,15 @@ destroy 幂等）；`test_cpu_render` 钉的是**像素**（clear、覆盖范围
 | 五种混合（预乘 / 覆盖 / 保留 / 擦除 / 叠加） | ✅ CPU（逐像素验证） |
 | 窗口呈现 / 交换链 / 垂直同步 | ⛔ 留给 VK / D3D12（CPU 明确 `UNSUPPORTED`） |
 | MSAA / mip 采样 / 用户着色器 / 网格光照 | ⛔ 未做，见 [docs/backends.md](docs/backends.md) 的欠账 |
-| Vulkan / D3D12 后端 | ⛔ 登记未实现（`AUTO` 落到 CPU） |
+| **Vulkan 后端** | ✅ **0.3.0**：设备/交换链/present、纹理/缓冲/采样器、五种混合、离屏+深度、网格、仿射；与 CPU 参考后端逐像素 0 差（`tests/test_vk_render.c` 11 个用例） |
+| D3D12 / GL / Metal 后端 | ⛔ 登记未实现（排期见 [docs/layering.md](docs/layering.md) §5）；`AUTO` 有 Vulkan 就选 Vulkan，否则 CPU |
 
 详细状态与理由：[docs/backends.md](docs/backends.md)。像素规则：[docs/raster_rules.md](docs/raster_rules.md)。
 **这一层在哪、四家后端怎么接（VK / D3D11 / GL / Metal 的落地顺序与验收线）**：[docs/layering.md](docs/layering.md)。
 
 ## 版本
 
-- 语义化版本 `0.2.2`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档，ABI 全程不变）；**二进制 ABI 号 1**（结构体布局 / 函数签名 / 枚举值一变就 +1）。
+- 语义化版本 `0.3.0`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档、0.3.0 = **Vulkan 后端落地**，ABI 全程不变）；**二进制 ABI 号 1**（结构体布局 / 函数签名 / 枚举值一变就 +1）。
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可

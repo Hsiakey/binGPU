@@ -67,10 +67,10 @@ static void check_error_shape(const char* fn_name) {
 static void test_version(void) {
     printf("[version]\n");
     CHECK_EQ(BINGPU_VERSION_MAJOR, 0);
-    CHECK_EQ(BINGPU_VERSION_MINOR, 2);   /* 0.2.0：实现改 C++17，ABI 仍是 1 */
-    CHECK_EQ(BINGPU_VERSION_PATCH, 2);   /* 0.2.2：分层设计文档，ABI 仍是 1 */
+    CHECK_EQ(BINGPU_VERSION_MINOR, 3);   /* 0.3.0：Vulkan 后端，ABI 仍是 1 */
+    CHECK_EQ(BINGPU_VERSION_PATCH, 0);   /* 0.3.0：Vulkan 后端落地，ABI 仍是 1 */
     CHECK(strcmp(bingpu_version_string(), BINGPU_VERSION_STRING) == 0);
-    CHECK(strcmp(bingpu_version_string(), "0.2.2") == 0);
+    CHECK(strcmp(bingpu_version_string(), "0.3.0") == 0);
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
     CHECK_EQ(BINGPU_ABI_VERSION, 1u);
     /* 结构体布局是 ABI 的一部分（头里也 static_assert 了，这里再钉一次） */
@@ -120,10 +120,15 @@ static void test_backends(void) {
         CHECK(bingpu_backend_name(bingpu_backend_at(i)) != NULL);
         CHECK(bingpu_backend_name(bingpu_backend_at(i))[0] != '\0');
     }
-    /* 这一版只有 CPU/NULL 可用；真实后端登记但不可用 */
+    /* CPU/NULL 永远可用；Vulkan 0.3.0 起是真后端 —— 能不能用**取决于机器**
+     * （驱动/物理设备），所以这里只断言"是合法的 0/1"，具体能力由
+     * tests/test_vk_render.c 在有卡时验证。D3D12/GL 仍登记但未实现。 */
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_CPU), 1);
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_NULL), 1);
-    CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_VULKAN), 0);
+    {
+        const int vk = bingpu_backend_available(BGPU_BACKEND_VULKAN);
+        CHECK(vk == 0 || vk == 1);
+    }
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_D3D12), 0);
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_GL), 0);
     CHECK_EQ(bingpu_backend_available(BGPU_BACKEND_AUTO), 0);
@@ -189,12 +194,30 @@ static void test_struct_size(void) {
     CHECK_EQ(bingpu_device_lost(device), 0);
     CHECK(bingpu_device_wait_idle(device) == BGPU_OK);
 
-    /* AUTO 在这一版必须落到 CPU（唯一真正"能画"的后端） */
+    /* AUTO 的语义：按注册表顺序选第一个可用后端（现在 Vulkan 优先，没有就 CPU）。
+     * 这里显式用 CPU 做后续的"CPU 不接受窗口"断言，AUTO 的结果只断言"落在可用后端里"。 */
+    {
+        BgpuDevice auto_dev = BGPU_INVALID;
+        BgpuDeviceDesc ad2;
+        memset(&ad2, 0, sizeof(ad2));
+        ad2.struct_size = (uint32_t)sizeof(ad2);
+        ad2.backend = BGPU_BACKEND_AUTO;
+        ad2.width = 8;
+        ad2.height = 8;
+        ad2.flags = BGPU_DEVICE_HEADLESS;
+        CHECK(bingpu_device_create(&ad2, &auto_dev) == BGPU_OK);
+        BgpuDeviceInfo ai2;
+        memset(&ai2, 0, sizeof(ai2));
+        ai2.struct_size = (uint32_t)sizeof(ai2);
+        CHECK(bingpu_device_info(auto_dev, &ai2) == BGPU_OK);
+        CHECK(ai2.backend == BGPU_BACKEND_CPU || ai2.backend == BGPU_BACKEND_VULKAN);
+        bingpu_device_destroy(auto_dev);
+    }
     BgpuDevice auto_dev = BGPU_INVALID;
     BgpuDeviceDesc ad;
     memset(&ad, 0, sizeof(ad));
     ad.struct_size = (uint32_t)sizeof(ad);
-    ad.backend = BGPU_BACKEND_AUTO;
+    ad.backend = BGPU_BACKEND_CPU;
     ad.width = 8;
     ad.height = 8;
     CHECK(bingpu_device_create(&ad, &auto_dev) == BGPU_OK);
@@ -216,18 +239,18 @@ static void test_struct_size(void) {
     check_error_shape("bingpu_swapchain_create");
     CHECK(window_sc == BGPU_INVALID);
 
-    /* 未实现的后端：UNSUPPORTED + 明确原因 */
+    /* 未实现的后端（D3D12）：UNSUPPORTED + 明确原因 */
     bingpu_clear_error();
-    BgpuDevice vk_dev = BGPU_INVALID;
+    BgpuDevice d3d_dev = BGPU_INVALID;
     BgpuDeviceDesc vd;
     memset(&vd, 0, sizeof(vd));
     vd.struct_size = (uint32_t)sizeof(vd);
-    vd.backend = BGPU_BACKEND_VULKAN;
+    vd.backend = BGPU_BACKEND_D3D12;
     vd.width = 8;
     vd.height = 8;
-    CHECK(bingpu_device_create(&vd, &vk_dev) == BGPU_ERR_UNSUPPORTED);
+    CHECK(bingpu_device_create(&vd, &d3d_dev) == BGPU_ERR_UNSUPPORTED);
     check_error_shape("bingpu_device_create");
-    CHECK(err_has("未实现") || err_has("vulkan"));
+    CHECK(err_has("未实现") || err_has("d3d12") || err_has("D3D12"));
 
     bingpu_device_destroy(auto_dev);
     bingpu_device_destroy(device);

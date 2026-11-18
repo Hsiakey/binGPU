@@ -248,5 +248,6 @@ inline ObjectBase::ObjectBase(uint32_t k, Backend& b, BgpuDevice owner)
 /* 后端单例（各自的 .cpp 里定义；注册表在 bingpu_error.cpp 里引用） */
 Backend& nullBackend();
 Backend& cpuBackend();
+Backend& vkBackend();
 
 }  // namespace bgpu

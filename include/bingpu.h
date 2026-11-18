@@ -71,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 2
-#define BINGPU_VERSION_PATCH 2
-#define BINGPU_VERSION_STRING "0.2.2"
+#define BINGPU_VERSION_MINOR 3
+#define BINGPU_VERSION_PATCH 0
+#define BINGPU_VERSION_STRING "0.3.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1 */
 #define BINGPU_ABI_VERSION 1u
