@@ -1691,14 +1691,15 @@ BgpuResult GlBackend::frameRead(Swapchain& sc_, void* dst, size_t dst_size,
         if (!sc.borrow || !sc.borrow->fbo) {
             return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "交换链没有可回读的帧");
         }
-        /* FBO 的存储行 0 = 图像顶行，glReadPixels 自下而上 → 这里要**翻行**才能拿到
-         * "从顶到底"的行序（与窗口那条路的结果对齐）。 */
+        /* FBO 这条路**不翻行**：渲染到 FBO 时 uFlip=0（s.y=0 → NDC -1 → 窗口 y=0），
+         * 而 glReadPixels 正是从窗口 y=0 开始往上吐 —— 第一条就是图像顶行。
+         * （第一版在这里也翻了，结果整幅上下镜像；bin2d 的 GPU 桥用一张 45° 渐变
+         * 框把这条抓出来，通道差 38。） */
         g_gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, sc.borrow->fbo);
         g_gl.glPixelStorei(GL_PACK_ALIGNMENT, 1);
         g_gl.glReadPixels(0, 0, static_cast<GLsizei>(sc.w), static_cast<GLsizei>(sc.h), GL_RGBA,
                           GL_UNSIGNED_BYTE, out);
         g_gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-        flipRows(out, sc.w, sc.h);
     }
     /* 两个真后端/CPU 的约定：frame_read 的输出是**直通 RGBA** */
     unpremultiply(out, static_cast<size_t>(sc.w) * sc.h);

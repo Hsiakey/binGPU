@@ -69,6 +69,7 @@ build-mingw/bin/tests/test_gl_render      # 没有可用 GL 3.3 时整份跳过�
 | `texture(box 局部上传)` | 局部上传也要预乘（0.4.0 抓到 VK 的偏差） |
 | `depth(LESS)` | 深度测试 + 写入，"相等不通过" |
 | `mesh(draw_indexed)` | 网格顶点布局（36 字节，零转换） |
+| `swapchain(frame_read 满幅纹理)` | **另一条回读路径**：`frame_begin → frame_end → frame_read`（离屏目标那条用 `texture_read`）。0.5.0 的两个后端 bug 只在这条路上，是 bin2d 的 GPU 桥先撞出来的 |
 
 判据：默认**逐像素 0 差**；只有上面那条双线性用例放宽到"差异像素 ≤ 25% 且通道差 ≤ 2"。
 

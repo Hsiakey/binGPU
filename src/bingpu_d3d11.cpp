@@ -1468,6 +1468,11 @@ bool D3d11Backend::ensureSwapchain(Swapchain& sc_, uint32_t w, uint32_t h) {
         sc.borrow->shareFrom(*ot);
         sc.borrow->w = w;
         sc.borrow->h = h;
+        /* res_w/res_h 也要给：beginRender 的 viewport、updateConstants 的 target、
+         * 以及 applyScissor 的裁剪矩形都按它算。漏了它就是"设备 96x64、viewport 0x0"
+         * —— 一笔都画不出来（bin2d 的 GPU 桥当场抓到，逐像素差 255）。 */
+        sc.borrow->res_w = w;
+        sc.borrow->res_h = h;
         sc.borrow->fmt = ot->fmt;
         sc.borrow->dxgi = ot->dxgi;
         sc.dxgi = ot->dxgi;

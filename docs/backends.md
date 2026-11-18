@@ -197,6 +197,11 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
 | 着色器 | SPIR-V（glslc 离线） | DXBC（fxc 离线） | **GLSL 源码字符串，运行时由驱动编译**（不需要离线工具） |
 | 构建依赖 | 头在 `third_party/`，`LoadLibrary` | MinGW 自带头，`LoadLibrary` | **完全不 include GL 头**，类型/常量自带，`LoadLibrary` |
 
+**回读有两条路径，验收必须两条都覆盖**（0.5.1 的教训）：`texture_read` 读的是"离屏目标
+纹理"，`frame_read` 读的是"交换链借出的帧目标"，在后端里是两段完全独立的实现
+（D3D11 = staging copy；GL = FBO 回读 / 默认帧缓冲翻行；VK = 拷回读缓冲）。
+`tests/gpu_parity.h` 现在两条都有用例（`texture(box)` 与 `swapchain(...)`）。
+
 两个 GL 特有的坑（都留了注释，也都写进了 CHANGELOG）：
 
 1. **`GL_SCISSOR_TEST` 的裁剪框默认值是"建上下文那个窗口"的大小**。离屏设备上那是个 8×8

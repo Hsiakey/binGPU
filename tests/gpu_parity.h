@@ -393,7 +393,144 @@ static void run_case(const char* name, SceneFn fn, uint32_t w, uint32_t h, int m
 }
 
 /* ---------------------------------------------------------------
- * 入口：两个 test_*.c 各调一次
+ * 交换链路径（frame_read）—— 与 texture_read 是**两条**回读代码路径
+ *
+ * 为什么必须单独有这一组：`texture_read` 读的是"离屏目标纹理"，`frame_read` 读的是
+ * "交换链借出的帧目标"，两边在后端里完全是两段实现（D3D11：staging copy；GL：FBO
+ * readback / 默认帧缓冲翻行）。0.5.0 落地时两个后端在这条路上各有一个 bug：
+ *   · D3D11 的借出对象漏了 res_w/res_h → viewport 0×0，一笔都画不出来；
+ *   · GL 的 FBO 回读多翻了一次行 → 整幅上下镜像。
+ * 12 个 texture_read 用例**一个都没抓到**，是 bin2d 的 GPU 桥先撞出来的。所以把它
+ * 补成规格的一部分：同样的画法，走 frame_* 一遍，也必须逐像素一致。
+ * --------------------------------------------------------------- */
+static int render_via_swapchain(BgpuBackendKind kind, uint32_t w, uint32_t h, uint8_t* out) {
+    BgpuDeviceDesc dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.struct_size = (uint32_t)sizeof(dd);
+    dd.backend = kind;
+    dd.width = w;
+    dd.height = h;
+    dd.flags = BGPU_DEVICE_HEADLESS;
+    BgpuDevice dev = BGPU_INVALID;
+    if (bingpu_device_create(&dd, &dev) != BGPU_OK) {
+        printf("  device_create(%s) 失败：%s\n", bingpu_backend_name(kind), bingpu_last_error());
+        return 0;
+    }
+    BgpuSwapchainDesc sd;
+    memset(&sd, 0, sizeof(sd));
+    sd.struct_size = (uint32_t)sizeof(sd);
+    sd.width = w;
+    sd.height = h;
+    sd.format = BGPU_FORMAT_RGBA8;
+    BgpuSwapchain sc = BGPU_INVALID;
+    if (bingpu_swapchain_create(dev, &sd, &sc) != BGPU_OK) {
+        printf("  swapchain_create 失败：%s\n", bingpu_last_error());
+        bingpu_device_destroy(dev);
+        return 0;
+    }
+    BgpuCmd cmd = BGPU_INVALID;
+    bingpu_cmd_create(dev, &cmd);
+
+    /* 一张 w×h 的"坐标色"纹理：两个轴上都强烈变化，上下镜像 / 不画 都会立刻露馅 */
+    uint8_t* px = (uint8_t*)malloc((size_t)w * h * 4);
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t* p = px + ((size_t)y * w + x) * 4;
+            p[0] = (uint8_t)(x * 255u / (w > 1 ? w - 1 : 1));
+            p[1] = (uint8_t)(y * 255u / (h > 1 ? h - 1 : 1));
+            p[2] = (uint8_t)(((x ^ y) & 1) ? 200 : 40);
+            p[3] = 255;
+        }
+    }
+    BgpuTexture tex = make_tex(dev, w, h, BGPU_FORMAT_RGBA8, BGPU_TEXTURE_CPU_READ);
+    bingpu_texture_upload(tex, NULL, px, w * 4);
+    free(px);
+    BgpuSampler samp = make_sampler(dev, BGPU_FILTER_NEAREST, BGPU_WRAP_CLAMP);
+    BgpuPipeline pipe = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, BGPU_PIPE_TEXTURED);
+
+    BgpuTexture target = BGPU_INVALID;
+    int ok = bingpu_frame_begin(sc, cmd, &target) == BGPU_OK;
+    if (ok) {
+        BgpuRenderBeginDesc rd;
+        memset(&rd, 0, sizeof(rd));
+        rd.struct_size = (uint32_t)sizeof(rd);
+        rd.target = target;
+        rd.flags = BGPU_RENDER_CLEAR_COLOR;
+        rd.clear_color = 0x00000000u;   /* 全透明：没画上的地方一眼看出来 */
+        ok = bingpu_cmd_begin_render(cmd, &rd) == BGPU_OK;
+        if (ok) {
+            bingpu_cmd_set_viewport(cmd, 0, 0, (float)w, (float)h);
+            bingpu_cmd_set_scissor(cmd, 0, 0, (int32_t)w, (int32_t)h);
+            bingpu_cmd_set_pipeline(cmd, pipe);
+            bingpu_cmd_set_texture(cmd, tex, samp);
+            const BgpuVertex v[4] = {{0, 0, 0, 0, 0, 0xFFFFFFFFu},
+                                     {(float)w, 0, 0, 1, 0, 0xFFFFFFFFu},
+                                     {0, (float)h, 0, 0, 1, 0xFFFFFFFFu},
+                                     {(float)w, (float)h, 0, 1, 1, 0xFFFFFFFFu}};
+            ok = bingpu_cmd_draw_quads(cmd, v, 1) == BGPU_OK &&
+                 bingpu_cmd_end_render(cmd) == BGPU_OK && bingpu_frame_end(sc, cmd) == BGPU_OK;
+        }
+        if (ok) {
+            uint32_t stride = 0;
+            ok = bingpu_frame_read(sc, out, (size_t)w * h * 4, &stride) == BGPU_OK;
+        }
+        if (!ok) printf("  交换链路径失败：%s\n", bingpu_last_error());
+    }
+    bingpu_cmd_destroy(dev, cmd);
+    bingpu_swapchain_destroy(dev, sc);
+    bingpu_device_destroy(dev);
+    return ok;
+}
+
+static void run_swapchain_case(const char* name, uint32_t w, uint32_t h, int max_ch,
+                               double max_ratio) {
+    uint8_t* a = (uint8_t*)malloc((size_t)w * h * 4);
+    uint8_t* b = (uint8_t*)malloc((size_t)w * h * 4);
+    printf("[%s]\n", name);
+    if (!render_via_swapchain(BGPU_BACKEND_CPU, w, h, a) ||
+        !render_via_swapchain(g_kind, w, h, b)) {
+        g_fail++;
+        printf("  FAIL %s: 渲染失败\n", name);
+        free(a);
+        free(b);
+        return;
+    }
+    size_t diff = 0;
+    int bad_ch = 0;
+    for (size_t i = 0; i < (size_t)w * h * 4; i++) {
+        const int d = abs((int)a[i] - (int)b[i]);
+        if (d != 0) {
+            if ((i & 3) == 0) diff++;
+            if (d > bad_ch) bad_ch = d;
+        }
+    }
+    const size_t total = (size_t)w * h;
+    const double ratio = total ? (double)diff / (double)total : 0.0;
+    printf("  尺寸 %ux%u，差异像素 %zu (%.3f%%)，最大通道差 %d\n", w, h, diff, ratio * 100.0,
+           bad_ch);
+    if (diff) {
+        int shown = 0;
+        for (size_t i = 0; i < (size_t)w * h && shown < 3; i++) {
+            const uint8_t* pa = a + i * 4;
+            const uint8_t* pb = b + i * 4;
+            if (memcmp(pa, pb, 4) != 0) {
+                printf("    px(%zu,%zu) cpu=%02X%02X%02X%02X gpu=%02X%02X%02X%02X\n", i % w, i / w,
+                       pa[3], pa[0], pa[1], pa[2], pb[3], pb[0], pb[1], pb[2]);
+                shown++;
+            }
+        }
+    }
+    if (max_ch == 0 && max_ratio <= 0.0) {
+        CHECK(diff == 0, "交换链路径也必须逐像素一致");
+    } else {
+        CHECK(bad_ch <= max_ch && ratio * 100.0 <= max_ratio, "交换链路径：容差超限");
+    }
+    free(a);
+    free(b);
+}
+
+/* ---------------------------------------------------------------
+ * 入口：各 test_*.c 调一次
  * --------------------------------------------------------------- */
 static int parity_run(const char* label, BgpuBackendKind kind) {
     g_kind = kind;
@@ -420,6 +557,9 @@ static int parity_run(const char* label, BgpuBackendKind kind) {
     run_case("texture(box 局部上传)", scene_texture_box, 64, 64, 0, 0.0);
     run_case("depth(LESS)", scene_depth, 64, 64, 0, 0.0);
     run_case("mesh(draw_indexed)", scene_mesh, 64, 64, 0, 0.0);
+    /* 交换链路径（frame_begin → … → frame_end → frame_read）：与上面的 texture_read
+     * 是两条回读实现。bin2d 的 GPU 桥就长这样，0.5.0 的两个后端 bug 都只在这条路上。 */
+    run_swapchain_case("swapchain(frame_read 满幅纹理)", 96, 64, 0, 0.0);
 
     printf("\n通过 %d 项，失败 %d 项\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

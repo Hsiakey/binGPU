@@ -68,9 +68,9 @@ static void test_version(void) {
     printf("[version]\n");
     CHECK_EQ(BINGPU_VERSION_MAJOR, 0);
     CHECK_EQ(BINGPU_VERSION_MINOR, 5);   /* 0.5.0：GL 后端（ABI 停在 2） */
-    CHECK_EQ(BINGPU_VERSION_PATCH, 0);   /* 0.5.0：GL 后端落地 */
+    CHECK_EQ(BINGPU_VERSION_PATCH, 1);   /* 0.5.1：交换链回读路径的两个 bug */
     CHECK(strcmp(bingpu_version_string(), BINGPU_VERSION_STRING) == 0);
-    CHECK(strcmp(bingpu_version_string(), "0.5.0") == 0);
+    CHECK(strcmp(bingpu_version_string(), "0.5.1") == 0);
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
     /* ABI 2 = 新增 BGPU_BACKEND_D3D11 枚举值（追加在末尾，既有值不变） */
     CHECK_EQ(BINGPU_ABI_VERSION, 2u);

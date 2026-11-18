@@ -4,6 +4,35 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.5.1] - 2026-11-18
+
+**两个 bug，都是"交换链回读"这条路上才有的**（`frame_begin → … → frame_end → frame_read`）。
+它们被 bin2d 的 GPU 桥先撞出来 —— 那份代码在 binGPU 这三个后端之前就写好了，一行没改地
+驱动 D3D11 / GL，于是当场暴露了**12 个 `texture_read` 用例一个都没抓到**的两条回读路径差异。
+
+### Fixed
+
+1. **D3D11：HEADLESS 交换链借出的帧目标漏了 `res_w/res_h`**。借出对象只赋了 `w/h/fmt/dxgi`，
+   而 `begin_render` 的 viewport、`updateConstants` 的 `target`、`applyScissor` 的裁剪矩形
+   全按 `res_w/res_h` 算 —— 于是 viewport 0×0、裁剪矩形为空，**一笔都画不出来**，读回来只有
+   清屏色（bin2d 那边逐像素差 255）。窗口路径没这个毛病（那条分支赋了 `res_w/res_h`），
+   所以 `make smoke` 一直是绿的。
+2. **GL：FBO 回读多翻了一次行**。渲染到 FBO 时 `uFlip=0`（`s.y=0 → NDC -1 → 窗口 y=0`），
+   而 `glReadPixels` 正是从窗口 y=0 往上吐 —— 第一条就是图像顶行，不该再翻。多翻一次的结果是
+   整幅**上下镜像**（bin2d 用一张 45° 渐变框看出来的，通道差 38）。
+
+### Added
+
+- `tests/gpu_parity.h` 新增 `swapchain(frame_read 满幅纹理)` 用例（96×64，坐标色纹理 +
+  NEAREST + REPLACE + 全透明清屏）：它走 `frame_*` 而不是 `texture_read`，因此能钉住
+  "两条回读路径必须给出同一幅图"。三个真后端现在各 13 个用例、全部 0 差（双线性那条仍是
+  容差用例）。
+- `docs/backends.md` 补一条：**回读有两条路径**（离屏目标 / 交换链借出），验收必须两条都覆盖。
+
+### 版本
+
+- `0.5.1`（PATCH：只修 bug，没有新能力）；`BINGPU_ABI_VERSION` 仍是 **2**。
+
 ## [0.5.0] - 2026-11-18
 
 **OpenGL 后端落地**（`src/bingpu_gl.cpp`，`GlBackend`）：`docs/layering.md` §5 排的顺序里
