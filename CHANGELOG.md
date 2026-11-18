@@ -4,6 +4,56 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.2.2] - 2026-11-18
+
+**只有文档**：把"这一层在哪、四家后端怎么接"写成 [`docs/layering.md`](docs/layering.md)。
+`BINGPU_ABI_VERSION` 仍是 **1**，`include/bingpu.h` 的功能面一个字未动（只有版本宏）。
+
+来源是 binUI 三个 GPU 后端（GL / VK / D3D11）跑通"逐像素一致"之后的复盘，回答了三个问题：
+
+1. **该收什么**：binUI 的绘制语义早就统一了（共用遍历 1788 行 + 共用字形图集 1169 行 +
+   7 个原语），重复的是**设备与呈现**（交换链、resize 策略、present 路径、离屏池、MSAA 解析，
+   每端各一份）。五个已知 bug 里三个长在这一段，两个长在呈现策略。
+2. **往上的承诺必须分成两条**：P1 = "同一串 `BgpuVertex` → 同样的像素"（binGPU 自己承诺，
+   裁判是 CPU 参考后端）；P2 = "同一份内容 → 同一串 `BgpuVertex`"（上层承诺，裁判是各自基准）。
+   混在一起验收会得出完全相反的错误结论。MSAA 破坏 P1 的 0 差，选"通道差 ≤2 / 差异像素
+   ≤0.1%"的容差表，而不是让 CPU 也做 4× 参考（理由写在 §2）。
+3. **四家分两族**：VK / D3D12 / Metal 同族（PSO + 命令缓冲，原生映射）；GL / D3D11 异族
+   （即时状态，做**状态映射**，不需要模拟命令缓冲 —— `contracts.md` §6 本来就禁止跨线程记录）。
+
+### Changed（排期修订，详见 `layering.md` §5）
+
+- **后端顺序改为 VK → D3D11 → GL → Metal，D3D12 待定**。原来写的是 VK → D3D12 → GL；
+  理由：D3D12 与 VK 同族、验证价值最低却要重写约 2270 行；而 D3D11 是异族模型，能反向
+  验证"这套 ABI 对上一代 API 也成立"。
+- **GL 从"不迁"改为"最后迁"**：原理由是"翻译层会变成半个 GL 封装"，但 binGPU 的指令面是
+  固定功能批处理（不是 RHI），适配量级约等于 binUI 的 300 行状态/present 代码。排在最后
+  的理由改为"没有用户"。
+
+### Documented（给 ABI 2 的三条提案，本次不动 ABI）
+
+- **6.1 句柄不走哈希表**：binUI 一帧 103 原语 / 938 四边形、遍历 16.6 µs；建议句柄 = 指针 +
+  魔数，深度校验只在 `BGPU_DEVICE_VALIDATE` 下做。验收线：迁移后 `make bench-draw` 的遍历
+  退化不超过 20%。
+- **6.2 冗余状态剔除写成后端契约**：上层重复 `set_pipeline` / `set_texture` 是常态，
+  按 `(pipeline, texture, scissor)` 切批的责任在后端，不在上层。
+- **6.3 present 升格为一等公民**：`BGPU_PRESENT_SWAPCHAIN / READBACK / LAYERED` 三态 +
+  守卫判定（铺满显示器 / 远程会话 / 拖拽中）收进 binGPU；并把"每帧至多一次交换链重建"、
+  "拖拽期不重建交换链不划算（resize 省 3 ms，present 多付 2.2 ms，整帧不变）"写成契约。
+
+### Fixed
+
+- **Makefile 从来没有 include 过 `-MMD -MP` 生成的 `.d`**：改 `include/bingpu.h`（结构体、版本宏、
+  枚举值）之后目标文件不重编，`make` 报 "Nothing to be done"，链出来的还是旧库。这次改版本宏
+  当场踩到（测试打印 `0.2.1`、库是新的）。修法：`-include $(wildcard $(OBJ_DIR)/*.d
+  $(OBJ_DIR)/*/*.d)`。
+- 版本号 `0.2.2`（`include/bingpu.h` 宏 + `tests/test_abi.c` 的断言）。
+
+### 同时
+
+- `docs/backends.md`：加排期修订、GL 段落改写、AUTO 顺序的重排建议（新增后端枚举 = ABI 变化，
+  留到 ABI 2）。
+
 ## [0.2.1] - 2026-11-15
 
 CPU 参考后端的吞吐优化轮：**四边形填充 4.6–7.3×、裁剪内小批 6.5×**，纹理路径 1.6–2.3×，

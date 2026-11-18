@@ -7,6 +7,7 @@
 | [raster_rules.md](raster_rules.md) | 光栅规则：顶点变换、top-left、插值、采样、混合、深度、回读 | 写后端的、写像素测试的 |
 | [backends.md](backends.md) | 后端现状表、CPU 的取舍、VK/D3D12 的开工顺序与条件、GL 为什么不迁、欠账 | 规划的人、写新后端的人 |
 | [perf.md](perf.md) | CPU 后端的吞吐基线、每条优化的收益、未做项与原因、校验和 | 要动内层循环的人 |
+| [layering.md](layering.md) | **这一层在第几层、往上的两条一致性承诺、进出边界判据、四家后端地形与落地顺序、ABI 2 的三处修订、binUI 迁移台账** | 规划的人、做 VK/D3D11/GL/Metal 后端的人 |
 
 ## 读的顺序
 
@@ -14,10 +15,11 @@
   `include/bingpu.h`（头文件注释是完整契约）。
 - **要绑到别的语言**：`abi.md` → `include/bingpu.h`。重点是句柄语义、`struct_size`、
   错误槽是线程本地的、`*_destroy` 幂等。
-- **要写新后端**：`contracts.md` → `raster_rules.md` → `backends.md`。新后端 = 继承
-  `BackendBase` 实现 5 个钩子 + 资源分配，然后拿 `tests/test_cpu_render.c` 当规格：
+- **要写新后端**：`contracts.md` → `raster_rules.md` → `backends.md` → `layering.md`（顺序与验收线）。
+  新后端 = 继承 `BackendBase` 实现 5 个钩子 + 资源分配，然后拿 `tests/test_cpu_render.c` 当规格：
   每条断言就是一条必须对齐的规则。
 - **要改这一层的设计**：先读 `contracts.md` 的六条，任何改动都要回答"破坏哪一条、为什么值得"。
+  再读 `layering.md` §2/§3：两条一致性承诺和进出边界是这一层的**位置定义**，比单条契约更靠上。
 
 ## 源码地图（`src/`）
 

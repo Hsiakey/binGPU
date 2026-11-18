@@ -1,5 +1,8 @@
 # 后端（backends）
 
+> 排期与验收口径的总设计见 [`layering.md`](layering.md)：这一层收什么、四家怎么分族、
+> 每个后端的"通过标准 + 完成后删掉哪份旧实现"都在那里。本文讲**每个后端的具体情况**。
+
 ## 现状表
 
 | 后端 | 状态（类） | 能做什么 | 不能做什么 |
@@ -19,6 +22,11 @@ VULKAN → D3D12 → GL → CPU → NULL
 也就是"真实后端优先，最后才是 CPU 与 NULL"。目前前三个都不可用，所以 `AUTO`
 落到 **CPU**。上层不该假设 AUTO 一定选到哪个 —— 拿到设备后用 `bingpu_device_info()`
 读 `backend` 字段。
+
+> 加入 D3D11 / Metal 之后这条顺序要重排（建议 `VULKAN → D3D11 → D3D12 → GL → METAL →
+> CPU → NULL`：按"能开窗口且最稳"优先，同族里 VK 先于 D3D12）。**新增 `BgpuBackendKind`
+> 枚举值 = ABI 变化**，所以这条留给 ABI 2，与 [`layering.md`](layering.md) §6 的三处修订
+> 一起做。
 
 ---
 
@@ -65,11 +73,15 @@ class CpuBackend  final : public BackendBase { /* 覆盖钩子 + 资源分配 */
 
 将来加后端 = 新写一个类 + 在注册表里登记一行：
 
-| 后端 | 类 | 覆盖什么 |
-|---|---|---|
-| Vulkan | `VkBackend` | 全部（真实实现） |
-| D3D12 | `D3D12Backend` | 全部（真实实现） |
-| （若迁 GL） | `GlBackend` | 全部 |
+| 顺序 | 后端 | 类 | 覆盖什么 |
+|---|---|---|---|
+| 1 | Vulkan | `VkBackend` | 全部（原生映射） |
+| 2 | D3D11 | `D3D11Backend` | 全部（状态映射；immediate context） |
+| 3 | GL | `GlBackend` | 全部（状态映射；WGL） |
+| 4 | Metal | `MetalBackend` | 全部（原生映射；要同时开 macOS 外壳） |
+| 待定 | D3D12 | `D3D12Backend` | 全部（原生映射；与 VK 同族，验证价值最低） |
+
+顺序与每步的"通过标准 + 删掉哪份旧实现"见 [`layering.md`](layering.md) §5。
 
 共享的 `BackendBase` 不用改 —— 状态机、校验、计数是后端无关的。
 
@@ -99,7 +111,8 @@ CPU 后端的定位不是"没有 GPU 时的降级"，而是**像素定义的权�
 
 ## Vulkan：第一个真实后端（排期在 0.2.0 之后）
 
-目标不是"能画"，而是"**和 CPU 逐字节一致**"。开工顺序：
+目标不是"能画"，而是"**和 CPU 逐字节一致**"。为什么它排第一（最显式、最能把 ABI 的不足
+顶出来），见 [`layering.md`](layering.md) §5。开工顺序：
 
 1. 设备 / 交换链 / 帧模型（`begin → record → present`，动态渲染，不挂 render pass）；
 2. 管线：五种混合各一条（预乘 / replace / keep / erase / additive），两种顶点布局；
@@ -115,35 +128,44 @@ CPU 后端的定位不是"没有 GPU 时的降级"，而是**像素定义的权�
 - 绑定层（bin2d/bin3d）已经有一层 C++ RAII 把句柄包起来 —— 否则 VK 的资源生命周期
   会漏进上层的每个调用点。
 
-## D3D12：第二个真实后端
+## D3D12：`layering.md` 里已排到 VK/D3D11/GL 之后
 
-排在 Vulkan 之后，**先把 VK 版把状态机钉死**。理由：D3D12 的显式程度最高（根签名、
-descriptor heap、fence、swap chain flip model），它验证"状态机 + 资源生命周期"的能力
-最强；但它没有"跑在 Linux 上"的兜底，调试成本也最高。VK 版通过之后，D3D12 主要是
-"把同一套规则翻译一遍"，差异集中在 present 与 swap chain 的细节。
+0.2.2 起排期调整（理由见 [`layering.md`](layering.md) §5）：**D3D11 提到 D3D12 之前**。
+原来的理由是"D3D12 显式程度最高，最能验证状态机"，但那条价值已经由 VK 拿到（两者同族：
+PSO + 命令缓冲 + 显式同步），D3D12 再写一遍学不到新东西，却要重写约 2270 行。而 **D3D11
+是异族模型**（immediate context、无命令缓冲），它能反向验证"这套 ABI 对上一代 API 也
+成立" —— 那才是真正的未知数。
 
-## GL：为什么不迁
+D3D12 不删除，只往后放：等 VK 后端把状态机钉死、D3D11 证明异族可用之后，D3D12 主要是
+"把同一套规则翻译一遍"，差异集中在根签名、描述符堆、fence 与 flip model 交换链。
 
-- binUI 的 GL 后端是**真实在用**的（Windows 上最稳的一条路），它已经跑通了三端一致的
-  像素验收。把它迁到 binGPU 的收益是"少一份代码"，成本是"把一条已经验证过的路重新
-  暴露给新的状态机"。
-- GL 的状态机与 binGPU 的"无状态命令"模型差异最大（全局状态、FBO 绑定、纹理绑定），
-  翻译层会变成半个 GL 封装，反而不好维护。
-- 真要统一的时机：**bin2d 需要 GPU 加速、且 VK/D3D12 已经稳定**之后。那时 GL 可以作为
-  "没有 VK 的旧机器"的兜底后端再进来，而不是现在。
+## GL：不迁 → **改成"最后迁"**（0.2.2 修订）
+
+原判断是"不迁"，理由是"GL 的状态机与无状态命令差得最远，翻译层会变成半个 GL 封装"。
+`layering.md` §4 推翻了这个担心的前提：**binGPU 的指令面是固定功能批处理，不是 RHI**，
+所以 GL 的适配是"3~4 处状态映射 + 一次 `glDrawArrays`"，量级和 binUI `binui_gl.cpp` 里
+present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` §6 本来就禁止跨线程记录）。
+
+结论修订为：**GL 排在最后，但理由是"没有用户"**（Windows 上优先 VK/D3D11），不是技术上
+不可行。旧机器兜底、以及 bin2d 需要 GPU 加速时，GL 仍是成本最低的第四条路。
 
 ## 欠账（明确不做，记在这里）
 
 1. **用户着色器 / SPIR-V**：bin3d 进 GPU 阶段的前提，排在 VK 后端之后。
 2. **深度纹理格式**：现在用 `RENDER_TARGET` 纹理当深度目标（后端自己解释）。
    建议将来加 `BGPU_TEXTURE_DEPTH` 或 `BGPU_FORMAT_D32F`。
-3. **MSAA**：`desc.msaa_samples` 已预留，CPU 降级为 1；VK/D3D12 落地时按需打开。
-   注意：**MSAA 会让"与 CPU 逐像素一致"变成"边界容忍 1px"**，需要单独设计验收方式。
+3. **MSAA**：`desc.msaa_samples` 已预留，CPU 降级为 1；VK/D3D11 落地时按需打开。
+   注意：**MSAA 会让"与 CPU 逐像素一致"变成"边界容差"** —— 容差怎么定、为什么现在选
+   "通道差 ≤2 / 差异像素 ≤0.1%"而不选"CPU 也做 4× 参考"，见
+   [`layering.md`](layering.md) §2 的 P1。
 4. **网格光照**：`BgpuMeshVertex` 带法线，但没有光源/材质状态可以喂给它。
    等 bin3d 定义光照模型后再加（那是 ABI 变化）。
 5. **多线程记录 / 多帧并行**：`max_frames_in_flight` 现在恒 1；真实后端落地时再按后端
    自报（CPU/NULL 永远是 1）。
 6. **透明窗口 / 垂直同步 / present 节拍**：cap 位已经预留（`TRANSPARENT`/`VSYNC`/
-   `PRESENT_PACES`），CPU/NULL 都不报；VK/D3D12 落地时按真实能力填。
+   `PRESENT_PACES`），CPU/NULL 都不报；VK/D3D11 落地时按真实能力填。
+   **present 策略本身要升格成 ABI 的一等公民**（交换链 / 读回贴屏 / 分层窗三态 + 守卫判定），
+   提案与理由见 [`layering.md`](layering.md) §6.3 —— binUI 三端各写了一遍，VK 那份在
+   "窗口铺满显示器"时出过 bug（v0.19.1）。
 7. **事件队列**：`poll()` 现在恒 `NONE`；真实后端要把 `DEVICE_LOST`/`RESIZE_REQUIRED`/
    `PRESENT_FAILED` 接到这里。

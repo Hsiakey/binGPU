@@ -106,10 +106,11 @@ destroy 幂等）；`test_cpu_render` 钉的是**像素**（clear、覆盖范围
 | Vulkan / D3D12 后端 | ⛔ 登记未实现（`AUTO` 落到 CPU） |
 
 详细状态与理由：[docs/backends.md](docs/backends.md)。像素规则：[docs/raster_rules.md](docs/raster_rules.md)。
+**这一层在哪、四家后端怎么接（VK / D3D11 / GL / Metal 的落地顺序与验收线）**：[docs/layering.md](docs/layering.md)。
 
 ## 版本
 
-- 语义化版本 `0.2.0`（0.2.0 = 实现改 C++17，ABI 不变）；**二进制 ABI 号 1**（结构体布局 / 函数签名 / 枚举值一变就 +1）。
+- 语义化版本 `0.2.2`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档，ABI 全程不变）；**二进制 ABI 号 1**（结构体布局 / 函数签名 / 枚举值一变就 +1）。
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可
