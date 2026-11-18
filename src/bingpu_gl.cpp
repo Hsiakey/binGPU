@@ -726,6 +726,7 @@ public:
     void deviceCaps(Device& dev, BgpuCaps& out) override;
     void deviceStats(Device& dev, BgpuStats& out) override;
     bool deviceLost(Device& dev) override { return static_cast<GlDeviceObj&>(dev).lost; }
+    BgpuResult deviceWaitIdle(Device& dev) override;
 
     BgpuResult createSwapchain(Device& dev, const BgpuSwapchainDesc& desc,
                                BgpuSwapchain* out) override;
@@ -1071,6 +1072,20 @@ void GlBackend::deviceStats(Device& dev, BgpuStats& out) {
     out.triangles = dev.tris;
     out.bytes_uploaded = dev.bytes_uploaded;
     out.bytes_live = dev.bytes_live;
+}
+
+/* 等 GPU 画完：glFinish（GL 没有"设备等待"，这是唯一能落地的语义）。
+ * 要先把设备自己的 context 切上来 —— 线程当前上下文可能是别的设备的。 */
+BgpuResult GlBackend::deviceWaitIdle(Device& dev) {
+    GlDeviceObj& d = static_cast<GlDeviceObj&>(dev);
+    if (!d.dc || !d.ctx) return BGPU_OK;
+    const bool wasCurrent = g_gl.wglGetCurrentContext() == d.ctx;
+    if (!wasCurrent && !g_gl.wglMakeCurrent(d.dc, d.ctx)) {
+        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "wglMakeCurrent 失败（wait_idle）");
+    }
+    if (g_gl.glFinish) g_gl.glFinish();
+    if (!wasCurrent) g_gl.wglMakeCurrent(nullptr, nullptr);
+    return BGPU_OK;
 }
 
 /* ---------------------------------------------------------------

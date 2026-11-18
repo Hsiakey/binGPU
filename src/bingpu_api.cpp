@@ -192,11 +192,12 @@ int bingpu_device_lost(BgpuDevice device) {
 BgpuResult bingpu_device_wait_idle(BgpuDevice device) {
     ApiScope scope("bingpu_device_wait_idle");
     BGPU_API_TRY
-    if (!lookupObject(device, kObjDevice)) {
+    Device* dev = static_cast<Device*>(lookupObject(device, kObjDevice));
+    if (!dev) {
         return fail(BGPU_ERR_INVALID_HANDLE, __FILE__, __LINE__, "device 句柄无效");
     }
-    /* CPU/NULL 都是同步执行，"等空闲"天然成立；真实后端在这里等队列。 */
-    return BGPU_OK;
+    /* CPU/NULL 同步执行，"等空闲"天然成立；真实后端在这里等队列（各自实现）。 */
+    return dev->be->deviceWaitIdle(*dev);
     BGPU_API_CATCH_RESULT()
 }
 

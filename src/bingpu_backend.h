@@ -137,6 +137,11 @@ public:
     virtual void deviceCaps(Device& dev, BgpuCaps& out) = 0;
     virtual void deviceStats(Device& dev, BgpuStats& out) = 0;
     virtual bool deviceLost(Device& dev) { (void)dev; return false; }
+    /* 等 GPU 把已提交的工作做完。**默认什么都不等**是不行的：CPU/NULL 后端天然同步，
+     * 但真实后端必须真的等队列 —— 否则"等空闲"是个谎，基准测试量到的是命令录制时间，
+     * 截图/回读也会读到半张图（0.5.2 才补上：VK=设备等待、D3D11=EVENT 查询、
+     * GL=glFinish）。 */
+    virtual BgpuResult deviceWaitIdle(Device& dev) { (void)dev; return BGPU_OK; }
 
     /* 交换链 / 帧 */
     virtual BgpuResult createSwapchain(Device& dev, const BgpuSwapchainDesc& desc,

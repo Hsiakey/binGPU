@@ -624,6 +624,7 @@ public:
     void deviceCaps(Device& dev, BgpuCaps& out) override;
     void deviceStats(Device& dev, BgpuStats& out) override;
     bool deviceLost(Device& dev) override { return static_cast<VkDeviceObj&>(dev).lost; }
+    BgpuResult deviceWaitIdle(Device& dev) override;
 
     BgpuResult createSwapchain(Device& dev, const BgpuSwapchainDesc& desc,
                                BgpuSwapchain* out) override;
@@ -993,6 +994,14 @@ void VkBackend::deviceStats(Device& dev, BgpuStats& out) {
     out.triangles = dev.tris;
     out.bytes_uploaded = dev.bytes_uploaded;
     out.bytes_live = dev.bytes_live;
+}
+
+/* 等 GPU 画完：VK 有原语，直接 vkDeviceWaitIdle（比插栅栏简单且语义足够）。 */
+BgpuResult VkBackend::deviceWaitIdle(Device& dev) {
+    VkDeviceObj& d = static_cast<VkDeviceObj&>(dev);
+    if (!d.dev) return BGPU_OK;
+    g_vk.vkDeviceWaitIdle(d.dev);
+    return BGPU_OK;
 }
 
 /* ---------------------------------------------------------------

@@ -4,6 +4,35 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.5.2] - 2026-11-18
+
+**两条性能/语义的坑，都是 bin2d 的图层合成基准逼出来的**（`../bin2D/tools/bin2d_bench_gpu.cpp`
+把 1280×720×16 层的三种合成路线摆在一张表上）。**ABI 不变**（ABI 2）。
+
+### Fixed
+
+1. **D3D11：纹理上传走的是 D3D11 最慢的一条路**。第一版是"建一张 b.w×b.h 的 STAGING 纹理
+   → Map → 拷行 → Unmap → `CopySubresourceRegion` 到 DEFAULT 纹理"：功能对，但每次上传
+   都要新建一张暂存纹理，而 STAGING → DEFAULT 的拷贝在驱动里是同步的。实测 56 MB/帧
+   （1280×720 的 16 个图层）要 **5942 ms**，比 VK（115 ms）和 GL（106 ms）的同等工作量
+   差两个数量级 —— "动态纹理"这条路等于废了（动画、视频帧、虚拟列表都会踩）。
+   现在改成先在普通内存里把这段行连续排好并预乘（thread_local 缓冲），再**一次
+   `UpdateSubresource`** 写进目标区域：同一基准 **5942 ms → 100 ms**（59 倍）。
+   局部上传（`box`）的语义不变，`box` 用例仍 0 差。
+2. **`bingpu_device_wait_idle()` 是个谎**。它在 `bingpu_api.cpp` 里直接 `return BGPU_OK`，
+   注释写着"真实后端在这里等队列"，但三个真后端一个都没实现 —— 调用方以为 GPU 画完了，
+   其实只把命令推给了驱动。表现是基准量到的是**命令录制时间**（0.011 ms 假装画完 16 个
+   全屏四边形），截图/回读还可能读到半张图。现在各后端真的等：
+   VK = `vkDeviceWaitIdle`、D3D11 = `D3D11_QUERY_EVENT` + `Flush` + 轮询、GL = `glFinish`
+   （切到该设备自己的 context 再 `glFinish`，完成后恢复）。同一基准 0.011 ms → 0.21 ms，
+   这才是 16 个全屏图层的真实 GPU 时长。
+
+### Changed
+
+- `src/bingpu_backend.h` 的 `Backend` 接口新增虚函数 `deviceWaitIdle()`
+  （**内部 C++ 接口**，不是 C ABI，`BINGPU_ABI_VERSION` 仍为 2）。
+- `docs/backends.md` 新增"性能：两条被基准抓出来的路径（0.5.2）"。
+
 ## [0.5.1] - 2026-11-18
 
 **两个 bug，都是"交换链回读"这条路上才有的**（`frame_begin → … → frame_end → frame_read`）。

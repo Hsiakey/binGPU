@@ -72,8 +72,8 @@ extern "C" {
 
 #define BINGPU_VERSION_MAJOR 0
 #define BINGPU_VERSION_MINOR 5
-#define BINGPU_VERSION_PATCH 1
-#define BINGPU_VERSION_STRING "0.5.1"
+#define BINGPU_VERSION_PATCH 2
+#define BINGPU_VERSION_STRING "0.5.2"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）

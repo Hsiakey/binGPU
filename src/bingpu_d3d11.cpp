@@ -302,6 +302,13 @@ void unpremultiply(uint8_t* px, size_t count) {
     }
 }
 
+/* 上传用的行缓冲（thread_local：单渲染线程，`contracts.md` §6 不允许跨线程记录，
+ * 所以一条线程一份就够；换线程时自动重建，不会串内容）。 */
+std::vector<uint8_t>& uploadScratch() {
+    static thread_local std::vector<uint8_t> buf;
+    return buf;
+}
+
 void bgraToRgbaInPlace(uint8_t* px, size_t count) {
     for (size_t i = 0; i < count; i++) std::swap(px[i * 4 + 0], px[i * 4 + 2]);
 }
@@ -454,6 +461,7 @@ public:
     void deviceCaps(Device& dev, BgpuCaps& out) override;
     void deviceStats(Device& dev, BgpuStats& out) override;
     bool deviceLost(Device& dev) override { return static_cast<D3dDeviceObj&>(dev).lost; }
+    BgpuResult deviceWaitIdle(Device& dev) override;
 
     BgpuResult createSwapchain(Device& dev, const BgpuSwapchainDesc& desc,
                                BgpuSwapchain* out) override;
@@ -785,6 +793,28 @@ void D3d11Backend::deviceStats(Device& dev, BgpuStats& out) {
     out.bytes_live = dev.bytes_live;
 }
 
+/* 等 GPU 真的画完：D3D11 没有"设备等待"，标准做法是插一个 EVENT 查询再轮询它。
+ * 只调 Flush 是不够的 —— Flush 只把命令推给驱动，不等执行（第一版就是这么写的，
+ * 于是"等空闲"实际什么都没等，基准量到的是录制时间）。 */
+BgpuResult D3d11Backend::deviceWaitIdle(Device& dev) {
+    D3dDeviceObj& d = static_cast<D3dDeviceObj&>(dev);
+    if (!d.ctx) return BGPU_OK;
+    D3D11_QUERY_DESC qd{};
+    qd.Query = D3D11_QUERY_EVENT;
+    Com<ID3D11Query> query;
+    HRESULT hr = d.dev->CreateQuery(&qd, query.put());
+    if (FAILED(hr)) { d.ctx->Flush(); return d3dFail(hr, "CreateQuery(EVENT)"); }
+    d.ctx->End(query.p);
+    d.ctx->Flush();
+    for (int spin = 0; spin < 200000; ++spin) {
+        const HRESULT r = d.ctx->GetData(query.p, nullptr, 0, 0);
+        if (r == S_OK) return BGPU_OK;
+        if (FAILED(r)) return d3dFail(r, "GetData(EVENT)");
+        ::Sleep(0);
+    }
+    return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "等待 GPU 完成超时");
+}
+
 /* ---------------------------------------------------------------
  * 纹理
  * --------------------------------------------------------------- */
@@ -886,50 +916,43 @@ BgpuResult D3d11Backend::textureUpload(Texture& tex, const BgpuBox* box, const v
                     cat("stride=", src_stride, " 小于一行 ", b.w * bpp, " 字节"));
     }
 
-    /* 暂存纹理只做"这一段"，不缓存（与 VK 每次上传建一个 host buffer 等价，
-     * 但省掉了全尺寸 staging 的显存）。 */
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = b.w;
-    td.Height = b.h;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = t.dxgi;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_STAGING;
-    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    Com<ID3D11Texture2D> staging;
-    HRESULT hr = d.dev->CreateTexture2D(&td, nullptr, staging.put());
-    if (FAILED(hr)) return d3dFail(hr, "CreateTexture2D(staging)");
-
-    D3D11_MAPPED_SUBRESOURCE ms{};
-    hr = d.ctx->Map(staging.p, 0, D3D11_MAP_WRITE, 0, &ms);
-    if (FAILED(hr)) return d3dFail(hr, "Map(staging)");
-    const uint64_t area = static_cast<uint64_t>(b.w) * b.h;
-    if (bpp == 4) {
-        /* 行内先拷再预乘（raster_rules §9）。局部上传同样要预乘 —— CPU 后端就是这么
-         * 做的，不预乘会让"局部更新的半透明贴图"混出不一样的颜色（VK 那边第一版
-         * 只在整张上传时预乘，0.4.0 一并修正）。 */
-        for (uint32_t y = 0; y < b.h; y++) {
-            uint8_t* drow = static_cast<uint8_t*>(ms.pData) + static_cast<size_t>(y) * ms.RowPitch;
-            std::memcpy(drow, static_cast<const uint8_t*>(pixels) +
-                                 static_cast<size_t>(y) * src_stride,
-                        static_cast<size_t>(b.w) * 4);
-            premultiply(drow, b.w);
-        }
-    } else {
-        for (uint32_t y = 0; y < b.h; y++) {
-            std::memcpy(static_cast<uint8_t*>(ms.pData) + static_cast<size_t>(y) * ms.RowPitch,
-                        static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * src_stride,
-                        static_cast<size_t>(b.w) * bpp);
-        }
+    /* 上传走 UpdateSubresource，**不建 staging 纹理**。
+     *
+     * 第一版是"建一张 b.w×b.h 的 STAGING → Map → 拷行 → Unmap → CopySubresourceRegion
+     * 到 DEFAULT 纹理"。功能没问题，但那是 D3D11 最慢的一条上传路径：每次上传都要
+     * 新建一张暂存纹理，而 STAGING → DEFAULT 的拷贝在驱动里是同步的、逐 texel 的。
+     * bin2D 的图层合成基准把它量出来了：1280×720×16 层每帧上传 = 56 MB，
+     * 实测 5.9 秒/帧（VK 115 ms、GL 106 ms 的同等工作量）—— 差了两个数量级，
+     * 足以把"动态纹理"这条路彻底废掉（动画、视频帧、虚拟列表都会踩）。
+     *
+     * 现在：先在普通内存里把这一段的行**连续**排好并预乘，再一次 UpdateSubresource
+     * 写进目标纹理的 (b.x,b.y) 区域。代价是一次额外拷贝（分配复用 thread_local 缓冲），
+     * 换来的是驱动侧的正常上传路径。 */
+    const uint32_t dst_row = b.w * bpp;
+    std::vector<uint8_t>& scratch = uploadScratch();
+    scratch.resize(static_cast<size_t>(dst_row) * b.h);
+    for (uint32_t y = 0; y < b.h; y++) {
+        uint8_t* drow = scratch.data() + static_cast<size_t>(y) * dst_row;
+        std::memcpy(drow, static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * src_stride,
+                    dst_row);
+        /* 行内预乘（raster_rules §9）。局部上传同样要预乘 —— CPU 后端就是这么做的，
+         * 不预乘会让"局部更新的半透明贴图"混出不一样的颜色（VK 那边第一版只在整张
+         * 上传时预乘，0.4.0 一并修正）。 */
+        if (bpp == 4) premultiply(drow, b.w);
     }
-    d.ctx->Unmap(staging.p, 0);
 
-    /* 注意参数顺序：**目的**区域由 DstX/DstY 给，最后一个参数是**源** box。
-     * 把 box 当源传就等于"把 (x,y) 处的 w×h 搬到 (0,0)"（第一版就是这么错的，
-     * box 用例的局部上传整体偏移了一格）。 */
-    d.ctx->CopySubresourceRegion(t.tex.p, 0, b.x, b.y, 0, staging.p, 0, nullptr);
-    d.bytes_uploaded += area * bpp;
+    /* 注意参数顺序：**目的**区域在 box 里，源数据用 srcRowPitch/srcDepthPitch 描述。
+     * box 传 nullptr 才是"整张"；局部上传必须给 (x,y)。 */
+    D3D11_BOX dst_box{};
+    dst_box.left = b.x;
+    dst_box.top = b.y;
+    dst_box.front = 0;
+    dst_box.right = b.x + b.w;
+    dst_box.bottom = b.y + b.h;
+    dst_box.back = 1;
+    const bool whole = (b.x == 0 && b.y == 0 && b.w == t.w && b.h == t.h);
+    d.ctx->UpdateSubresource(t.tex.p, 0, whole ? nullptr : &dst_box, scratch.data(), dst_row, 0);
+    d.bytes_uploaded += static_cast<uint64_t>(b.w) * b.h * bpp;
     return BGPU_OK;
 }
 
