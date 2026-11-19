@@ -190,6 +190,10 @@ public:
         return BGPU_OK;
     }
     virtual BgpuResult drawQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t quad_count) = 0;
+    /* ABI 4：解析圆角（SDF）四边形。BackendBase 做状态校验后派发到 rasterShapes 钩子；
+     * 钩子默认 UNSUPPORTED —— 后端实现了才覆盖它，并把 BGPU_CAP_SHAPE 打开。 */
+    virtual BgpuResult drawShapes(Cmd& cmd, const BgpuShapeVertex* verts,
+                                  uint32_t quad_count) = 0;
     virtual BgpuResult drawIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset, Buffer& ib,
                                    uint32_t index_count, uint32_t index_offset) = 0;
 };
@@ -215,6 +219,7 @@ public:
     BgpuResult setTexture(Cmd& cmd, Texture* tex, Sampler* samp) override;
     BgpuResult setAffine(Cmd& cmd, const float* xf) override;
     BgpuResult drawQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t quad_count) override;
+    BgpuResult drawShapes(Cmd& cmd, const BgpuShapeVertex* verts, uint32_t quad_count) override;
     BgpuResult drawIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset, Buffer& ib,
                            uint32_t index_count, uint32_t index_offset) override;
 
@@ -241,6 +246,16 @@ protected:
         (void)verts;
         (void)quad_count;
         return BGPU_OK;
+    }
+    /* 解析圆角的钩子：默认**不支持**（NULL 后端也走这里 —— 它只计数、不画）。
+     * 实现了的后端覆盖它，并在 caps 里给 BGPU_CAP_SHAPE。 */
+    virtual BgpuResult rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
+                                    uint32_t quad_count) {
+        (void)cmd;
+        (void)verts;
+        (void)quad_count;
+        return fail(BGPU_ERR_UNSUPPORTED, __FILE__, __LINE__,
+                    "这个后端没有实现解析圆角（BGPU_CAP_SHAPE 为 0）");
     }
     virtual BgpuResult rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset, Buffer& ib,
                                      uint32_t index_count, uint32_t index_offset) {

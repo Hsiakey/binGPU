@@ -199,6 +199,24 @@ BgpuResult BackendBase::drawQuads(Cmd& c, const BgpuVertex* verts, uint32_t quad
     return rasterQuads(c, verts, quad_count);
 }
 
+BgpuResult BackendBase::drawShapes(Cmd& c, const BgpuShapeVertex* verts, uint32_t quad_count) {
+    if (!c.inRender) {
+        return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "draw 之前没有 begin_render");
+    }
+    if (!c.pipe) {
+        return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "draw 之前没有 set_pipeline");
+    }
+    if (c.pipe->layout != BGPU_VERTEX_SHAPE) {
+        return fail(BGPU_ERR_STATE, __FILE__, __LINE__,
+                    "draw_shapes 需要 BGPU_VERTEX_SHAPE 管线的顶点布局");
+    }
+    if (!verts || quad_count == 0) return BGPU_OK;
+    c.dev->draws++;
+    c.dev->quads += quad_count;
+    c.dev->tris += static_cast<uint64_t>(quad_count) * 2u;
+    return rasterShapes(c, verts, quad_count);
+}
+
 BgpuResult BackendBase::drawIndexed(Cmd& c, Buffer& vb, uint32_t vertex_offset, Buffer& ib,
                                     uint32_t index_count, uint32_t index_offset) {
     if (!c.inRender) {

@@ -71,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 11
-#define BINGPU_VERSION_PATCH 1
-#define BINGPU_VERSION_STRING "0.11.1"
+#define BINGPU_VERSION_MINOR 12
+#define BINGPU_VERSION_PATCH 0
+#define BINGPU_VERSION_STRING "0.12.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -81,8 +81,11 @@ extern "C" {
  *          0.5.0 落 GL 后端时**一个字节都没动** —— GL 的枚举值 0.1.0 就在。
  *   ABI 3：0.6.0（**BgpuMeshVertex 加 float w** —— 透视校正的源头；
  *          新增 BgpuLight + bingpu_cmd_set_light；新增两个 cap 位。
- *          2D 路径（BgpuVertex / draw_quads）一个字节没动。） */
-#define BINGPU_ABI_VERSION 3u
+ *          2D 路径（BgpuVertex / draw_quads）一个字节没动。）
+ *   ABI 4：0.12.0（新增 BGPU_VERTEX_SHAPE 枚举值 + BgpuShapeVertex +
+ *          BGPU_PIPE_SHAPE + BGPU_CAP_SHAPE + bingpu_cmd_draw_shapes；
+ *          既有结构体、枚举值、签名全部不变） */
+#define BINGPU_ABI_VERSION 4u
 
 /* 句柄都是 uint64_t；0 = 无效 */
 #define BGPU_INVALID 0ull
@@ -281,7 +284,10 @@ uint32_t bingpu_format_bytes(BgpuFormat format);
  * --------------------------------------------------------------- */
 typedef enum BgpuVertexLayout {
     BGPU_VERTEX_2D = 0,
-    BGPU_VERTEX_MESH = 1
+    BGPU_VERTEX_MESH = 1,
+    /* 0.12.0：**解析圆角**（有符号距离场）四边形。片元着色器自己算覆盖率，
+     * 不再吃"CPU 生成好的覆盖率模板"—— AA 数学真的跑在 GPU 上。 */
+    BGPU_VERTEX_SHAPE = 2
 } BgpuVertexLayout;
 
 typedef struct BgpuVertex {
@@ -353,7 +359,8 @@ typedef enum BgpuCapFlag {
     BGPU_CAP_AFFINE = 1u << 9,          /* 支持 set_affine（任意四边形） */
     /* ABI 3：追加在末尾，旧枚举值一个都没动 */
     BGPU_CAP_LIGHTING = 1u << 10,       /* 固定功能 Lambert（BGPU_PIPE_LIGHTING 可用） */
-    BGPU_CAP_PERSPECTIVE = 1u << 11     /* 网格顶点带 w、属性按 1/w 透视校正插值 */
+    BGPU_CAP_PERSPECTIVE = 1u << 11,    /* 网格顶点带 w、属性按 1/w 透视校正插值 */
+    BGPU_CAP_SHAPE = 1u << 12           /* 解析圆角（BGPU_PIPE_SHAPE + draw_shapes） */
 } BgpuCapFlag;
 
 typedef struct BgpuCaps {
@@ -563,7 +570,10 @@ typedef enum BgpuPipelineFlag {
     BGPU_PIPE_TEXTURED = 1u << 3,     /* 采样纹理；关掉时顶点色直接出（纯色） */
     /* ABI 3：固定功能 Lambert。只对 BGPU_VERTEX_MESH 有意义（需要法线），
      * 光照参数由 bingpu_cmd_set_light 给。2D 管线设这一位是 BGPU_ERR_INVALID_ARGUMENT。 */
-    BGPU_PIPE_LIGHTING = 1u << 4
+    BGPU_PIPE_LIGHTING = 1u << 4,
+    /* ABI 4：解析圆角（SDF）管线。必须配 BGPU_VERTEX_SHAPE；
+     * 覆盖率在片元着色器里算，**不采样纹理**。 */
+    BGPU_PIPE_SHAPE = 1u << 5
 } BgpuPipelineFlag;
 
 typedef struct BgpuPipelineDesc {
@@ -645,11 +655,56 @@ typedef struct BgpuLight {
 
 BgpuResult bingpu_cmd_set_light(BgpuCmd cmd, const BgpuLight* light);
 
+/* ---------------------------------------------------------------
+ * 解析圆角四边形（0.12.0）：BGPU_VERTEX_SHAPE 的顶点
+ *
+ * 为什么要有它：0.10.0 的圆角是"CPU 算一张覆盖率位图 → GPU 九宫格拉伸"。那条路
+ * 的 AA 数学**在 CPU 上**，而且位图只能在整像素相位上生成。这里改成片元着色器
+ * 一句有符号距离场（SDF）：
+ *
+ *     q = abs(p) - b + r;  d = length(max(q,0)) + min(max(q.x,q.y),0) - r;
+ *     cov = clamp(0.5 - d, 0, 1);        // 轴对齐 1:1 时 |grad d| 恒为 1 ⇒ 1px 解析过渡
+ *
+ * 于是：AA 在 GPU 上逐像素算、不要纹理、不要模板缓存、半径不再是纹理键
+ * （所有圆角矩形可以一次 draw 画完），而且相位精确到浮点。
+ *
+ * 顶点四个角按 TL,TR,BL,BR（与 BGPU_VERTEX_2D 一致）。字段口径：
+ *   x, y       目标像素位置（走与 2D 相同的 viewport/affine）
+ *   lx, ly     **相对盒子中心**的局部坐标（顶点处 = ±hx, ±hy；片元里线性插值，
+ *              因为它是屏幕坐标的仿射函数，插值是精确的）
+ *   hx, hy     盒子半尺寸（四个顶点相同）—— SDF 需要它，不能从 lx/ly 推回来
+ *   radius     圆角半径，内部夹到 min(hx,hy)
+ *   thick      0 = 实心；> 0 = **向内** thickness 的环带（与 bin2d 的 strokeRounded 同义）
+ *   tint       0xAARRGGBB **直通**（与 BGPU_VERTEX_2D 的顶点色同口径）
+ *
+ * 已知边界：`scale` 由 transform 决定，而这条管线只在**轴对齐 1:1**（含整数平移）时
+ * 精确 —— 旋转/缩放的圆角仍走模板那条路（bin2d 侧按 transform 选路）。
+ * --------------------------------------------------------------- */
+typedef struct BgpuShapeVertex {
+    float x, y;
+    float lx, ly;
+    float hx, hy;
+    float radius;
+    float thick;
+    uint32_t tint;
+} BgpuShapeVertex;
+
+BGPU_STATIC_ASSERT(sizeof(BgpuShapeVertex) == 36, "BgpuShapeVertex 必须 36 字节");
+
 /* 一次下发 quad_count 个四边形，每 4 个顶点按 TL,TR,BL,BR 排。
  * 顶点是 CPU 数组：后端自己攒批后一次性提交（binUI 的三端都是这个形状，
  * 也是"每帧只传脏节点"的将来入口）。 */
 BgpuResult bingpu_cmd_draw_quads(BgpuCmd cmd, const BgpuVertex* vertices,
                                  uint32_t quad_count);
+
+/* 解析圆角四边形（0.12.0）：quad_count 个 BGPU_VERTEX_SHAPE 四边形一次提交，
+ * 每次 4 个顶点按 TL,TR,BL,BR。要求管线是 BGPU_PIPE_SHAPE —— 覆盖率由片元着色器
+ * 用有符号距离场算，不绑纹理。后端不支持时返回 BGPU_ERR_UNSUPPORTED
+ * （先查 BGPU_CAP_SHAPE）。 */
+BgpuResult bingpu_cmd_draw_shapes(BgpuCmd cmd, const BgpuShapeVertex* vertices,
+                                  uint32_t quad_count);
+
+
 
 /* ---------------------------------------------------------------
  * 2D 图元（0.10.0）：把"圆角矩形怎么拆成块"收进设备层

@@ -568,7 +568,7 @@ BgpuResult bingpu_pipeline_create(BgpuDevice device, const BgpuPipelineDesc* des
     if (r != BGPU_OK) return r;
     const int layout = static_cast<int>(desc->vertex_layout);
     const int blend = static_cast<int>(desc->blend);
-    if (layout < 0 || layout > 1) {
+    if (layout < 0 || layout > 2) {
         return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
                     cat("vertex_layout=", layout, " 非法"));
     }
@@ -581,6 +581,13 @@ BgpuResult bingpu_pipeline_create(BgpuDevice device, const BgpuPipelineDesc* des
     if ((desc->flags & BGPU_PIPE_LIGHTING) && desc->vertex_layout != BGPU_VERTEX_MESH) {
         return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
                     "BGPU_PIPE_LIGHTING 需要 BGPU_VERTEX_MESH 顶点（2D 顶点没有法线）");
+    }
+    /* ABI 4：解析圆角是"片元算覆盖率"，顶点必须带 hx/hy/radius/thick —— 只有
+     * BGPU_VERTEX_SHAPE 有。两位必须成对出现，否则画出来是一堆没有覆盖率的实心块。 */
+    if (((desc->flags & BGPU_PIPE_SHAPE) != 0) !=
+        (desc->vertex_layout == BGPU_VERTEX_SHAPE)) {
+        return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
+                    "BGPU_PIPE_SHAPE 与 BGPU_VERTEX_SHAPE 必须成对使用");
     }
     return settle(dev->be->createPipeline(*dev, *desc, out_pipeline), __FILE__, __LINE__, s0);
     BGPU_API_CATCH_RESULT()
@@ -788,6 +795,26 @@ BgpuResult bingpu_cmd_draw_quads(BgpuCmd cmd, const BgpuVertex* vertices, uint32
                     cat("quad_count=", quad_count, " 超出单次上限 ", BGPU_MAX_QUADS_PER_DRAW));
     }
     return settle(c->be->drawQuads(*c, vertices, quad_count), __FILE__, __LINE__, s0);
+    BGPU_API_CATCH_RESULT()
+}
+
+BgpuResult bingpu_cmd_draw_shapes(BgpuCmd cmd, const BgpuShapeVertex* vertices,
+                                  uint32_t quad_count) {
+    ApiScope scope("bingpu_cmd_draw_shapes");
+    const unsigned s0 = errorSeq();
+    BGPU_API_TRY
+    Cmd* c = static_cast<Cmd*>(take(cmd, kObjCmd, "cmd", __FILE__, __LINE__));
+    if (!c) return BGPU_ERR_INVALID_HANDLE;
+    if (quad_count == 0) return BGPU_OK;
+    if (!vertices) {
+        return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
+                    cat("vertices 为空（quad_count=", quad_count, "）"));
+    }
+    if (quad_count > BGPU_MAX_QUADS_PER_DRAW) {
+        return fail(BGPU_ERR_LIMIT, __FILE__, __LINE__,
+                    cat("quad_count=", quad_count, " 超出单次上限 ", BGPU_MAX_QUADS_PER_DRAW));
+    }
+    return settle(c->be->drawShapes(*c, vertices, quad_count), __FILE__, __LINE__, s0);
     BGPU_API_CATCH_RESULT()
 }
 

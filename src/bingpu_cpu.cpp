@@ -367,6 +367,9 @@ struct RVert {
      *   n  = 世界空间法线（只有网格路径填；2D 路径是 0，且管线不会开 LIGHTING）。 */
     float iw = 1.0f;
     float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+    /* ABI 4：解析圆角。四个顶点同值，但照样按重心权重插值（恒定属性插值仍是它自己），
+     * 于是 CPU 与 GPU 走的是**同一条**片元公式。u,v 装的是局部坐标 lx,ly。 */
+    float hx = 0.0f, hy = 0.0f, radius = 0.0f, thick = 0.0f;
 };
 
 /* 一次 draw 的常量状态 */
@@ -384,6 +387,9 @@ struct Paint {
      * 所以放在 Paint 里（不是逐顶点）。2D 路径两个都是 false。 */
     bool lighting = false;
     bool perspective = false;
+    /* ABI 4：解析圆角管线。覆盖率在片元里算（下面 shape_coverage），
+     * 与 GL/VK/D3D11 三份着色器的公式逐字对应。 */
+    bool shape = false;
     BgpuLight light{{0.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.1f, 0.1f, 0.1f}};
 
     /* 混合查表的缓存：同一批小四边形往往同色同混合，只算一次 */
@@ -393,8 +399,37 @@ struct Paint {
     uint8_t lut[4][256] = {};
 };
 
-inline float edgef(const RVert* a, const RVert* b, float px, float py) {
-    const float e = (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
+/* 解析圆角的覆盖率（0.12.0）—— 与四端着色器里那 6 行**逐字对应**：
+ *
+ *     q  = abs(p) - b + r
+ *     d  = length(max(q,0)) + min(max(q.x,q.y),0) - r     // 有符号距离（负数在内部）
+ *     cov = clamp(0.5 - d, 0, 1)                          // 轴对齐 1:1 ⇒ |grad d| = 1
+ *     环带（thick > 0）：|d + t/2| - t/2 才是"到带子中心线"的距离
+ *
+ * 为什么 0.5 - d 就是覆盖率：距离场是 1-Lipschitz 且 |grad d| = 1（像素单位），
+ * 所以一个像素内 d 恰好走 1，覆盖率随 d 线性从 1 降到 0，中点在 d = 0 的边界上。
+ * 这与"CPU 扫描线"是**不同的 AA 定义**（那边是 8 条子扫描线积分），差别见 CHANGELOG。 */
+inline float shape_coverage(float px, float py, float hx, float hy, float r, float thick) {
+    const float ax = px < 0.0f ? -px : px;
+    const float ay = py < 0.0f ? -py : py;
+    const float qx = ax - hx + r;
+    const float qy = ay - hy + r;
+    const float mx = qx > 0.0f ? qx : 0.0f;
+    const float my = qy > 0.0f ? qy : 0.0f;
+    const float m = qx > qy ? qx : qy;
+    const float d = std::sqrt(mx * mx + my * my) + (m < 0.0f ? m : 0.0f) - r;
+    float cov;
+    if (thick > 0.0f) {
+        const float half = thick * 0.5f;
+        const float e = d + half;
+        cov = 0.5f - (e < 0.0f ? -e : e) + half;
+    } else {
+        cov = 0.5f - d;
+    }
+    return cov < 0.0f ? 0.0f : (cov > 1.0f ? 1.0f : cov);
+}
+
+inline float edgef(const RVert* a, const RVert* b, float px, float py) {    const float e = (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
     /* 贴着边就**吸成精确 0**（±1e-6 边函数单位 ≈ 1e-7 px，远小于一个像素）。
      *
      * 为什么必须吸：顶点经过"设备坐标 → 视口除法 → 乘回"的往返
@@ -598,6 +633,23 @@ void shade_general(const Paint& p, float px, float py, const RVert* v0, const RV
         frag[3] = va;
     }
 
+    /* ABI 4：解析圆角覆盖率（四端着色器里的同一段公式）。
+     * 顶点色是直通的，frag 是预乘的 ⇒ 覆盖率同时乘 rgb 与 alpha，
+     * 得到的就是"这个像素被形状盖住多少"的预乘结果。 */
+    if (p.shape) {
+        const float lx = w0 * v0->u + w1 * v1->u + w2 * v2->u;
+        const float ly = w0 * v0->v + w1 * v1->v + w2 * v2->v;
+        const float hx = w0 * v0->hx + w1 * v1->hx + w2 * v2->hx;
+        const float hy = w0 * v0->hy + w1 * v1->hy + w2 * v2->hy;
+        const float rd = w0 * v0->radius + w1 * v1->radius + w2 * v2->radius;
+        const float th = w0 * v0->thick + w1 * v1->thick + w2 * v2->thick;
+        const float cov = shape_coverage(lx, ly, hx, hy, rd, th);
+        frag[0] *= cov;
+        frag[1] *= cov;
+        frag[2] *= cov;
+        frag[3] *= cov;
+    }
+
     /* ---- 固定功能 Lambert（ABI 3）----
      * 公式与 bin3d 的 Shade 逐字一致：
      *   rgb = base·vcol·tex，然后 × (ambient + color·max(dot(n,dir),0))，
@@ -738,7 +790,9 @@ void raster_tri(Paint& p, RVert* a, RVert* b, RVert* d) {
      * 这两条快路径是 2D 的主战场（文字/图标几千个小四边形），所以不是删掉，
      * 而是只在"没有新特性"时启用 —— 2D 路径 p.lighting / p.perspective 恒为 false。 */
     const bool plain2d = !p.lighting && !p.perspective;
-    if (!p.depthOn && uniformColor && wideTarget && plain2d) {
+    /* 解析圆角**不能**走这些快路径：它们的片元循环里没有覆盖率那一步（直接填整片颜色）。
+     * 覆盖率是形状管线的全部意义，绕过去就画成方角实心块。 */
+    if (!p.depthOn && uniformColor && wideTarget && plain2d && !p.shape) {
         if (!p.textured) {
             float src[4];
             src[0] = a->r * a->a;
@@ -896,7 +950,7 @@ public:
          * 不呈现到窗口 —— 那三个 cap 位故意不置。 */
         out.flags = BGPU_CAP_DEPTH | BGPU_CAP_OFFSCREEN | BGPU_CAP_READBACK |
                     BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH |
-                    BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
+                    BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE | BGPU_CAP_SHAPE;
         out.max_texture_size = BGPU_MAX_TEXTURE_SIZE;
         out.max_frames_in_flight = 1;
         out.msaa_samples = 1;
@@ -1256,6 +1310,30 @@ protected:
             for (int i = 0; i < 4; i++) transform_vert(c, *p.tgt, affine, v[i], t[i]);
             /* TL,TR,BL,BR → 三角形 (0,1,2) 与 (2,1,3)：与 binUI 的 emitQuad 同一套索引，
              * 保证共享的对角线在 top-left 规则下只被一个三角形覆盖。 */
+            raster_tri(p, &t[0], &t[1], &t[2]);
+            raster_tri(p, &t[2], &t[1], &t[3]);
+        }
+        return BGPU_OK;
+    }
+
+    BgpuResult rasterShapes(Cmd& c, const BgpuShapeVertex* verts, uint32_t quad_count) override {
+        Paint p;
+        build_paint(c, p);
+        p.shape = true;
+        p.textured = false;         /* 解析圆角不采样纹理 */
+        const bool affine = c.affineOn;
+        for (uint32_t q = 0; q < quad_count; q++) {
+            const BgpuShapeVertex* v = verts + static_cast<size_t>(q) * 4u;
+            RVert t[4];
+            for (int i = 0; i < 4; i++) {
+                /* 位置与 2D 顶点走同一条 viewport/affine 变换 */
+                const BgpuVertex base{v[i].x, v[i].y, 0.0f, v[i].lx, v[i].ly, v[i].tint};
+                transform_vert(c, *p.tgt, affine, base, t[i]);
+                t[i].hx = v[i].hx;
+                t[i].hy = v[i].hy;
+                t[i].radius = v[i].radius;
+                t[i].thick = v[i].thick;
+            }
             raster_tri(p, &t[0], &t[1], &t[2]);
             raster_tri(p, &t[2], &t[1], &t[3]);
         }

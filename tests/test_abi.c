@@ -81,12 +81,15 @@ static void test_version(void) {
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
     /* ABI 3 = BgpuMeshVertex 加 w（透视校正）+ BgpuLight + 两个 cap 位。
      * 2D 路径（BgpuVertex / draw_quads）一个字节没动 —— 那一行的断言仍然钉 24。
-     * 枚举值全部是追加，旧二进制调用方不受影响。 */
-    CHECK_EQ(BINGPU_ABI_VERSION, 3u);
+     * 枚举值全部是追加，旧二进制调用方不受影响。
+     *   ABI 4 = 0.12.0 追加 BGPU_VERTEX_SHAPE / BgpuShapeVertex / BGPU_PIPE_SHAPE /
+     *           BGPU_CAP_SHAPE / bingpu_cmd_draw_shapes。既有结构体与签名未动。 */
+    CHECK_EQ(BINGPU_ABI_VERSION, 4u);
     /* 结构体布局是 ABI 的一部分（头里也 static_assert 了，这里再钉一次） */
     CHECK_EQ(sizeof(BgpuVertex), 24u);
     CHECK_EQ(sizeof(BgpuMeshVertex), 40u);
     CHECK_EQ(sizeof(BgpuLight), 36u);   /* 3 个 float[3] */
+    CHECK_EQ(sizeof(BgpuShapeVertex), 36u);   /* ABI 4：2 位置 + 2 局部 + 2 半尺寸 + r + t + tint */
     CHECK_EQ(sizeof(BgpuDevice), 8u);
     CHECK(sizeof(BgpuDeviceDesc) >= sizeof(uint32_t) * 3);
 }

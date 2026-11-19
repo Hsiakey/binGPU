@@ -661,9 +661,14 @@ struct GlDeviceObj final : Device {
     GLint u_vp = -1, u_target = -1, u_xf0 = -1, u_xf1 = -1, u_flip = -1, u_tex = -1;
     /* ABI 3：光照 uniform（LIGHTING 管线才推进去；2D/无光照时 uLightOn=0） */
     GLint u_light_on = -1, u_light_dir = -1, u_light_color = -1, u_light_ambient = -1;
+    /* ABI 4：解析圆角的专用程序（与上面那对共用视口/仿射/翻转几个 uniform 名） */
+    GLuint prog_shape = 0;
+    GLint s_vp = -1, s_target = -1, s_xf0 = -1, s_xf1 = -1, s_flip = -1;
     GLuint def_samp = 0;
     BgpuTexture white_handle = BGPU_INVALID;
     GlTextureObj* white = nullptr;
+    /* 解析圆角程序是否编译成功（失败就如实上报"没有这个 cap"，而不是画一片黑） */
+    bool caps_shape = false;
 
     GlDeviceObj(Backend& b, uint32_t flags, uint32_t w, uint32_t h)
         : Device(b, BGPU_INVALID, flags, w, h) {}
@@ -825,6 +830,7 @@ public:
 
 protected:
     BgpuResult rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t quad_count) override;
+    BgpuResult rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts, uint32_t quad_count) override;
     BgpuResult rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset, Buffer& ib,
                              uint32_t index_count, uint32_t index_offset) override;
     BgpuResult prepareDepth(Texture& depth, Texture& target,
@@ -836,6 +842,7 @@ private:
     bool activate(GlDeviceObj& d);
     bool initDeviceObjects(GlDeviceObj& d);
     bool compileProgram(GlDeviceObj& d);
+    bool compileShapeProgram(GlDeviceObj& d);
     bool ensureFbo(GlTextureObj& t, GlDeviceObj& d);
     bool ensureSwapchain(Swapchain& sc, uint32_t w, uint32_t h);
     BgpuResult bindState(GlCmdObj& c, GlDeviceObj& d, GlTextureObj& target, Pipeline& pipe,
@@ -963,6 +970,78 @@ const char* GlBackend::unavailableReason() const noexcept {
 }
 
 /* ---------------------------------------------------------------
+ * 解析圆角（0.12.0，ABI 4）：一对专用着色器
+ *
+ * 与上面那对的差别只有两件事：顶点属性换成了形状参数，片元里多算一次覆盖率。
+ * 视口/仿射/翻转那套公式**逐字相同**（同一份 docs/raster_rules.md §1），
+ * 所以位置映射两条路完全一样。
+ *
+ * 覆盖率：圆角方盒的有符号距离场 + 1px 解析过渡
+ *     q  = abs(p) - b + r
+ *     d  = length(max(q,0)) + min(max(q.x,q.y),0) - r
+ *     cov = clamp(0.5 - d, 0, 1)            // 环带：|d + t/2| - t/2
+ * |grad d| 在像素单位下恒为 1，所以"0.5 - d"天然就是覆盖率 —— 这**不用 fwidth**
+ * （导数在 2×2 quad 上分块常数，会在高曲率处出方块；而这里的距离场本来就是 1:1 轴对齐，
+ *  梯度是常数 1，用解析式反而更准，也让 CPU 参考后端能逐位对上）。
+ * --------------------------------------------------------------- */
+const char* kShapeVertSrc =
+    "#version 330 core\n"
+    "layout(location = 0) in vec2 inPos;     // 目标像素\n"
+    "layout(location = 1) in vec2 inLocal;   // 相对盒子中心的局部坐标\n"
+    "layout(location = 2) in vec2 inHalf;    // 盒子半尺寸\n"
+    "layout(location = 3) in float inRadius;\n"
+    "layout(location = 4) in float inThick;  // 0 = 实心\n"
+    "layout(location = 5) in vec4 inColor;\n"
+    "uniform vec4 uVp;\n"
+    "uniform vec2 uTarget;\n"
+    "uniform vec4 uXf0;\n"
+    "uniform vec4 uXf1;\n"
+    "uniform float uFlip;\n"
+    "out vec2 vLocal;\n"
+    "flat out vec2 vHalf;\n"
+    "flat out vec2 vRT;\n"
+    "out vec4 vColor;\n"
+    "void main() {\n"
+    "  vec2 s = vec2(uVp.x + (inPos.x / uTarget.x) * uVp.z,\n"
+    "                uVp.y + (inPos.y / uTarget.y) * uVp.w);\n"
+    "  if (uXf0.w > 0.5) {\n"
+    "    s = vec2(uXf0.x * s.x + uXf0.y * s.y + uXf0.z,\n"
+    "             uXf1.x * s.x + uXf1.y * s.y + uXf1.z);\n"
+    "  }\n"
+    "  float yDown = s.y / uTarget.y * 2.0 - 1.0;\n"
+    "  float yUp = 1.0 - s.y / uTarget.y * 2.0;\n"
+    "  gl_Position = vec4(s.x / uTarget.x * 2.0 - 1.0, mix(yDown, yUp, uFlip), 0.0, 1.0);\n"
+    "  vLocal = inLocal;\n"
+    "  vHalf = inHalf;\n"
+    "  vRT = vec2(inRadius, inThick);\n"
+    "  vColor = inColor.zyxw;\n"
+    "}\n";
+
+const char* kShapeFragSrc =
+    "#version 330 core\n"
+    "in vec2 vLocal;\n"
+    "flat in vec2 vHalf;\n"
+    "flat in vec2 vRT;\n"
+    "in vec4 vColor;\n"
+    "out vec4 outColor;\n"
+    "void main() {\n"
+    "  float r = max(vRT.x, 0.0);\n"
+    "  float th = vRT.y;\n"
+    "  vec2 q = abs(vLocal) - vHalf + vec2(r);\n"
+    "  float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;\n"
+    "  float cov;\n"
+    "  if (th > 0.0) {\n"
+    "    float half_t = th * 0.5;\n"
+    "    cov = 0.5 - abs(d + half_t) + half_t;\n"
+    "  } else {\n"
+    "    cov = 0.5 - d;\n"
+    "  }\n"
+    "  cov = clamp(cov, 0.0, 1.0);\n"
+    "  float a = vColor.a * cov;\n"
+    "  outColor = vec4(vColor.rgb * a, a);   // 顶点色是直通的 ⇒ 输出预乘\n"
+    "}\n";
+
+/* ---------------------------------------------------------------
  * 设备
  * --------------------------------------------------------------- */
 bool GlBackend::compileProgram(GlDeviceObj& d) {
@@ -1020,8 +1099,60 @@ bool GlBackend::compileProgram(GlDeviceObj& d) {
     return true;
 }
 
-bool GlBackend::initDeviceObjects(GlDeviceObj& d) {
-    if (!compileProgram(d)) return false;
+/* 解析圆角的程序（0.12.0）。编译失败**不算致命** —— 老驱动/老 GLSL 上退化成
+ * "没有 BGPU_CAP_SHAPE"，上层继续用覆盖率模板那条路。 */
+bool GlBackend::compileShapeProgram(GlDeviceObj& d) {
+    GLuint vs = g_gl.glCreateShader(GL_VERTEX_SHADER);
+    const GLchar* vp = kShapeVertSrc;
+    g_gl.glShaderSource(vs, 1, &vp, nullptr);
+    g_gl.glCompileShader(vs);
+    GLint ok = GL_FALSE;
+    g_gl.glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024] = {0};
+        g_gl.glGetShaderInfoLog(vs, sizeof(log) - 1, nullptr, log);
+        g_gl.glDeleteShader(vs);
+        if (trace4()) std::fprintf(stderr, "[gl] shape vs 编译失败：%s\n", log);
+        return false;
+    }
+    GLuint fs = g_gl.glCreateShader(GL_FRAGMENT_SHADER);
+    const GLchar* fp = kShapeFragSrc;
+    g_gl.glShaderSource(fs, 1, &fp, nullptr);
+    g_gl.glCompileShader(fs);
+    g_gl.glGetShaderiv(fs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024] = {0};
+        g_gl.glGetShaderInfoLog(fs, sizeof(log) - 1, nullptr, log);
+        g_gl.glDeleteShader(fs);
+        g_gl.glDeleteShader(vs);
+        if (trace4()) std::fprintf(stderr, "[gl] shape fs 编译失败：%s\n", log);
+        return false;
+    }
+    d.prog_shape = g_gl.glCreateProgram();
+    g_gl.glAttachShader(d.prog_shape, vs);
+    g_gl.glAttachShader(d.prog_shape, fs);
+    g_gl.glLinkProgram(d.prog_shape);
+    g_gl.glGetProgramiv(d.prog_shape, GL_LINK_STATUS, &ok);
+    g_gl.glDeleteShader(vs);
+    g_gl.glDeleteShader(fs);
+    if (!ok) {
+        char log[1024] = {0};
+        g_gl.glGetProgramInfoLog(d.prog_shape, sizeof(log) - 1, nullptr, log);
+        if (trace4()) std::fprintf(stderr, "[gl] shape program 链接失败：%s\n", log);
+        g_gl.glDeleteProgram(d.prog_shape);
+        d.prog_shape = 0;
+        return false;
+    }
+    d.s_vp = g_gl.glGetUniformLocation(d.prog_shape, "uVp");
+    d.s_target = g_gl.glGetUniformLocation(d.prog_shape, "uTarget");
+    d.s_xf0 = g_gl.glGetUniformLocation(d.prog_shape, "uXf0");
+    d.s_xf1 = g_gl.glGetUniformLocation(d.prog_shape, "uXf1");
+    d.s_flip = g_gl.glGetUniformLocation(d.prog_shape, "uFlip");
+    return true;
+}
+
+bool GlBackend::initDeviceObjects(GlDeviceObj& d) {    if (!compileProgram(d)) return false;
+    if (compileShapeProgram(d)) d.caps_shape = true;
     g_gl.glGenVertexArrays(1, &d.vao);
     g_gl.glBindVertexArray(d.vao);
     g_gl.glGenSamplers(1, &d.def_samp);
@@ -1130,6 +1261,9 @@ void GlBackend::deviceCaps(Device& dev, BgpuCaps& out) {
                 BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH |
                 /* ABI 3：固定功能光照（uniform 驱动）与透视校正（网格顶点带 w）。 */
                 BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
+    /* ABI 4：解析圆角。只有形状着色器真的编出来了才报 —— 老驱动上退化成"没有这个 cap"，
+     * 上层继续用覆盖率模板。 */
+    if (d.prog_shape) out.flags |= BGPU_CAP_SHAPE;
     out.max_texture_size = std::min<uint32_t>(BGPU_MAX_TEXTURE_SIZE,
                                               max_tex > 0 ? static_cast<uint32_t>(max_tex)
                                                           : BGPU_MAX_TEXTURE_SIZE);
@@ -1965,6 +2099,83 @@ BgpuResult GlBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
     g_gl.glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(quad_count * 6), GL_UNSIGNED_INT,
                         reinterpret_cast<const void*>(0));
     if (glFail("draw_quads") != BGPU_OK) {
+        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "GL 绘制失败");
+    }
+    return BGPU_OK;
+}
+
+BgpuResult GlBackend::rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
+                                   uint32_t quad_count) {
+    GlCmdObj& c = static_cast<GlCmdObj&>(cmd);
+    GlDeviceObj& d = *c.gldev;
+    if (!c.target) return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "draw 时不在渲染里");
+    if (!d.prog_shape) {
+        return fail(BGPU_ERR_UNSUPPORTED, __FILE__, __LINE__,
+                    "GL 后端的解析圆角着色器没编译出来");
+    }
+    GlTextureObj& target = static_cast<GlTextureObj&>(*c.target);
+    if (!activate(d)) return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "上下文不可用");
+
+    /* 混合/深度/裁剪与 2D 那条完全一样；程序换成形状专用的那一对。 */
+    BgpuResult r = bindState(c, d, target, *c.pipe, c.depth != nullptr);
+    if (r != BGPU_OK) return r;
+    g_gl.glUseProgram(d.prog_shape);
+    {
+        const GLfloat vp[4] = {c.vp[0], c.vp[1], c.vp[2], c.vp[3]};
+        const GLfloat tg[2] = {static_cast<GLfloat>(target.res_w),
+                               static_cast<GLfloat>(target.res_h)};
+        GLfloat xf0[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        GLfloat xf1[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+        if (c.affineOn) {
+            xf0[0] = c.xf[0];
+            xf0[1] = c.xf[1];
+            xf0[2] = c.xf[2];
+            xf0[3] = 1.0f;
+            xf1[0] = c.xf[3];
+            xf1[1] = c.xf[4];
+            xf1[2] = c.xf[5];
+        }
+        if (d.s_vp >= 0) g_gl.glUniform4fv(d.s_vp, 1, vp);
+        if (d.s_target >= 0) g_gl.glUniform2fv(d.s_target, 1, tg);
+        if (d.s_xf0 >= 0) g_gl.glUniform4fv(d.s_xf0, 1, xf0);
+        if (d.s_xf1 >= 0) g_gl.glUniform4fv(d.s_xf1, 1, xf1);
+        if (d.s_flip >= 0) g_gl.glUniform1f(d.s_flip, target.window_target ? 1.0f : 0.0f);
+    }
+    if (!applyScissor(c, target)) return BGPU_OK;
+
+    if (!ensureQuadBuffers(c, d, quad_count)) {
+        return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "顶点/索引缓冲扩容失败");
+    }
+    const GLsizeiptr vbytes =
+        static_cast<GLsizeiptr>(quad_count) * 4 *
+        static_cast<GLsizeiptr>(sizeof(BgpuShapeVertex));
+    g_gl.glBindBuffer(GL_ARRAY_BUFFER, c.vbuf);
+    g_gl.glBufferSubData(GL_ARRAY_BUFFER, 0, vbytes, verts);
+    g_gl.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, c.ibuf);
+
+    /* BgpuShapeVertex 36 字节：x,y(0) lx,ly(8) hx,hy(16) radius(24) thick(28) tint(32) */
+    const GLsizei stride = sizeof(BgpuShapeVertex);
+    g_gl.glEnableVertexAttribArray(0);
+    g_gl.glEnableVertexAttribArray(1);
+    g_gl.glEnableVertexAttribArray(2);
+    g_gl.glEnableVertexAttribArray(3);
+    g_gl.glEnableVertexAttribArray(4);
+    g_gl.glEnableVertexAttribArray(5);
+    g_gl.glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride,
+                               reinterpret_cast<const void*>(0));
+    g_gl.glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride,
+                               reinterpret_cast<const void*>(8));
+    g_gl.glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride,
+                               reinterpret_cast<const void*>(16));
+    g_gl.glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, stride,
+                               reinterpret_cast<const void*>(24));
+    g_gl.glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride,
+                               reinterpret_cast<const void*>(28));
+    g_gl.glVertexAttribPointer(5, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride,
+                               reinterpret_cast<const void*>(32));
+    g_gl.glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(quad_count * 6), GL_UNSIGNED_INT,
+                        reinterpret_cast<const void*>(0));
+    if (glFail("draw_shapes") != BGPU_OK) {
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "GL 绘制失败");
     }
     return BGPU_OK;
