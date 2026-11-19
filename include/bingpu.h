@@ -71,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 9
+#define BINGPU_VERSION_MINOR 10
 #define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.9.0"
+#define BINGPU_VERSION_STRING "0.10.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -650,6 +650,54 @@ BgpuResult bingpu_cmd_set_light(BgpuCmd cmd, const BgpuLight* light);
  * 也是"每帧只传脏节点"的将来入口）。 */
 BgpuResult bingpu_cmd_draw_quads(BgpuCmd cmd, const BgpuVertex* vertices,
                                  uint32_t quad_count);
+
+/* ---------------------------------------------------------------
+ * 2D 图元（0.10.0）：把"圆角矩形怎么拆成块"收进设备层
+ *
+ * 分工（与帧节拍器同一个道理）：
+ *   · **AA 数学在调用方** —— "圆角看起来是什么样"是绘制语义，所以覆盖率模板由
+ *     bin2d 的 `RasterizeRoundedTileCoverage` 出（它是唯一一份解析式，仓里三个 GPU 后端
+ *     的圆角能逐字节一致就是靠共用它）；
+ *   · **拆几块、怎么合批、走哪个后端** 是"怎么画" —— 在这一层。
+ *
+ * 实现上就是"把模板铺成 9 块，转成一次 draw_quads"，所以五个后端（CPU / VK / GL /
+ * D3D11 / NULL）**零改动**就能画，像素也天然一致 —— 这正是这一层存在的意义：
+ * 上层只描述形状，几何展开与合批在设备层。
+ *
+ * 调用前提：已经有 begin_render、已 `bingpu_cmd_set_pipeline`（一般 TEXTURED +
+ * 目标混合模式）。这两个函数只负责绑模板纹理 + 发顶点。
+ * --------------------------------------------------------------- */
+
+/* 圆角实心：coverage 是 t×t 的覆盖率模板（t = tile_size，四通道都等于覆盖率），
+ * radius 夹到 min(w,h)/2（与 bin2d 的 FillRounded 同一口径）。radius <= 0 或
+ * tile_size <= 0 返回 BGPU_ERR_INVALID_ARGUMENT（调用方应改走 draw_quads 的直角路径）。
+ * tint 是 0xAARRGGBB 直通（与顶点色同一口径）。
+ *
+ * **粗描边不在这一层循环**：粗描边 = 同心 1px 环叠层，每一层的半径不同、要一张**不同**的
+ * 覆盖率模板，而模板缓存归调用方（只有它知道半径取整与缓存键）。所以这里只画"一层"，
+ * 多层由调用方连着调 —— 这一层负责的是"怎么把一层变成四边形"。 */
+BgpuResult bingpu_cmd_draw_rounded_rect(BgpuCmd cmd, BgpuTexture coverage,
+                                        float x, float y, float w, float h,
+                                        float radius, int32_t tile_size, uint32_t tint);
+
+/* 同一张模板、一次绑定、**一次 draw_quads** 画 N 个圆角矩形。
+ *
+ * 为什么要有数组版（合批是这个层的职责，不是上层的）：
+ *   234 个卡片如果各调一次 `draw_rounded_rect`，就是 234 次绑纹理 + 234 次 draw_quads
+ *   + 234 次顶点提交。实测（1020×684、234 个 100×32 的圆角矩形）：
+ *   逐个调用 CPU 后端 20.4 ms，而一次批量只有几毫秒 —— 差的全是调用开销，
+ *   跟"画多少像素"无关。半径相同的形状在 UI 里是**绝大多数**（10 / 12 / 14 这几档），
+ *   所以调用方按模板分组之后就能一次发完。
+ */
+typedef struct BgpuRoundedRect {
+    float x, y, w, h;
+    float radius;      /* 每项自己夹到 min(w,h)/2 */
+    uint32_t tint;     /* 0xAARRGGBB 直通 */
+} BgpuRoundedRect;
+
+BgpuResult bingpu_cmd_draw_rounded_rects(BgpuCmd cmd, BgpuTexture coverage,
+                                         int32_t tile_size, const BgpuRoundedRect* rects,
+                                         uint32_t count);
 
 /* 索引绘制（3D 网格）：顶点格式由管线的 vertex_layout 决定。 */
 BgpuResult bingpu_cmd_draw_indexed(BgpuCmd cmd, BgpuBuffer vertex_buffer,

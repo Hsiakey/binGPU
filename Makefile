@@ -83,7 +83,7 @@ $(LIB_A): $(LIB_OBJS)
 # =============================================
 # 测试（C 源码 → gcc 编 → g++ 链接；见文件头）
 # =============================================
-TEST_NAMES := test_abi test_cpu_render test_pace test_vk_render test_d3d11_render test_gl_render
+TEST_NAMES := test_abi test_cpu_render test_pace test_prims test_vk_render test_d3d11_render test_gl_render
 TEST_BINS  := $(addprefix $(TEST_DIR)/,$(addsuffix $(EXT),$(TEST_NAMES)))
 
 $(OBJ_DIR)/tests/%.o: $(TEST_SRC)/%.c
