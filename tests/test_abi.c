@@ -67,10 +67,17 @@ static void check_error_shape(const char* fn_name) {
 static void test_version(void) {
     printf("[version]\n");
     CHECK_EQ(BINGPU_VERSION_MAJOR, 0);
-    CHECK_EQ(BINGPU_VERSION_MINOR, 6);   /* 0.6.0：光照 + 透视校正（ABI 3） */
-    CHECK_EQ(BINGPU_VERSION_PATCH, 1);   /* 0.6.1：三个 GPU 后端补上光照 + 透视 */
-    CHECK(strcmp(bingpu_version_string(), BINGPU_VERSION_STRING) == 0);
-    CHECK(strcmp(bingpu_version_string(), "0.6.1") == 0);
+    /* 版本号不许在这里写死（写死过一次：0.7/0.8 连发两个版本，这里还钉着 0.6.1，
+     * 于是 `make test` 静默红了三个版本没人发现）。钉"三个宏和字符串一致"才是
+     * 这一条真正要防的东西。 */
+    {
+        char expected[32];
+        snprintf(expected, sizeof(expected), "%d.%d.%d", BINGPU_VERSION_MAJOR,
+                 BINGPU_VERSION_MINOR, BINGPU_VERSION_PATCH);
+        CHECK(strcmp(BINGPU_VERSION_STRING, expected) == 0);
+        CHECK(strcmp(bingpu_version_string(), expected) == 0);
+    }
+    CHECK(BINGPU_VERSION_MINOR >= 9);    /* 0.9.0：帧节拍器 */
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
     /* ABI 3 = BgpuMeshVertex 加 w（透视校正）+ BgpuLight + 两个 cap 位。
      * 2D 路径（BgpuVertex / draw_quads）一个字节没动 —— 那一行的断言仍然钉 24。

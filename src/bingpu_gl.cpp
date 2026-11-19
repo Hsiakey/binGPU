@@ -470,6 +470,17 @@ bool loadGlFunctions() {
     BGPU_GL_FN(glUniform2fv);
     BGPU_GL_FN(glUniform3fv);
     BGPU_GL_FN(glUniform4fv);
+    /* wglSwapIntervalEXT 是**扩展**不是 core，装载失败不算错（那条路上只是关不掉垂直同步），
+     * 所以不并进上面的 ok。但**必须装**：0.9.0 之前它只在文件里声明过、从来没有装载，
+     * 于是 `BGPU_DEVICE_VSYNC` 位完全是个空操作 —— 显式传 vsync=0 也仍然每帧等刷新
+     * （实测 1020×684 卡死在 8.335 ms / 120.0 fps），而装载之后同一个 context、同一个窗口
+     * 是 1.206 ms / 801 fps。同时 swapchainInfo 还按 flag 自报 present_paces_frames，
+     * 于是"自报"和"实际"对不上 —— 这是 55 fps 那类双重等待的又一个来源。 */
+    {
+        const bool swapOk = bindP(glProc, "wglSwapIntervalEXT", &g_gl.wglSwapIntervalEXT);
+        if (!swapOk && trace4())
+            std::fprintf(stderr, "[gl] wglSwapIntervalEXT 不可用：垂直同步开关会被忽略\n");
+    }
 #undef BGPU_GL_FN
     if (trace4()) std::fprintf(stderr, "[gl] loadGlFunctions ok=%d\n", (int)ok);
     return ok;

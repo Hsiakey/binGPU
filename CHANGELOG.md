@@ -4,6 +4,79 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.9.0] - 2026-11-20
+
+**新增帧节拍器 `bingpu_pace_*`：把"这一拍该不该画"收进 device 层**；
+并修掉 **GL 后端的 `BGPU_DEVICE_VSYNC` 从来是个空操作**（ABI 不变，纯追加 API）。
+
+### 为什么节拍器在这一层
+
+master 2026-11-20：「按理说这种绘制请求 GPU 应该能画个几百上千帧才对。防止使用率过高，
+性能钳制才用的节拍器（即达到屏幕或系统刷新率即可）。这个性能钳制在哪做呢？我感觉是在
+bin2D/3D 这里，当然做成可调的最好：标准/无限制/240/120/90/60/30 等」，以及
+「标准 = 跟着合成帧节拍或屏幕刷新率：路性能不够时尽可能画多点帧，性能超过时钳制在系统合成帧率」。
+
+先量出来的事实是：**帧率不是画出来的上限**。1020×684 一帧的 present+draw 只要 0.5–1.0 ms：
+
+| 后端 | vsync=0 裸跑 | vsync=1 |
+|---|---|---|
+| Vulkan | 966–991 fps | 120.0 fps |
+| D3D11 | 1846–1854 fps | 119.0 fps |
+| OpenGL | 120.0 fps（**bug**，见下） | 120.0 fps |
+
+上千帧的算力一直摆在那里，被节拍器掐成了 55/31/100。而掐拍需要的判据全在设备层：
+刷新率、present mode、present 有没有阻塞到垂直同步、上一拍 present 真实耗时 ——
+上层猜这些就是 0.8.0 里"present 节奏不稳定"的来源（见下）。
+
+所以：**策略在上面（bin2D/bin3D 说"最多多少帧"），闸门在这里。**
+
+### 新增
+
+```c
+typedef enum BgpuPacePolicy {          /* standard / unlimited / 240 / 120 / 90 / 60 / 30 */
+    BGPU_PACE_STANDARD = 0, BGPU_PACE_UNLIMITED = 1, BGPU_PACE_240 = 2, ...
+} BgpuPacePolicy;
+
+void      bingpu_pace_init(BgpuPacer* pacer, void* native_window);  /* 探测刷新率 */
+BgpuResult bingpu_pace_set_policy(BgpuPacer*, BgpuPacePolicy);
+double    bingpu_pace_frame_ms(const BgpuPacer*);      /* **生效**周期；0 = 不掐拍 */
+int64_t   bingpu_pace_wait_us(const BgpuPacer*, int64_t now_us);
+void      bingpu_pace_frame_begin(BgpuPacer*, int64_t now_us);
+void      bingpu_pace_frame_end(BgpuPacer*, int64_t end_us, double present_ms);
+int       bingpu_pace_wants_vsync(const BgpuPacer*);   /* 目标 > 刷新率时必须关 */
+int       bingpu_display_refresh_hz(void* native_window);
+int       bingpu_pace_policy_parse(const char* text, BgpuPacePolicy* out);
+```
+
+`BgpuPacer` 是调用方持有的一块 POD（没有资源、没有生命周期），时间由调用方注入 ——
+所以整个节拍逻辑可以离线单测（`tests/test_pace.c`，72 条断言，喂任意时间序列）。
+
+规则一句话：**下一拍 = max(本拍开始 + 目标周期, 本拍结束)**。析出三条：
+
+- present 自己在等刷新时，相位从**本拍结束**起算（`end + (k-1) 格`）——
+  它返回的时刻本来就是刷新边界，从这里数才不会和刷新打拍子；
+- `标准` **不向上凑整**：画不完就尽力多画，不为了"整数个刷新周期"退成 60 fps；
+- 只有明确要 60/30 时才凑整；`90` 落在 120 Hz 屏上实际是 120（报的是生效周期）。
+
+### 修复
+
+- **GL：`wglSwapIntervalEXT` 从来没被装载过**（`bingpu_gl.cpp` 只声明、没进
+  `loadGlFunctions` 的装载表），于是 `BGPU_DEVICE_VSYNC` 位是个空操作：
+  显式传 `vsync=0` 也仍然每帧等刷新 —— 实测卡在 120.0 fps / 8.335 ms，
+  装载之后同一个 context、同一个窗口 **801 fps / 1.206 ms**。
+- **`tests/test_abi.c` 里的版本断言写死成 0.6.1**，从 0.7.0 起 `make test` 就一直是红的
+  （静默红了三个版本）。改成校验"三个宏与字符串一致"，以后再也不会过期。
+
+### 撤回 0.8.0 的"present 节奏不稳定"诊断
+
+0.8.0 那张表（VK 112/55 两档、D3D11 113/31 两档）把原因记成"交换链在飞帧数没限制"。
+量到底之后：**三端在 vsync=1 下裸跑都是 119–120 fps / 8.34 ms**，present 本身没有问题。
+真正的两个原因：
+1. GL 关不掉 vsync（上面那条）；
+2. 上层的外壳和 present **互相等**（present 等一格、外壳再补一格）。
+
+0.8.0 提到的验收标准（"连跑 5 次 present 方差 < 10%"）仍然留着，但现在它由
+`bingpu_pace_*` 而不是交换链来保证。
 ## [0.8.0] - 2026-11-20
 
 **新增 `bingpu_render_plan()`：把"用哪个 API、在哪执行、什么质量档"收进 binGPU。**

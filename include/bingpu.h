@@ -71,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 8
+#define BINGPU_VERSION_MINOR 9
 #define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.8.0"
+#define BINGPU_VERSION_STRING "0.9.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -177,6 +177,86 @@ typedef struct BgpuRenderPlan {
 BgpuResult bingpu_render_plan(BgpuBackendKind want, BgpuRenderPlan* out_plan);
 /* "gpu" / "cpu"，只用于日志 */
 const char* bingpu_exec_mode_name(BgpuExecMode mode);
+
+/* ---------------------------------------------------------------
+ * 帧节拍器（0.9.0）：**"这一拍该不该画"由设备层回答**
+ *
+ * 为什么要它，以及为什么在这一层：
+ *   1. GPU 画 1020×684 一帧只需要 0.54 ms（D3D11 实测 1848 fps，Vulkan 977 fps）。
+ *      也就是说**帧率从来不是画出来的上限，而是被节拍器掐出来的上限**。
+ *   2. 掐拍的输入全是设备层的东西：显示器刷新率、交换链 present mode、
+ *      present 到底有没有阻塞到垂直同步、上一拍 present 花了多久。
+ *      上层猜这些只能瞎猜（曾经在外壳里用 `present 耗时 >= 半个刷新周期` 猜，
+ *      结果在 Vulkan 上每次多睡一格 → present 等一格 + 外壳再等一格 = 双重等待，
+ *      实测 120 Hz 屏上掉到 55 fps，而同一份代码裸跑 present 是 119.9 fps）。
+ *   3. 所以：**策略由上层给（bin2D/bin3D 的绘制语义层），闸门在这里算。**
+ *      上层只有两个问题要问：`wait_us()` 还要等多久、`wants_vsync()` 该不该开垂直同步。
+ *
+ * 节拍规则（一句话）：**下一拍 = max(本拍开始 + 目标周期, 本拍结束)**。
+ *   · `max(..., 本拍结束)` 就是防双重等待的那一刀：present 已经等掉了时间，
+ *     就不要在它后面再补一整格 —— 这是 55 fps 那个坑的唯一根因。
+ *   · 目标周期 = 刷新网格（或比刷新更细的网格，见 PACE_240）× 整数 k，
+ *     k 由"本拍真实耗时"带滞回地往上调（装不下就升档，稳稳装得下才降档）。
+ * --------------------------------------------------------------- */
+typedef enum BgpuPacePolicy {
+    /* 跟显示器刷新率：**上限**是刷新率，**不设下限**。
+     *   · 画得完（一帧 ≤ 一个刷新周期）→ 钳在刷新率上，多的帧没意义还烧电；
+     *   · 画不完（一帧 > 一个刷新周期）→ **尽力多画**，不往"整数个刷新周期"上凑。
+     *     9.5 ms 的帧就是 ~105 fps，不会被硬凑成 2 个周期（60 fps）——
+     *     凑整只对"明确要求 60/30"有意义，对"标准"就是白白扔掉 40% 的帧。
+     * 这条是 2026-11-20 master 定的口径。 */
+    BGPU_PACE_STANDARD = 0,
+    BGPU_PACE_UNLIMITED = 1,  /* 完全不掐拍：能画多快画多快（需要关 vsync，会撕裂） */
+    BGPU_PACE_240 = 2,
+    BGPU_PACE_120 = 3,
+    BGPU_PACE_90 = 4,
+    BGPU_PACE_60 = 5,
+    BGPU_PACE_30 = 6
+} BgpuPacePolicy;
+
+typedef struct BgpuPacer {
+    uint32_t struct_size;
+    int32_t  refresh_hz;      /* 显示器刷新率；<=0 时按 60 算 */
+    int32_t  policy;          /* BgpuPacePolicy */
+    int32_t  steps;           /* 上一拍占几个网格（滞回状态；0 = 还没学过） */
+    int32_t  started;         /* 是否已经有基准 */
+    int32_t  frame_open;      /* frame_begin 已经调过且还没 frame_end（0 是合法时间戳，不能拿它当哨兵）*/
+    int64_t  next_us;         /* 下一拍最早开始时刻（调用方自己的时钟，微秒） */
+    int64_t  frame_start_us;  /* 本拍开始时刻 */
+    double   last_present_ms; /* 上一拍 present 耗时（用来估计"present 自己等了多少"） */
+    double   last_frame_ms;   /* 上一拍 end - start */
+    uint32_t flags;           /* 保留 */
+} BgpuPacer;
+
+/* "standard" / "unlimited" / "240" / "120" / "90" / "60" / "30"（大小写不敏感，
+ * "0" 也接受为 unlimited）。成功返回 1。 */
+int bingpu_pace_policy_parse(const char* text, BgpuPacePolicy* out_policy);
+const char* bingpu_pace_policy_name(BgpuPacePolicy policy);
+/* 策略的目标帧率；0 = 不掐拍（BGPU_PACE_UNLIMITED） */
+int bingpu_pace_policy_fps(BgpuPacePolicy policy);
+
+/* 显示器刷新率（现在挂在哪个窗口上就按哪台显示器算）。
+ * 拿不到 / 远程会话 / 驱动乱报时返回 0（调用方按 60 处理）。 */
+int bingpu_display_refresh_hz(void* native_window);
+
+/* 初始化：refresh_hz 探测一次，policy = STANDARD，节拍状态清空。
+ * native_window 可以为空（离屏），此时 refresh_hz 取 60。 */
+void bingpu_pace_init(BgpuPacer* pacer, void* native_window);
+/* 改策略。策略一变就丢掉相位重新学（避免拿 30 fps 的档位去套 120 fps）。 */
+BgpuResult bingpu_pace_set_policy(BgpuPacer* pacer, BgpuPacePolicy policy);
+BgpuPacePolicy bingpu_pace_policy(const BgpuPacer* pacer);
+/* 目标帧间隔（ms）；0 = 不掐拍 */
+double bingpu_pace_frame_ms(const BgpuPacer* pacer);
+/* 这个策略下 vsync 该不该开：目标帧率 > 刷新率（含 unlimited）时必须关，
+ * 否则 present 会把帧率钉在刷新率上，"240 fps" 就是一句空话。 */
+int bingpu_pace_wants_vsync(const BgpuPacer* pacer);
+/* 现在(now_us)还要等多少微秒才能开始下一拍；0 = 立刻可以画。 */
+int64_t bingpu_pace_wait_us(const BgpuPacer* pacer, int64_t now_us);
+/* 一帧开始画（beginFrame 之前调） */
+void bingpu_pace_frame_begin(BgpuPacer* pacer, int64_t now_us);
+/* 一帧画完且 present 已返回：end_us = present 返回的时刻，
+ * present_ms = present() 自身的耗时（含它自己等垂直同步的那一段）。 */
+void bingpu_pace_frame_end(BgpuPacer* pacer, int64_t end_us, double present_ms);
 
 /* ---------------------------------------------------------------
  * 像素格式（全部 8 位/通道；49 是保留给将来的 HDR）
