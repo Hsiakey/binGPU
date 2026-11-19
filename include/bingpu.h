@@ -71,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 10
+#define BINGPU_VERSION_MINOR 11
 #define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.10.0"
+#define BINGPU_VERSION_STRING "0.11.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -698,6 +698,24 @@ typedef struct BgpuRoundedRect {
 BgpuResult bingpu_cmd_draw_rounded_rects(BgpuCmd cmd, BgpuTexture coverage,
                                          int32_t tile_size, const BgpuRoundedRect* rects,
                                          uint32_t count);
+
+/* 四角带色的圆角矩形（0.11.0）：同一次九宫格展开，颜色由**四角**给。
+ *
+ * 为什么要这个变体：圆角底的渐变不能拆成"先画方渐变、再拿模板抠"（没有 stencil，
+ * 也没有第二次 pass）。而线性渐变在屏幕空间就是一个仿射函数，仿射函数被四边形上的
+ * 双线性插值精确复现 —— 于是"一个九宫格 + 四角带色"就是**精确解**，不是近似。
+ *
+ * 口径：corner_tints 按 TL, TR, BL, BR 顺序（与 draw_quads 的顶点顺序一致），
+ * 颜色是**预乘**的 0xAARRGGBB（与顶点色同一口径）。每个顶点的颜色 = 这四角在
+ * "该顶点于盒子里的归一化位置"上的双线性插值；盒子四角上正好取回传入的值。
+ *
+ * 为什么插值放在这一层而不是让调用方自己算九块：九宫格的块边界（角片边长 = r、
+ * 中段 UV 取模板正中 1 个像素）是这一层的知识，调用方只描述"四角什么颜色"。
+ * 这一层不认识"渐变"—— 它只做"四色在矩形上插值"，那是纯几何。 */
+BgpuResult bingpu_cmd_draw_rounded_rect_grad(BgpuCmd cmd, BgpuTexture coverage,
+                                            float x, float y, float w, float h,
+                                            float radius, int32_t tile_size,
+                                            const uint32_t corner_tints[4]);
 
 /* 索引绘制（3D 网格）：顶点格式由管线的 vertex_layout 决定。 */
 BgpuResult bingpu_cmd_draw_indexed(BgpuCmd cmd, BgpuBuffer vertex_buffer,

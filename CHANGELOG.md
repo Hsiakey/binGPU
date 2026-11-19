@@ -4,6 +4,43 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.11.0] - 2026-11-20
+
+**新增 `bingpu_cmd_draw_rounded_rect_grad()`：四角带色的圆角矩形。**
+（ABI 不变，纯追加 API；渲染目标/顶点格式/管线全部没动。）
+
+```c
+BgpuResult bingpu_cmd_draw_rounded_rect_grad(BgpuCmd cmd, BgpuTexture coverage,
+                                             float x, float y, float w, float h,
+                                             float radius, int32_t tile_size,
+                                             const uint32_t corner_tints[4]);  /* TL,TR,BL,BR */
+```
+
+### 为什么快路径里需要"四角带色"，而不是画两次
+
+圆角底的渐变不能"先画方渐变、再拿模板抠"（没有 stencil，也没有第二次 pass）。
+而线性渐变在屏幕空间就是一个**仿射函数**，仿射函数被四边形上的线性插值精确复现
+—— 于是"一个九宫格 + 四角带色"就是**精确解**：九块之间不会出现色阶接缝，
+也不需要为了渐变把圆角拆成条带。九宫格的块边界（角片边长 = r、中段 UV 取模板正中
+1 个像素）是这一层的知识，所以调用方只描述"四角什么颜色"。
+
+顶点色口径不变：`corner_tints` 是 **0xAARRGGBB 直通**（同上层的 `draw_quads`：
+`frag.rgb = tex.rgb · vcol.rgb · vcol.a`）。这一层不认识"渐变"—— 它只做
+"四色在矩形上双线性插值"，那是纯几何。**顶点在盒子四角上精确取回传入值。**
+
+注意这条口径的边界：直通域插值只在"四角来自一个仿射函数"时才是那个函数。
+随手编的四个角（比如对角同色、另两角同色）不是任何线性渐变，光栅化出来自然对不上
+—— 那不是 bug，是拿错了输入。
+
+### 验收（`tests/test_prims.c` 21 → 32 项）
+
+| 判据 | 结果 |
+|---|---|
+| 四角**同色**时与 `draw_rounded_rect` 逐字节相同 | 0 差异像素（64×64 全图） |
+| 四角不同色 vs 盒子上的仿射函数，1064 个内部像素 | 最大通道差 **1** |
+| 盒子外一个像素都不许动 | 通过 |
+| `radius <= 0` / `corner_tints == NULL` | `BGPU_ERR_INVALID_ARGUMENT` |
+
 ## [0.10.0] - 2026-11-20
 
 **新增 `bingpu_cmd_draw_rounded_rect()`：圆角矩形的九宫格几何收进设备层。**

@@ -77,6 +77,41 @@ void QuadToVertices(const Quad& q, uint32_t tint, BgpuVertex* v) {
     v[3] = BgpuVertex{q.x + q.w, q.y + q.h, 0.0f, q.u1, q.v1, tint};
 }
 
+/* 四角带色：顶点色 = 四角在该顶点于盒子内归一化位置上的双线性插值。
+ * 盒子四角精确取回传入值（u,v ∈ {0,1} 时权重退化成一个角），中段顶点落在
+ * 盒子内部任意位置 —— 因为线性渐变是仿射函数，双线性在矩形上对仿射函数是精确的，
+ * 所以九块之间不会出现色阶接缝（这是"四角带色"能取代条带逼近的全部理由）。 */
+void QuadToVerticesGrad(const Quad& q, float bx, float by, float bw, float bh,
+                        const uint32_t c[4], BgpuVertex* v) {
+    const float iw = bw > 0.0f ? 1.0f / bw : 0.0f;
+    const float ih = bh > 0.0f ? 1.0f / bh : 0.0f;
+    const float px[4] = {q.x, q.x + q.w, q.x, q.x + q.w};
+    const float py[4] = {q.y, q.y, q.y + q.h, q.y + q.h};
+    const float uu[4] = {q.u0, q.u1, q.u0, q.u1};
+    const float vv[4] = {q.v0, q.v0, q.v1, q.v1};
+    for (int i = 0; i < 4; ++i) {
+        const float u = (px[i] - bx) * iw;
+        const float vv2 = (py[i] - by) * ih;
+        const float w00 = (1.0f - u) * (1.0f - vv2);
+        const float w10 = u * (1.0f - vv2);
+        const float w01 = (1.0f - u) * vv2;
+        const float w11 = u * vv2;
+        uint32_t ch = 0;
+        for (int s = 0; s < 4; ++s) {
+            const int shift = 24 - s * 8;
+            const float a = static_cast<float>((c[0] >> shift) & 0xFFu);  /* TL */
+            const float b = static_cast<float>((c[1] >> shift) & 0xFFu);  /* TR */
+            const float cc = static_cast<float>((c[2] >> shift) & 0xFFu); /* BL */
+            const float d = static_cast<float>((c[3] >> shift) & 0xFFu);  /* BR */
+            const float val = a * w00 + b * w10 + cc * w01 + d * w11;
+            uint32_t qv = static_cast<uint32_t>(val + 0.5f);
+            if (qv > 255u) qv = 255u;
+            ch |= qv << shift;
+        }
+        v[i] = BgpuVertex{px[i], py[i], 0.0f, uu[i], vv[i], ch};
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -141,6 +176,29 @@ BgpuResult bingpu_cmd_draw_rounded_rects(BgpuCmd cmd, BgpuTexture coverage, int3
     BgpuResult rc = bingpu_cmd_set_texture(cmd, coverage, 0);
     if (rc != BGPU_OK) return rc;
     return bingpu_cmd_draw_quads(cmd, verts.data(), quads);
+}
+
+BgpuResult bingpu_cmd_draw_rounded_rect_grad(BgpuCmd cmd, BgpuTexture coverage, float x,
+                                            float y, float w, float h, float radius,
+                                            int32_t tile_size,
+                                            const uint32_t corner_tints[4]) {
+    bgpu::ApiScope api("bingpu_cmd_draw_rounded_rect_grad");
+    if (!cmd || !coverage || !corner_tints) {
+        return bgpu::fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
+                          "cmd / coverage / corner_tints 为空");
+    }
+    Quad q[9];
+    const int n = BuildNineSlice(x, y, w, h, radius, tile_size, q);
+    if (n <= 0) {
+        return bgpu::fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
+                          "半径/尺寸无效（调用方要先把 radius 夹到 min(w,h)/2）");
+    }
+    BgpuResult r = bingpu_cmd_set_texture(cmd, coverage, 0);
+    if (r != BGPU_OK) return r;
+    BgpuVertex verts[9 * 4];
+    for (int i = 0; i < n; ++i)
+        QuadToVerticesGrad(q[i], x, y, w, h, corner_tints, verts + i * 4);
+    return bingpu_cmd_draw_quads(cmd, verts, static_cast<uint32_t>(n));
 }
 
 }  // extern "C"

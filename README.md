@@ -124,6 +124,7 @@ viewport / affine / 双线性 / 最近+重复 / 局部上传 / 深度 / 网格�
 | 五种混合（预乘 / 覆盖 / 保留 / 擦除 / 叠加） | ✅ CPU / VK / D3D11（逐像素验证） |
 | 窗口呈现 / 交换链 / 垂直同步 | ✅ VK / D3D11 / GL（CPU/NULL 明确 `UNSUPPORTED`） |
 | **2D 图元（`bingpu_cmd_draw_rounded_rect`）** | ✅ **0.10.0**：圆角矩形九宫格 —— AA 数学在调用方（bin2d 的覆盖率模板），拆块/合批/后端选择在这一层，所以五个后端零改动就能画；另有 `bingpu_cmd_draw_rounded_rects()` 批量版（同模板 N 个形状一次 draw_quads，D3D11 实测 1.37 → 0.38 ms） |
+| **四角带色圆角矩形（`bingpu_cmd_draw_rounded_rect_grad`）** | ✅ **0.11.0**：九宫格 + 四角直通色。线性渐变在屏幕空间是仿射函数，仿射函数被四边形上的线性插值精确复现 ⇒ 圆角底渐变也是精确解（实测 1064 像素最大通道差 1），不要条带、不要 stencil、不要第二次 pass |
 | **帧节拍器（`bingpu_pace_*`）** | ✅ **0.9.0**：`standard`/`unlimited`/`240`/`120`/`90`/`60`/`30`，规则是「下一拍 = max(本拍开始 + 目标周期, 本拍结束)」；纯状态机、时间由调用方注入，所以能离线单测（`tests/test_pace.c`）。上层实测：VK `unlimited` 2116–2207 fps、`standard` 114 fps |
 | MSAA / mip 采样 / 用户着色器 / 网格光照 | ⛔ 未做，见 [docs/backends.md](docs/backends.md) 的欠账 |
 | **Vulkan 后端** | ✅ **0.3.0**：设备/交换链/present、纹理/缓冲/采样器、五种混合、离屏+深度、网格、仿射；与 CPU 参考后端逐像素 0 差（`tests/test_vk_render.c` 12 个用例） |
@@ -136,7 +137,7 @@ viewport / affine / 双线性 / 最近+重复 / 局部上传 / 深度 / 网格�
 
 ## 版本
 
-- 语义化版本 `0.10.0`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档、0.3.0 = **Vulkan 后端**、0.4.0 = **D3D11 后端**、0.5.0 = **OpenGL 后端**、0.5.1 = 交换链回读的两个 bug、0.5.2 = D3D11 上传路径 + `wait_idle` 真的等 GPU、0.6.0/0.6.1 = 光照 + 透视校正、0.7.0/0.8.0 = `bingpu_render_plan` 决策面、**0.9.0 = 帧节拍器 `bingpu_pace_*` + GL 的 `wglSwapIntervalEXT` 装载修复**、0.10.0 = 圆角矩形九宫格图元）。
+- 语义化版本 `0.11.0`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档、0.3.0 = **Vulkan 后端**、0.4.0 = **D3D11 后端**、0.5.0 = **OpenGL 后端**、0.5.1 = 交换链回读的两个 bug、0.5.2 = D3D11 上传路径 + `wait_idle` 真的等 GPU、0.6.0/0.6.1 = 光照 + 透视校正、0.7.0/0.8.0 = `bingpu_render_plan` 决策面、**0.9.0 = 帧节拍器 `bingpu_pace_*` + GL 的 `wglSwapIntervalEXT` 装载修复**、0.10.0 = 圆角矩形九宫格图元、0.11.0 = 四角带色圆角矩形）。
 - **二进制 ABI 号 3**：0.6.0 给 `BgpuMeshVertex` 加 `float w`（透视校正）并新增光照状态；2D 路径（`BgpuVertex`）一个字节没动，枚举值全部追加，ABI 1/2 的旧二进制调用方不受影响。ABI 2 = 0.4.0 新增 `BGPU_BACKEND_D3D11`；ABI 1 的 0.1.0–0.3.0 未动过。
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)。
 
