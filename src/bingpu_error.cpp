@@ -213,6 +213,47 @@ int backendAvailable(BgpuBackendKind kind) noexcept {
     return 1;
 }
 
+/* 渲染计划（0.8.0）：上层问"用哪个 API、在哪执行、什么质量档"。
+ * 优先级：**VULKAN → GL → D3D11**，一个都没有就 CPU（同一套图元语义，只是执行体不同）。
+ * MSAA 按后端声明的上限取 4（CPU 恒为 1）；真要在某个后端上开到别的档，
+ * 由调用方在 device desc 里自己指定，这里给的是**默认建议值**。 */
+BgpuResult PlanFor(BgpuBackendKind want, BgpuRenderPlan* out) noexcept {
+    if (!out) return BGPU_ERR_INVALID_ARGUMENT;
+    out->struct_size = sizeof(*out);
+    out->flags = 0;
+    const BgpuBackendKind kOrder[] = {BGPU_BACKEND_VULKAN, BGPU_BACKEND_GL,
+                                      BGPU_BACKEND_D3D11};
+    if (want != BGPU_BACKEND_AUTO) {
+        if (want == BGPU_BACKEND_CPU || want == BGPU_BACKEND_NULL) {
+            out->backend = BGPU_BACKEND_CPU;
+            out->exec = BGPU_EXEC_CPU;
+            out->msaa_samples = 1;
+            return BGPU_OK;
+        }
+        if (backendAvailable(want)) {
+            out->backend = want;
+            out->exec = BGPU_EXEC_GPU;
+            out->msaa_samples = 4;
+            return BGPU_OK;
+        }
+        out->backend = BGPU_BACKEND_CPU;
+        out->exec = BGPU_EXEC_CPU;
+        out->msaa_samples = 1;
+        return BGPU_OK;
+    }
+    for (BgpuBackendKind k : kOrder) {
+        if (!backendAvailable(k)) continue;
+        out->backend = k;
+        out->exec = BGPU_EXEC_GPU;
+        out->msaa_samples = 4;
+        return BGPU_OK;
+    }
+    out->backend = BGPU_BACKEND_CPU;
+    out->exec = BGPU_EXEC_CPU;
+    out->msaa_samples = 1;
+    return BGPU_OK;
+}
+
 }  // namespace bgpu
 
 uint32_t bingpu_backend_count(void) {
@@ -235,6 +276,15 @@ const char* bingpu_backend_name(BgpuBackendKind kind) {
 
 int bingpu_backend_available(BgpuBackendKind kind) {
     return bgpu::backendAvailable(kind);
+}
+
+BgpuResult bingpu_render_plan(BgpuBackendKind want, BgpuRenderPlan* out_plan) {
+    bgpu::ApiScope scope("bingpu_render_plan");
+    return bgpu::PlanFor(want, out_plan);
+}
+
+const char* bingpu_exec_mode_name(BgpuExecMode mode) {
+    return mode == BGPU_EXEC_CPU ? "cpu" : "gpu";
 }
 
 /* ============================================================

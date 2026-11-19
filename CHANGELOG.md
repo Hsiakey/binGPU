@@ -4,6 +4,52 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.8.0] - 2026-11-20
+
+**新增 `bingpu_render_plan()`：把"用哪个 API、在哪执行、什么质量档"收进 binGPU。**
+（ABI 不变，纯追加 API。）
+
+### 为什么
+
+master 2026-11-20 纠正过一次分层：「应该是 binGPU 来决定怎么绘制、用什么绘制来保证绘制
+性能和质量吧？binUI、bin2D/3D 决定的是功能。」所以上层的每一层都不该再自己按
+`vk/gl/d3d` 挑后端 —— 该问这一层要一个**计划**：
+
+```c
+BgpuRenderPlan p;
+bingpu_render_plan(BGPU_BACKEND_AUTO, &p);
+/* p.backend = VULKAN / GL / D3D11 / CPU，p.exec = GPU / CPU，p.msaa_samples = 质量档 */
+```
+
+- 优先级：**VULKAN → GL → D3D11**，一个都不可用才 `exec = CPU`、`backend = CPU`
+  （也就是"没显卡，用 CPU 算"）。
+- `want` 可以钉住某个后端（对照构建 / 金标准 / 排查）。
+- `exec` 这一轴是为下一版准备的：同一套 2D 图元语义既能在 GPU 上求值，也能在 CPU 上
+  用同一份解析式求值，于是"换执行体不换像素"，质量由同一份数学保证。
+
+### 实测（`build-mingw/tmp/plan_probe`）
+
+```
+auto  -> backend=vulkan exec=gpu msaa=4
+cpu   -> backend=cpu    exec=cpu msaa=1
+gl    -> backend=gl     exec=gpu msaa=4
+```
+
+**已知问题（下一版修，属于本层职责）**：三个 GPU 后端的**呈现节奏不稳定**。
+同一台机器、同一个页面，连续跑出来的 present 耗时会落在不同档上：
+
+| 后端 | present（同页、多次） | 说明 |
+|---|---|---|
+| GL | 1.42 ~ 1.48 ms 稳定，100 fps | SwapBuffers 不等，节奏交给上层 |
+| Vulkan | 8.08 ms（1 拍）**或** 17.7 ms（2 拍），112 / 55 fps 两种 | FIFO 队列深度在 1/2 张图上摆 |
+| D3D11 | 0.30 ms（不阻塞）**或** 31.5 ms（3.8 拍），113 / 31 fps 两种 | 同上，队列满时阻塞 |
+
+同一段代码两次跑出 4 倍的差距，说明**队列里在飞几帧没被约束住**。修法方向：
+交换链固定"最多 1 帧在飞"（acquire 时等 fence / 用 MAILBOX 或按 present mode
+显式协商），并在 present 后回收。这一条的验收是"连续 5 次跑同一个页面，present
+耗时的方差 < 10%" —— 现在做不到。
+
+---
 ## [0.7.0] - 2026-11-20
 
 **上传可以声明"数据已经是预乘"**，省掉一次整幅转换（ABI 不变，仍为 3）。

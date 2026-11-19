@@ -71,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 7
+#define BINGPU_VERSION_MINOR 8
 #define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.7.0"
+#define BINGPU_VERSION_STRING "0.8.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -142,6 +142,41 @@ BgpuBackendKind bingpu_backend_at(uint32_t index);
 const char*   bingpu_backend_name(BgpuBackendKind kind);
 /* 编译进来了并且在当前会话里可用（例如 VK 运行期 LoadLibrary 成功才算可用） */
 int           bingpu_backend_available(BgpuBackendKind kind);
+
+/* ---------------------------------------------------------------
+ * 渲染计划（0.8.0）—— **"怎么画、用什么画"由 binGPU 决定**
+ *
+ * 分层分工：binUI 定功能（节点/CSS/布局/语义原语），bin2d/bin3d 定绘制语义，
+ * 而"用哪个 API、在哪执行、什么质量档"是**这一层**的事。上层不该再按
+ * `vk/gl/d3d` 自己挑后端（那是把决策权抢回来），只需要问一句 plan。
+ *
+ *   API 轴  ：Vulkan / GL / D3D11 / CPU
+ *  执行轴  ：同一套 2D 图元语义既能在 GPU 上求值，也能在 CPU 上求值 ——
+ *            两条路用**同一份解析式（SDF）**，所以"换执行体不换像素"。
+ *            选哪边由 `exec` 决定（设备能力 + 这笔活在哪更划算）。
+ *  质量轴  ：msaa_samples / aa 方式，由这里给，不由调用方猜。
+ * --------------------------------------------------------------- */
+typedef enum BgpuExecMode {
+    BGPU_EXEC_GPU = 0,   /* 设备上执行（各 API 后端） */
+    BGPU_EXEC_CPU = 1    /* CPU 上执行（同一套图元语义，不依赖显卡/驱动） */
+} BgpuExecMode;
+
+typedef struct BgpuRenderPlan {
+    uint32_t        struct_size;
+    BgpuBackendKind backend;      /* 选中的后端（CPU 模式时为 BGPU_BACKEND_CPU） */
+    BgpuExecMode    exec;         /* 在哪执行 */
+    uint32_t        msaa_samples; /* 质量档：1 / 2 / 4 / 8（CPU 模式恒为 1） */
+    uint32_t        flags;        /* 保留（BGPU_PLAN_*），当前恒 0 */
+} BgpuRenderPlan;
+
+/* 让 binGPU 出计划。
+ *   want = BGPU_BACKEND_AUTO 时按 **VULKAN → GL → D3D11** 取第一个可用的 GPU 后端；
+ *          一个都没有则返回 exec=CPU、backend=CPU（也就是"没显卡，用 CPU 算"）。
+ *   want 指定某个后端时，只在那一个上判断（不可用则同样退 CPU 并在 last_error 里说明）。
+ * 这是**唯一**该被上层用来决定"用 GPU 还是 CPU"的入口。 */
+BgpuResult bingpu_render_plan(BgpuBackendKind want, BgpuRenderPlan* out_plan);
+/* "gpu" / "cpu"，只用于日志 */
+const char* bingpu_exec_mode_name(BgpuExecMode mode);
 
 /* ---------------------------------------------------------------
  * 像素格式（全部 8 位/通道；49 是保留给将来的 HDR）
