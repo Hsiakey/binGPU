@@ -159,3 +159,69 @@ float4 ps(PSIn i) : SV_Target {
     }
     return float4(fragRgb, outA);
 }
+
+// ---------------------------------------------------------------------------
+// ABI 4：解析圆角（一个 VS + 一个 PS，不与上面那对共用）
+//
+// 输入是 BgpuShapeVertex（36 字节），逐字节镜像：
+//   POSITION   float2  x, y         (偏移 0)   目标像素
+//   TEXCOORD0  float2  local        (偏移 8)   相对盒子中心
+//   TEXCOORD1  float2  ext          (偏移 16)  盒子半尺寸
+//   TEXCOORD2  float   rad          (偏移 24)  圆角半径
+//   TEXCOORD3  float   thick        (偏移 28)  环带厚度（0 = 实心）
+//   COLOR0     UNORM8  tint         (偏移 32)  0xAARRGGBB（内存 B,G,R,A）
+//
+// 为什么单独一个 PS：这条路**不采样纹理**、也**不**走光照。若复用 ps()，就得靠
+// flags 去关掉两段，而 D3D11 的 UNORM 白纹理采样差一个 ulp —— 形状本来不需要它。
+//
+// 数学与 src/bingpu_cpu.cpp 的 shape_coverage、以及 GL/VK 两份着色器逐字相同：
+//   q   = abs(p) - b + r
+//   d   = length(max(q,0)) + min(max(q.x,q.y),0) - r
+//   cov = clamp(0.5 - d, 0, 1)              实心
+//   cov = clamp(0.5 - |d + t/2| + t/2, 0, 1) 环带
+// 轴对齐 1:1 时 |grad d| 恒为 1，所以 0.5 - d 就是精确的解析覆盖率，不需要导数。
+// ---------------------------------------------------------------------------
+struct VSInShape {
+    float2 pos   : POSITION;    /* 目标像素 */
+    float2 local : TEXCOORD0;   /* 相对盒子中心 */
+    float2 ext   : TEXCOORD1;   /* 盒子半尺寸 */
+    float  rad   : TEXCOORD2;
+    float  thick : TEXCOORD3;
+    float4 col   : COLOR0;
+};
+
+struct PSInShape {
+    float4 pos   : SV_Position;
+    float2 local : TEXCOORD0;
+    float2 ext   : TEXCOORD1;
+    float2 rt    : TEXCOORD2;   /* x = 半径，y = 厚度 */
+    float4 col   : COLOR0;
+};
+
+PSInShape vs_shape(VSInShape i) {
+    PSInShape o;
+    o.pos = ToClip(float3(i.pos, 0.0));
+    o.local = i.local;
+    o.ext = i.ext;
+    o.rt = float2(i.rad, i.thick);
+    o.col = UnpackColor(i.col.zyxw);   /* 内存 (B,G,R,A) → (R,G,B,A)，与 2D 路径同一口径 */
+    return o;
+}
+
+float4 ps_shape(PSInShape i) : SV_Target {
+    const float r = max(i.rt.x, 0.0);
+    const float th = i.rt.y;
+    const float2 q = abs(i.local) - i.ext + float2(r, r);
+    const float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+    float cov;
+    if (th > 0.0) {
+        const float ht = th * 0.5;
+        cov = 0.5 - abs(d + ht) + ht;
+    } else {
+        cov = 0.5 - d;
+    }
+    cov = saturate(cov);
+    const float a = i.col.a * cov;
+    return float4(i.col.rgb * a, a);   /* 顶点色直通 ⇒ 输出预乘（三端同一口径） */
+}
+

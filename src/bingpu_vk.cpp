@@ -480,6 +480,11 @@ struct VkDeviceObj final : Device {
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
     VkShaderModule vert = VK_NULL_HANDLE;
     VkShaderModule frag = VK_NULL_HANDLE;
+    /* ABI 4：解析圆角那一对。模块建不出来就**不报错**，只是没有 BGPU_CAP_SHAPE，
+     * 上层继续用覆盖率模板（与 GL 后端同一条退路）。 */
+    VkShaderModule vert_shape = VK_NULL_HANDLE;
+    VkShaderModule frag_shape = VK_NULL_HANDLE;
+    bool caps_shape = false;
     VkSampler default_sampler = VK_NULL_HANDLE;
     VkFormat swap_format = VK_FORMAT_B8G8R8A8_UNORM;
     VkFence fence = VK_NULL_HANDLE;
@@ -630,6 +635,8 @@ VkDeviceObj::~VkDeviceObj() {
         if (default_sampler) g_vk.vkDestroySampler(dev, default_sampler, nullptr);
         if (vert) g_vk.vkDestroyShaderModule(dev, vert, nullptr);
         if (frag) g_vk.vkDestroyShaderModule(dev, frag, nullptr);
+        if (vert_shape) g_vk.vkDestroyShaderModule(dev, vert_shape, nullptr);
+        if (frag_shape) g_vk.vkDestroyShaderModule(dev, frag_shape, nullptr);
         if (pipe_layout) g_vk.vkDestroyPipelineLayout(dev, pipe_layout, nullptr);
         if (desc_pool) g_vk.vkDestroyDescriptorPool(dev, desc_pool, nullptr);
         if (set_layout) g_vk.vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
@@ -698,6 +705,8 @@ public:
 
 protected:
     BgpuResult rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t quad_count) override;
+    BgpuResult rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
+                            uint32_t quad_count) override;
     BgpuResult rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset, Buffer& ib,
                              uint32_t index_count, uint32_t index_offset) override;
     BgpuResult prepareDepth(Texture& depth, Texture& target,
@@ -944,6 +953,33 @@ BgpuResult VkBackend::createDevice(const BgpuDeviceDesc& desc, BgpuDevice* out) 
         return vkFail(vr, "vkCreateShaderModule(frag)");
     }
 
+    /* ABI 4 的解析圆角：**失败不致命**。驱动/工具链把 SPIR-V 拒了，就只是没有
+     * BGPU_CAP_SHAPE —— bin2d 会照旧走覆盖率模板，像素不会坏。 */
+    {
+        VkResult sr = VK_SUCCESS;
+        smi.codeSize = sizeof(vkshader::kShapeVertSpv);
+        smi.pCode = vkshader::kShapeVertSpv;
+        sr = g_vk.vkCreateShaderModule(vkdev, &smi, nullptr, &d->vert_shape);
+        if (sr == VK_SUCCESS) {
+            smi.codeSize = sizeof(vkshader::kShapeFragSpv);
+            smi.pCode = vkshader::kShapeFragSpv;
+            sr = g_vk.vkCreateShaderModule(vkdev, &smi, nullptr, &d->frag_shape);
+        }
+        d->caps_shape = (sr == VK_SUCCESS);
+        if (!d->caps_shape) {
+            if (d->vert_shape) {
+                g_vk.vkDestroyShaderModule(vkdev, d->vert_shape, nullptr);
+                d->vert_shape = VK_NULL_HANDLE;
+            }
+            if (d->frag_shape) {
+                g_vk.vkDestroyShaderModule(vkdev, d->frag_shape, nullptr);
+                d->frag_shape = VK_NULL_HANDLE;
+            }
+            if (trace2()) std::fprintf(stderr, "[vk] shape 着色器模块创建失败（%d），没有 CAP_SHAPE\n",
+                                      static_cast<int>(sr));
+        }
+    }
+
     VkFenceCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     vr = g_vk.vkCreateFence(vkdev, &fci, nullptr, &d->fence);
@@ -1020,11 +1056,13 @@ void VkBackend::deviceInfo(Device& dev, BgpuDeviceInfo& out) {
 }
 
 void VkBackend::deviceCaps(Device& dev, BgpuCaps& out) {
-    (void)dev;
+    VkDeviceObj& d = static_cast<VkDeviceObj&>(dev);
     out.flags = BGPU_CAP_DEPTH | BGPU_CAP_OFFSCREEN | BGPU_CAP_READBACK | BGPU_CAP_PRESENT_PACES |
                 BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH |
                 /* ABI 3：光照（片元里做 Lambert）与透视校正（顶点带 w）都已实现 */
                 BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
+    /* ABI 4：解析圆角 —— 片元着色器里算 SDF 覆盖率。模块建不出来就没有这一位。 */
+    if (d.caps_shape) out.flags |= BGPU_CAP_SHAPE;
     out.max_texture_size = BGPU_MAX_TEXTURE_SIZE;
     out.max_frames_in_flight = 1;   /* 每帧 submit + 等 fence */
     out.msaa_samples = 1;           /* 与 CPU 参考后端一致（0 差验收的前提） */
@@ -1471,21 +1509,41 @@ VkPipeline VkBackend::pipelineFor(VkPipelineObj& p, VkDeviceObj& dev, VkFormat c
     auto it = p.cache.find(key);
     if (it != p.cache.end()) return it->second;
 
+    /* 解析圆角走另一对着色器 + 另一份顶点输入（36 字节）。
+     * 其余状态（栅格化/混合/深度/动态 viewport+scissor/push constant）**完全共用**，
+     * 因为两边用的是同一个管线布局（dev.pipe_layout）：shape 着色器声明了同一块
+     * push_constant 但不用其中的光照字段，也**不**声明采样器 —— 未使用的绑定
+     * 不影响布局兼容性。 */
+    const bool shape = (p.layout == BGPU_VERTEX_SHAPE);
+    if (shape && (!dev.vert_shape || !dev.frag_shape)) return VK_NULL_HANDLE;
+
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = dev.vert;
+    stages[0].module = shape ? dev.vert_shape : dev.vert;
     stages[0].pName = "main";
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = dev.frag;
+    stages[1].module = shape ? dev.frag_shape : dev.frag;
     stages[1].pName = "main";
 
     VkVertexInputBindingDescription bind{};
-    VkVertexInputAttributeDescription attrs[5]{};
+    VkVertexInputAttributeDescription attrs[6]{};
     VkPipelineVertexInputStateCreateInfo vin{};
     vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    if (p.layout == BGPU_VERTEX_2D) {
+    if (shape) {
+        /* BgpuShapeVertex（36）：x,y(0) lx,ly(8) hx,hy(16) radius(24) thick(28) tint(32) */
+        bind.binding = 0;
+        bind.stride = sizeof(BgpuShapeVertex);   /* 36（ABI 4 的静态断言钉住的） */
+        bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        attrs[0] = {0, 0, VK_FORMAT_R32G32_SFLOAT, 0};      /* x, y    */
+        attrs[1] = {1, 0, VK_FORMAT_R32G32_SFLOAT, 8};      /* lx, ly  */
+        attrs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT, 16};     /* hx, hy  */
+        attrs[3] = {3, 0, VK_FORMAT_R32_SFLOAT, 24};        /* radius  */
+        attrs[4] = {4, 0, VK_FORMAT_R32_SFLOAT, 28};        /* thick   */
+        attrs[5] = {5, 0, VK_FORMAT_R8G8B8A8_UNORM, 32};    /* tint    */
+        vin.vertexAttributeDescriptionCount = 6;
+    } else if (p.layout == BGPU_VERTEX_2D) {
         bind.binding = 0;
         bind.stride = sizeof(BgpuVertex);   /* 24（ABI 3 未变） */
         bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
@@ -1509,7 +1567,7 @@ VkPipeline VkBackend::pipelineFor(VkPipelineObj& p, VkDeviceObj& dev, VkFormat c
     }
     vin.vertexBindingDescriptionCount = 1;
     vin.pVertexBindingDescriptions = &bind;
-    vin.vertexAttributeDescriptionCount = 5;
+    if (!shape) vin.vertexAttributeDescriptionCount = 5;   /* shape 的分支在上面设成 6 */
     vin.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
@@ -2337,6 +2395,65 @@ BgpuResult VkBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
     }
     std::memcpy(static_cast<uint8_t*>(c.vmap) + c.vused, verts, bytes);
     const uint32_t first_vertex = static_cast<uint32_t>(c.vused / sizeof(BgpuVertex));
+    c.vused += bytes;
+    const VkDeviceSize off = 0;
+    g_vk.vkCmdBindVertexBuffers(c.cb, 0, 1, &c.vbuf, &off);
+    g_vk.vkCmdBindIndexBuffer(c.cb, c.ibuf, 0, VK_INDEX_TYPE_UINT32);
+    g_vk.vkCmdDrawIndexed(c.cb, quad_count * 6, 1, 0, first_vertex, 0);
+    return BGPU_OK;
+}
+
+/* ABI 4：解析圆角。流程与 rasterQuads 一致，少了纹理那一段（不采样），
+ * 顶点流换成 36 字节的 BgpuShapeVertex —— 索引仍是同一张 "TL,TR,BL / BL,TR,BR"。 */
+BgpuResult VkBackend::rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
+                                   uint32_t quad_count) {
+    VkCmdObj& c = static_cast<VkCmdObj&>(cmd);
+    VkDeviceObj& d = static_cast<VkDeviceObj&>(*lookupObject(cmd.device, kObjDevice));
+    VkPipelineObj& p = static_cast<VkPipelineObj&>(*cmd.pipe);
+    if (!c.rendering || !c.target) {
+        return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "draw 时不在渲染里");
+    }
+    if (!d.caps_shape) {
+        return fail(BGPU_ERR_UNSUPPORTED, __FILE__, __LINE__,
+                    "Vulkan 后端的解析圆角着色器不可用");
+    }
+    VkTextureObj& target = static_cast<VkTextureObj&>(*c.target);
+
+    VkPipeline pipe = pipelineFor(p, d, target.vfmt, c.depth_fmt);
+    if (pipe == VK_NULL_HANDLE) {
+        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "管线创建失败");
+    }
+    if (pipe != c.last_pipe) {
+        g_vk.vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        c.last_pipe = pipe;
+    }
+
+    VkRect2D sc{{0, 0}, {target.w, target.h}};
+    if (cmd.scissorOn) {
+        const int32_t x = std::max(0, cmd.sc[0]);
+        const int32_t y = std::max(0, cmd.sc[1]);
+        const int32_t r = std::min<int32_t>(target.w, cmd.sc[0] + cmd.sc[2]);
+        const int32_t b = std::min<int32_t>(target.h, cmd.sc[1] + cmd.sc[3]);
+        if (r <= x || b <= y) return BGPU_OK;
+        sc = {{x, y}, {static_cast<uint32_t>(r - x), static_cast<uint32_t>(b - y)}};
+    }
+    g_vk.vkCmdSetScissor(c.cb, 0, 1, &sc);
+
+    PushConstants pc{};
+    fillPushConstants(cmd, /*perspective=*/false, target.w, target.h, pc);
+    g_vk.vkCmdPushConstants(c.cb, d.pipe_layout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                            sizeof(pc), &pc);
+
+    const uint64_t bytes = static_cast<uint64_t>(quad_count) * 4 * sizeof(BgpuShapeVertex);
+    if (!ensureVertexSpace(c, d, bytes)) {
+        return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "顶点流扩容失败");
+    }
+    if (!ensureIndexSpace(c, d, quad_count)) {
+        return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "索引缓冲扩容失败");
+    }
+    std::memcpy(static_cast<uint8_t*>(c.vmap) + c.vused, verts, bytes);
+    const uint32_t first_vertex = static_cast<uint32_t>(c.vused / sizeof(BgpuShapeVertex));
     c.vused += bytes;
     const VkDeviceSize off = 0;
     g_vk.vkCmdBindVertexBuffers(c.cb, 0, 1, &c.vbuf, &off);

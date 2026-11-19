@@ -43,11 +43,17 @@ def emit(name, words):
 def main():
     vs = words_of(ROOT / "src/vk_shaders/quad.vert.spv")
     fs = words_of(ROOT / "src/vk_shaders/quad.frag.spv")
+    # ABI 4：解析圆角（shape.vert / shape.frag）。共用同一块 push constant，
+    # 所以管线布局仍是 dev.pipe_layout，只是换一对着色器模块。
+    svs = words_of(ROOT / "src/vk_shaders/shape.vert.spv")
+    sfs = words_of(ROOT / "src/vk_shaders/shape.frag.spv")
     hdr = f'''// bingpu_vk_shaders.h - Vulkan 后端的 SPIR-V（由 src/vk_shaders/*.vert/.frag 生成，勿手改）
 //
 // 生成方式（构建**不需要**这一步，产物已入库，与 binUI 同一套规矩）：
-//   glslc --target-env=vulkan1.0 -O src/vk_shaders/quad.vert -o src/vk_shaders/quad.vert.spv
-//   glslc --target-env=vulkan1.0 -O src/vk_shaders/quad.frag -o src/vk_shaders/quad.frag.spv
+//   glslc --target-env=vulkan1.0 -O src/vk_shaders/quad.vert  -o src/vk_shaders/quad.vert.spv
+//   glslc --target-env=vulkan1.0 -O src/vk_shaders/quad.frag  -o src/vk_shaders/quad.frag.spv
+//   glslc --target-env=vulkan1.0 -O src/vk_shaders/shape.vert -o src/vk_shaders/shape.vert.spv
+//   glslc --target-env=vulkan1.0 -O src/vk_shaders/shape.frag -o src/vk_shaders/shape.frag.spv
 //   python3 tools/gen_spv_header.py
 //
 // 本机没有 Vulkan SDK，但 Android NDK 自带 glslc；SPIR-V 以 C 数组入库，
@@ -64,6 +70,10 @@ namespace vkshader {{
 
 {emit("kQuadFragSpv", fs)}
 
+{emit("kShapeVertSpv", svs)}
+
+{emit("kShapeFragSpv", sfs)}
+
 }}  // namespace vkshader
 }}  // namespace bgpu
 
@@ -71,7 +81,7 @@ namespace vkshader {{
 '''
     out = ROOT / "src/bingpu_vk_shaders.h"
     out.write_text(hdr, encoding="utf-8", newline="\n")   # 仓库一律 LF
-    print(f"wrote {out} (vert {len(vs)} words, frag {len(fs)} words)")
+    print(f"wrote {out} (quad {len(vs)}+{len(fs)} words, shape {len(svs)}+{len(sfs)} words)")
 
 
 if __name__ == "__main__":

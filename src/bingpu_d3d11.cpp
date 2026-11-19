@@ -339,9 +339,14 @@ struct D3dDeviceObj final : Device {
     /* 设备级共享对象：固定功能的全部"管线状态"都在这里，按需绑定 */
     Com<ID3D11VertexShader> vs;
     Com<ID3D11VertexShader> vs_mesh;   /* ABI 3：网格 VS（读法线 + w） */
+    Com<ID3D11VertexShader> vs_shape;  /* ABI 4：解析圆角 VS（36 字节顶点） */
     Com<ID3D11PixelShader> ps;
+    Com<ID3D11PixelShader> ps_shape;   /* ABI 4：解析圆角 PS（不采样、不光照） */
     Com<ID3D11InputLayout> il_2d;
     Com<ID3D11InputLayout> il_mesh;
+    Com<ID3D11InputLayout> il_shape;
+    /* 解析圆角那一套没建起来就只是没有 BGPU_CAP_SHAPE，上层退回覆盖率模板 */
+    bool caps_shape = false;
     Com<ID3D11Buffer> cb;
     Com<ID3D11BlendState> blend[5];
     Com<ID3D11DepthStencilState> ds[4];   /* 下标 = (测试?1:0) | (写入?2:0) */
@@ -436,6 +441,7 @@ struct D3dCmdObj final : Cmd {
     ID3D11RasterizerState* last_rs = nullptr;
     ID3D11InputLayout* last_il = nullptr;
     ID3D11VertexShader* last_vs = nullptr;   /* 2D 与网格是两个 VS，跟着布局切 */
+    ID3D11PixelShader* last_ps = nullptr;    /* ABI 4：形状有自己的 PS，也要跟着切 */
     ID3D11ShaderResourceView* last_srv = nullptr;
     ID3D11SamplerState* last_samp = nullptr;
     bool have_shaders = false;   /* 着色器 / 拓扑每个 pass 绑一次 */
@@ -500,6 +506,8 @@ public:
 
 protected:
     BgpuResult rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t quad_count) override;
+    BgpuResult rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
+                            uint32_t quad_count) override;
     BgpuResult rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset, Buffer& ib,
                              uint32_t index_count, uint32_t index_offset) override;
     BgpuResult prepareDepth(Texture& depth, Texture& target,
@@ -519,7 +527,8 @@ private:
     BgpuResult bindTexture(D3dCmdObj& c, D3dDeviceObj& d, Pipeline& pipe);
     /* 返回 false = 裁剪矩形是空的（这一笔什么也不画） */
     bool applyScissor(D3dCmdObj& c, D3dTextureObj& target);
-    bool ensureQuadBuffers(D3dCmdObj& c, D3dDeviceObj& d, uint32_t quads);
+    bool ensureQuadBuffers(D3dCmdObj& c, D3dDeviceObj& d, uint32_t quads,
+                           uint32_t vstride = sizeof(BgpuVertex));
     void updateConstants(D3dCmdObj& c, D3dDeviceObj& d, D3dTextureObj& target, Pipeline& pipe);
     bool initDeviceObjects(D3dDeviceObj& d);
 };
@@ -600,6 +609,33 @@ bool D3d11Backend::initDeviceObjects(D3dDeviceObj& d) {
     if (FAILED(dev->CreateInputLayout(emesh, 5, d3d11shader::kQuadVsMeshDxbc,
                                       d3d11shader::kQuadVsMeshSize, d.il_mesh.put()))) {
         return false;
+    }
+
+    /* ABI 4 的解析圆角：**失败不致命** —— 只是没有 BGPU_CAP_SHAPE，bin2d 会照旧
+     * 走覆盖率模板，像素不会坏。所以这一段的失败只清位、不 return false。 */
+    {
+        const D3D11_INPUT_ELEMENT_DESC eshape[] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 2, DXGI_FORMAT_R32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 3, DXGI_FORMAT_R32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        };
+        const bool ok =
+            SUCCEEDED(dev->CreateVertexShader(d3d11shader::kShapeVsDxbc, d3d11shader::kShapeVsSize,
+                                              nullptr, d.vs_shape.put())) &&
+            SUCCEEDED(dev->CreatePixelShader(d3d11shader::kShapePsDxbc, d3d11shader::kShapePsSize,
+                                             nullptr, d.ps_shape.put())) &&
+            SUCCEEDED(dev->CreateInputLayout(eshape, 6, d3d11shader::kShapeVsDxbc,
+                                             d3d11shader::kShapeVsSize, d.il_shape.put()));
+        d.caps_shape = ok;
+        if (!ok) {
+            d.vs_shape.reset();
+            d.ps_shape.reset();
+            d.il_shape.reset();
+            if (trace3()) std::fprintf(stderr, "[d3d11] shape 着色器/输入布局创建失败，没有 CAP_SHAPE\n");
+        }
     }
 
     D3D11_BUFFER_DESC cbd{};
@@ -792,12 +828,14 @@ void D3d11Backend::deviceInfo(Device& dev, BgpuDeviceInfo& out) {
 }
 
 void D3d11Backend::deviceCaps(Device& dev, BgpuCaps& out) {
-    (void)dev;
+    D3dDeviceObj& d = static_cast<D3dDeviceObj&>(dev);
     /* ABI 3：光照（PS 里做固定功能 Lambert）与透视校正（网格 VS 读 w，PS 按 1/w 加权）
      * 都在这一版实现了，如实上报；GL / VK 那边各自上报自己的。 */
     out.flags = BGPU_CAP_DEPTH | BGPU_CAP_OFFSCREEN | BGPU_CAP_READBACK | BGPU_CAP_PRESENT_PACES |
                 BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH |
                 BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
+    /* ABI 4：解析圆角 —— 片元着色器里算 SDF 覆盖率。没建起来就没有这一位。 */
+    if (d.caps_shape) out.flags |= BGPU_CAP_SHAPE;
     out.max_texture_size = BGPU_MAX_TEXTURE_SIZE;
     out.max_frames_in_flight = 1;   /* 立即上下文：Present 之后不等 GPU */
     out.msaa_samples = 1;           /* 与 CPU 参考后端一致（0 差验收的前提） */
@@ -1139,8 +1177,9 @@ BgpuResult D3d11Backend::createCmd(Device& dev, BgpuCmd* out) {
     return BGPU_OK;
 }
 
-bool D3d11Backend::ensureQuadBuffers(D3dCmdObj& c, D3dDeviceObj& d, uint32_t quads) {
-    const uint64_t vbytes = static_cast<uint64_t>(quads) * 4 * sizeof(BgpuVertex);
+bool D3d11Backend::ensureQuadBuffers(D3dCmdObj& c, D3dDeviceObj& d, uint32_t quads,
+                                     uint32_t vstride) {
+    const uint64_t vbytes = static_cast<uint64_t>(quads) * 4 * vstride;
     if (!c.vbuf || c.vcap < vbytes) {
         uint64_t cap = c.vcap ? c.vcap : 64 * 1024;
         while (cap < vbytes) cap *= 2;
@@ -1208,20 +1247,29 @@ BgpuResult D3d11Backend::bindState(D3dCmdObj& c, D3dDeviceObj& d, Pipeline& pipe
         c.last_rs = d.rs[rsi].p;
     }
 
-    ID3D11InputLayout* il = pipe.layout == BGPU_VERTEX_MESH ? d.il_mesh.p : d.il_2d.p;
+    const bool is_shape = (pipe.layout == BGPU_VERTEX_SHAPE);
+    ID3D11InputLayout* il = is_shape ? d.il_shape.p
+                                     : (pipe.layout == BGPU_VERTEX_MESH ? d.il_mesh.p : d.il_2d.p);
     if (il != c.last_il) {
         d.ctx->IASetInputLayout(il);
         c.last_il = il;
     }
 
-    /* 顶点着色器跟着布局走（2D / 网格是两个入口）；像素着色器与拓扑每 pass 一次 */
-    ID3D11VertexShader* vs = pipe.layout == BGPU_VERTEX_MESH ? d.vs_mesh.p : d.vs.p;
+    /* 顶点着色器跟着布局走（2D / 网格 / 解析圆角是三个入口） */
+    ID3D11VertexShader* vs = is_shape ? d.vs_shape.p
+                                      : (pipe.layout == BGPU_VERTEX_MESH ? d.vs_mesh.p : d.vs.p);
     if (vs != c.last_vs) {
         d.ctx->VSSetShader(vs, nullptr, 0);
         c.last_vs = vs;
     }
+    /* 像素着色器也跟布局走：解析圆角有自己的一份（不采样、不光照）。 */
+    ID3D11PixelShader* ps = is_shape ? d.ps_shape.p : d.ps.p;
+    if (ps != c.last_ps) {
+        d.ctx->PSSetShader(ps, nullptr, 0);
+        c.last_ps = ps;
+        c.have_shaders = false;   /* 换了 PS 之后拓扑要重设（见下） */
+    }
     if (!c.have_shaders) {
-        d.ctx->PSSetShader(d.ps.p, nullptr, 0);
         d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         c.have_shaders = true;
     }
@@ -1415,6 +1463,7 @@ BgpuResult D3d11Backend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
     c.last_rs = nullptr;
     c.last_il = nullptr;
     c.last_vs = nullptr;
+    c.last_ps = nullptr;
     c.last_srv = nullptr;
     c.last_samp = nullptr;
     c.have_shaders = false;
@@ -1761,6 +1810,43 @@ BgpuResult D3d11Backend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t
     updateConstants(c, d, target, *c.pipe);
 
     UINT stride = sizeof(BgpuVertex);
+    UINT offset = 0;
+    ID3D11Buffer* vb = c.vbuf.p;
+    ID3D11Buffer* ib = c.ibuf.p;
+    d.ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+    d.ctx->IASetIndexBuffer(ib, DXGI_FORMAT_R32_UINT, 0);
+    d.ctx->DrawIndexed(quad_count * 6u, 0, 0);
+    return BGPU_OK;
+}
+
+/* ABI 4：解析圆角。与 rasterQuads 同一条流程，差三处：
+ *   · 顶点是 36 字节的 BgpuShapeVertex（stride 由 ensureQuadBuffers 的参数给）；
+ *   · **不**绑纹理（PS 不采样）；
+ *   · 状态由 bindState 按布局选出 il_shape / vs_shape / ps_shape。 */
+BgpuResult D3d11Backend::rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
+                                      uint32_t quad_count) {
+    D3dCmdObj& c = static_cast<D3dCmdObj&>(cmd);
+    D3dDeviceObj& d = *c.d3ddev;
+    if (!c.target) return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "draw 时不在渲染里");
+    if (!d.caps_shape) {
+        return fail(BGPU_ERR_UNSUPPORTED, __FILE__, __LINE__,
+                    "D3D11 后端的解析圆角着色器不可用");
+    }
+    D3dTextureObj& target = static_cast<D3dTextureObj&>(*c.target);
+
+    BgpuResult r = bindState(c, d, *c.pipe);
+    if (r != BGPU_OK) return r;
+    if (!applyScissor(c, target)) return BGPU_OK;   /* 空裁剪：什么也不画 */
+
+    if (!ensureQuadBuffers(c, d, quad_count, sizeof(BgpuShapeVertex))) {
+        return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "顶点/索引缓冲扩容失败");
+    }
+    const UINT vbytes = quad_count * 4u * static_cast<UINT>(sizeof(BgpuShapeVertex));
+    const D3D11_BOX box{0, 0, 0, vbytes, 1, 1};
+    d.ctx->UpdateSubresource(c.vbuf.p, 0, &box, verts, 0, 0);
+    updateConstants(c, d, target, *c.pipe);
+
+    UINT stride = sizeof(BgpuShapeVertex);
     UINT offset = 0;
     ID3D11Buffer* vb = c.vbuf.p;
     ID3D11Buffer* ib = c.ibuf.p;

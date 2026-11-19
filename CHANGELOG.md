@@ -4,6 +4,75 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.12.0] - 2026-11-20
+
+**解析圆角进设备层：圆角的抗锯齿数学从 CPU 搬到**像素着色器**里算。**（ABI 4）
+
+起因是一句追问：「怎么还在用 CPU，CPU 数学还没改用 GPU 吗」。上一版（bin2D 0.19.x 起）的做法是
+CPU 用 8 条子扫描线积分出一张 `RoundedTileSize×RoundedTileSize` 的覆盖率位图，上传成纹理，
+GPU 只做九宫格采样 —— AA **数学**在 CPU，GPU 只是搬运。这一版把那 6 行公式挪进片元着色器。
+
+### 新增 ABI（全部是**追加**，既有结构体/枚举值/函数签名一个字节没动）
+
+```c
+#define BGPU_VERTEX_SHAPE   2u          /* 第三种顶点布局 */
+#define BGPU_PIPE_SHAPE     (1u << 5)   /* 必须与 BGPU_VERTEX_SHAPE 成对出现 */
+#define BGPU_CAP_SHAPE      (1u << 12)  /* 这个后端能解析地画圆角 */
+
+typedef struct BgpuShapeVertex {        /* 36 字节，静态断言钉住 */
+    float x, y;        /* 目标像素位置 */
+    float lx, ly;      /* 相对盒子中心的局部坐标（顶点处 = ±hx, ±hy） */
+    float hx, hy;      /* 盒子半尺寸 */
+    float radius;      /* 圆角半径 */
+    float thick;       /* 0 = 实心；> 0 = 向内环带（边框）的厚度 */
+    uint32_t tint;     /* 0xAARRGGBB */
+} BgpuShapeVertex;
+
+BgpuResult bingpu_cmd_draw_shapes(BgpuCmd cmd, const BgpuShapeVertex* verts, uint32_t quad_count);
+```
+
+顶点顺序沿用 `raster_rules §2`：`TL, TR, BL, BR`，索引 `0,1,2 / 2,1,3`。
+
+### 片元里算的就是这 6 行
+
+```glsl
+q   = abs(p) - half + r;
+d   = length(max(q, 0)) + min(max(q.x, q.y), 0) - r;
+cov = clamp(0.5 - d, 0, 1);                   // 实心
+cov = clamp(0.5 - abs(d + t/2) + t/2, 0, 1);  // 环带（厚度 t）
+```
+
+**没有 `fwidth`。** 轴对齐 1:1 的映射下，局部坐标 1 个单位 = 屏幕 1 个像素，圆角矩形的距离场
+是 1-Lipschitz 且 `|grad d| ≡ 1` —— 一个像素内 `d` 恰好跨过 1，覆盖率随 `d` 线性下降，中点落在
+`d = 0` 的边界上，于是 `0.5 - d` 就是**精确解析**覆盖率。加导数不但没好处，还会变差：导数在
+2×2 quad 上是分块常数，小半径的弧上会退化成方块；而解析式让 CPU 参考后端能逐位对上。
+
+### 四个后端都实现了（这是这一版的重点）
+
+| 后端 | 做法 | 与 CPU 参考后端 |
+|---|---|---|
+| CPU（参考实现） | `shape_coverage()` 逐像素同一套式子 | 权威 |
+| OpenGL | GLSL 330 运行期编译；编不出来就**不报** `CAP_SHAPE` | 最大 1 级，>1 的通道 0 个 |
+| Vulkan | `shape.vert/frag` → glslc → SPIR-V 入库；模块建不出来就不报 `CAP_SHAPE` | 最大 1 级，>1 的通道 0 个 |
+| D3D11 | `quad.hlsl` 的 `vs_shape`/`ps_shape` → fxc → DXBC 入库；第三套输入布局 | 最大 1 级，>1 的通道 0 个 |
+
+四个后端都是**能力位门控**：没有 `BGPU_CAP_SHAPE` 时调用方退回覆盖率模板（0.10.0 那条路），
+不会半残、不会崩。
+
+### 验收（`tests/test_shape.c`，18 项）
+
+- CPU 参考后端的左上角区 **15×15 逐像素** vs 闭式 SDF 公式：**最大差 0**（含 19 个半覆盖格）；
+- 三个 GPU 后端 vs CPU：**差 >1 的通道 0 个，最大 1**；
+- 环带（`thick=4`）：中心是洞、四边满覆盖；
+- 精度对比（16×16 超采样当参考）：**解析 AA 最大差 10~13、平均 0.1**；上一版 8 子采样扫描线
+  模板最大差 16~40、平均 1~3 ⇒ 搬到 GPU 之后不但没变糙，本身也更准。
+
+### 已知边界（写在这里免得日后误用）
+
+- 只对**轴对齐、1:1、整数平移**的圆角矩形是精确的。旋转/缩放时局部坐标会被非均匀拉伸，
+  而距离场不知道这件事 ⇒ 那条路上层仍应走覆盖率模板；
+- 与 bin2D/binUI 的接线在各自仓库（bin2D 0.21.0 起在有 `CAP_SHAPE` 时发 `draw_shapes`）。
+
 ## [0.11.1] - 2026-11-20
 
 **修掉 CPU 参考后端的一个 1px 空洞：共享边上的像素被两个三角形同时丢掉。**

@@ -47,17 +47,23 @@ def main():
     vs = bytes_of(ROOT / "src/d3d11_shaders/quad.vs.cso")
     vs_mesh = bytes_of(ROOT / "src/d3d11_shaders/quad.vs_mesh.cso")
     fs = bytes_of(ROOT / "src/d3d11_shaders/quad.ps.cso")
+    # ABI 4：解析圆角（vs_shape / ps_shape）
+    vs_shape = bytes_of(ROOT / "src/d3d11_shaders/quad.vs_shape.cso")
+    ps_shape = bytes_of(ROOT / "src/d3d11_shaders/quad.ps_shape.cso")
     hdr = f'''// bingpu_d3d11_shaders.h - D3D11 后端的 DXBC（由 src/d3d11_shaders/quad.hlsl 生成，勿手改）
 //
 // 生成方式（构建**不需要**这一步，产物已入库，与 Vulkan 那份 SPIR-V 同一套规矩）：
-//   fxc /nologo /T vs_4_0 /E vs      /O3 /Fo src/d3d11_shaders/quad.vs.cso      src/d3d11_shaders/quad.hlsl
-//   fxc /nologo /T vs_4_0 /E vs_mesh /O3 /Fo src/d3d11_shaders/quad.vs_mesh.cso src/d3d11_shaders/quad.hlsl
-//   fxc /nologo /T ps_4_0 /E ps      /O3 /Fo src/d3d11_shaders/quad.ps.cso      src/d3d11_shaders/quad.hlsl
+//   fxc /nologo /T vs_4_0 /E vs       /O3 /Fo src/d3d11_shaders/quad.vs.cso       src/d3d11_shaders/quad.hlsl
+//   fxc /nologo /T vs_4_0 /E vs_mesh  /O3 /Fo src/d3d11_shaders/quad.vs_mesh.cso  src/d3d11_shaders/quad.hlsl
+//   fxc /nologo /T vs_4_0 /E vs_shape /O3 /Fo src/d3d11_shaders/quad.vs_shape.cso src/d3d11_shaders/quad.hlsl
+//   fxc /nologo /T ps_4_0 /E ps       /O3 /Fo src/d3d11_shaders/quad.ps.cso       src/d3d11_shaders/quad.hlsl
+//   fxc /nologo /T ps_4_0 /E ps_shape /O3 /Fo src/d3d11_shaders/quad.ps_shape.cso src/d3d11_shaders/quad.hlsl
 //   python3 tools/gen_dxbc_header.py
 //
 // 为什么有两个 VS：D3D11 的输入布局必须覆盖 VS 声明的全部输入语义。2D 顶点没有
 // 法线与 w，与网格共用一份签名就只能把它们指向别的字段（读垃圾值）；拆开之后
-// 2D 的顶点流与旧版本逐字节相同。
+// 2D 的顶点流与旧版本逐字节相同。ABI 4 的解析圆角是第三种顶点（36 字节），
+// 于是有第三对入口。
 //
 // DXBC 以 C 数组入库，于是 `make` 只依赖 C++ 编译器（不需要 Windows SDK / fxc）。
 // 每个入口一份字节码：ID3D11Device::CreateVertexShader / CreatePixelShader 只吃
@@ -79,6 +85,12 @@ static const uint32_t kQuadVsMeshSize = {len(vs_mesh)}u;
 {emit("kQuadPsDxbc", fs)}
 static const uint32_t kQuadPsSize = {len(fs)}u;
 
+{emit("kShapeVsDxbc", vs_shape)}
+static const uint32_t kShapeVsSize = {len(vs_shape)}u;
+
+{emit("kShapePsDxbc", ps_shape)}
+static const uint32_t kShapePsSize = {len(ps_shape)}u;
+
 }}  // namespace d3d11shader
 }}  // namespace bgpu
 
@@ -86,7 +98,8 @@ static const uint32_t kQuadPsSize = {len(fs)}u;
 '''
     out = ROOT / "src/bingpu_d3d11_shaders.h"
     out.write_text(hdr, encoding="utf-8", newline="\n")   # 仓库一律 LF
-    print(f"wrote {out} (vs {len(vs)} bytes, vs_mesh {len(vs_mesh)} bytes, ps {len(fs)} bytes)")
+    print(f"wrote {out} (vs {len(vs)}, vs_mesh {len(vs_mesh)}, ps {len(fs)}, "
+          f"vs_shape {len(vs_shape)}, ps_shape {len(ps_shape)} bytes)")
 
 
 if __name__ == "__main__":
