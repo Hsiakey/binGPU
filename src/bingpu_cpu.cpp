@@ -361,6 +361,12 @@ struct RVert {
     float x, y, z;
     float u, v;
     float r, g, b, a;   /* 直通色（插值在直通域做，与 GPU 的顶点色一致） */
+    /* ABI 3：透视校正与光照。
+     *   iw = 1/w（裁剪空间原始 w）。2D 路径恒为 1 → 透视校正公式退化成普通插值，
+     *        所以两条路可以共用同一个着色函数，不必再分一份循环。
+     *   n  = 世界空间法线（只有网格路径填；2D 路径是 0，且管线不会开 LIGHTING）。 */
+    float iw = 1.0f;
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
 };
 
 /* 一次 draw 的常量状态 */
@@ -374,6 +380,11 @@ struct Paint {
     bool depthTest = false;
     bool depthWrite = false;
     TexState texState;
+    /* ABI 3：光照与透视校正。两个都是"这条 draw 整批一致"的状态，
+     * 所以放在 Paint 里（不是逐顶点）。2D 路径两个都是 false。 */
+    bool lighting = false;
+    bool perspective = false;
+    BgpuLight light{{0.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.1f, 0.1f, 0.1f}};
 
     /* 混合查表的缓存：同一批小四边形往往同色同混合，只算一次 */
     bool lutValid = false;
@@ -547,9 +558,21 @@ void shade_general(const Paint& p, float px, float py, const RVert* v0, const RV
     const float vg = w0 * v0->g + w1 * v1->g + w2 * v2->g;
     const float vb = w0 * v0->b + w1 * v1->b + w2 * v2->b;
     const float va = w0 * v0->a + w1 * v1->a + w2 * v2->a;
+
+    /* 透视校正的分母：Σ λ·(1/w)。2D 路径所有 iw 都是 1 → 恒等于 1，
+     * 于是下面那一段与"普通插值"逐位相同（不需要为 2D 单开一条循环）。 */
+    const float iwSum = w0 * v0->iw + w1 * v1->iw + w2 * v2->iw;
+    const float invIw = (p.perspective && iwSum > 1e-9f) ? (1.0f / iwSum) : 1.0f;
+
     if (p.textured) {
-        const float u = w0 * v0->u + w1 * v1->u + w2 * v2->u;
-        const float v = w0 * v0->v + w1 * v1->v + w2 * v2->v;
+        float u, v;
+        if (p.perspective) {
+            u = (w0 * v0->u * v0->iw + w1 * v1->u * v1->iw + w2 * v2->u * v2->iw) * invIw;
+            v = (w0 * v0->v * v0->iw + w1 * v1->v * v1->iw + w2 * v2->v * v2->iw) * invIw;
+        } else {
+            u = w0 * v0->u + w1 * v1->u + w2 * v2->u;
+            v = w0 * v0->v + w1 * v1->v + w2 * v2->v;
+        }
         float tex[4];
         sample_fast(p.texState, u, v, tex);
         /* 纹理存预乘色、顶点色直通：straight = texStraight * vcol，再预乘
@@ -563,6 +586,50 @@ void shade_general(const Paint& p, float px, float py, const RVert* v0, const RV
         frag[1] = vg * va;
         frag[2] = vb * va;
         frag[3] = va;
+    }
+
+    /* ---- 固定功能 Lambert（ABI 3）----
+     * 公式与 bin3d 的 Shade 逐字一致：
+     *   rgb = base·vcol·tex，然后 × (ambient + color·max(dot(n,dir),0))，
+     *   **在直通空间 clamp 到 [0,1]**，最后才乘 alpha。
+     *
+     * 为什么必须还原成直通再 clamp：纹理与 frag 都是预乘的，先乘光照再 clamp
+     * 会让"过曝"的像素被 alpha 挡掉一部分 —— 与软光栅差一个 alpha 因子。
+     * bin3d 那边 clamp 的是 straight 值（raster.cpp 的 Shade 末段）。 */
+    if (p.lighting) {
+        float nx, ny, nz;
+        if (p.perspective) {
+            nx = (w0 * v0->nx * v0->iw + w1 * v1->nx * v1->iw + w2 * v2->nx * v2->iw) * invIw;
+            ny = (w0 * v0->ny * v0->iw + w1 * v1->ny * v1->iw + w2 * v2->ny * v2->iw) * invIw;
+            nz = (w0 * v0->nz * v0->iw + w1 * v1->nz * v1->iw + w2 * v2->nz * v2->iw) * invIw;
+        } else {
+            nx = w0 * v0->nx + w1 * v1->nx + w2 * v2->nx;
+            ny = w0 * v0->ny + w1 * v1->ny + w2 * v2->ny;
+            nz = w0 * v0->nz + w1 * v1->nz + w2 * v2->nz;
+        }
+        const float nlen2 = nx * nx + ny * ny + nz * nz;
+        float ndl = 0.0f;
+        if (nlen2 > 1e-12f) {
+            const float invN = 1.0f / std::sqrt(nlen2);
+            ndl = (nx * invN) * p.light.dir[0] + (ny * invN) * p.light.dir[1] +
+                  (nz * invN) * p.light.dir[2];
+            if (ndl < 0.0f) ndl = 0.0f;
+        }
+        const float lr = p.light.ambient[0] + p.light.color[0] * ndl;
+        const float lg = p.light.ambient[1] + p.light.color[1] * ndl;
+        const float lb = p.light.ambient[2] + p.light.color[2] * ndl;
+        const float outA = frag[3];
+        // 还原直通（预乘 ÷ alpha；alpha 为 0 时颜色没有意义，直接给 0）
+        const float invA = outA > 1e-6f ? (1.0f / outA) : 0.0f;
+        float sr = frag[0] * invA * lr;
+        float sg = frag[1] * invA * lg;
+        float sb = frag[2] * invA * lb;
+        sr = sr < 0.0f ? 0.0f : (sr > 1.0f ? 1.0f : sr);
+        sg = sg < 0.0f ? 0.0f : (sg > 1.0f ? 1.0f : sg);
+        sb = sb < 0.0f ? 0.0f : (sb > 1.0f ? 1.0f : sb);
+        frag[0] = sr * outA;
+        frag[1] = sg * outA;
+        frag[2] = sb * outA;
     }
 
     uint8_t* q = tgt.data() + (static_cast<size_t>(yi) * tgt.w + xi) * 4u;
@@ -656,7 +723,12 @@ void raster_tri(Paint& p, RVert* a, RVert* b, RVert* d) {
     /* 只在不挂深度时走快路径：深度比较用**插值后的 z**，换成常数值虽然也只差 1 ulp，
      * 但那是"相等不通过"的比较，不值得为它冒风险。 */
     const bool wideTarget = (p.tgt->fmt == BGPU_FORMAT_RGBA8 || p.tgt->fmt == BGPU_FORMAT_BGRA8);
-    if (!p.depthOn && uniformColor && wideTarget) {
+    /* 光照与透视校正**不能**走这些快路径：uniform 色路径把整片颜色在三角形外算好、
+     * 直接填（不经过 shade_general），而光照是逐像素的（法线在三角形内变化）。
+     * 这两条快路径是 2D 的主战场（文字/图标几千个小四边形），所以不是删掉，
+     * 而是只在"没有新特性"时启用 —— 2D 路径 p.lighting / p.perspective 恒为 false。 */
+    const bool plain2d = !p.lighting && !p.perspective;
+    if (!p.depthOn && uniformColor && wideTarget && plain2d) {
         if (!p.textured) {
             float src[4];
             src[0] = a->r * a->a;
@@ -722,6 +794,13 @@ void build_paint(Cmd& c, Paint& p) {
     p.depthOn = p.depth != nullptr && p.depth->depth_w == tgt->w && p.depth->depth_h == tgt->h;
     p.depthTest = p.depthOn && (c.pipe->pipe_flags & BGPU_PIPE_DEPTH_TEST) != 0;
     p.depthWrite = p.depthOn && (c.pipe->pipe_flags & BGPU_PIPE_DEPTH_WRITE) != 0;
+    /* ABI 3：光照只对网格管线有意义（需要法线）。2D 顶点没有法线，
+     * createPipeline 已经在 API 层挡掉了"2D 管线开 LIGHTING"，这里不必再判。 */
+    p.lighting = (c.pipe->pipe_flags & BGPU_PIPE_LIGHTING) != 0;
+    p.light = c.light;
+    /* 透视校正只在网格路径打开：rasterIndexed 会把它置 true（顶点带 w）。
+     * 2D 顶点没有 w 语义，iw 恒 1，走普通插值。 */
+    p.perspective = false;
     int l = 0, t = 0, r = static_cast<int>(tgt->w), b = static_cast<int>(tgt->h);
     if (c.scissorOn) {
         const int sl = c.sc[0];
@@ -806,7 +885,8 @@ public:
         /* 如实上报：能深度/离屏/回读/采样器/仿射/网格；没有 MSAA、没有垂直同步、
          * 不呈现到窗口 —— 那三个 cap 位故意不置。 */
         out.flags = BGPU_CAP_DEPTH | BGPU_CAP_OFFSCREEN | BGPU_CAP_READBACK |
-                    BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH;
+                    BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH |
+                    BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
         out.max_texture_size = BGPU_MAX_TEXTURE_SIZE;
         out.max_frames_in_flight = 1;
         out.msaa_samples = 1;
@@ -1172,6 +1252,9 @@ protected:
         CpuBuffer& ib = static_cast<CpuBuffer&>(ib_);
         Paint p;
         build_paint(c, p);
+        /* 网格路径：顶点带原始 w 与世界空间法线，属性按 1/w 透视校正插值。
+         * （2D 的 draw_quads 不走这里 —— 它在屏幕空间，没有 w 可校正。） */
+        p.perspective = true;
 
         /* 先整段校验索引（越界是调用方 bug：宁可一笔都不画，也不要"画一半再报错"）。 */
         const uint32_t* idx = reinterpret_cast<const uint32_t*>(ib.data.data() + index_offset);
@@ -1196,6 +1279,12 @@ protected:
                             sizeof(mv));
                 const BgpuVertex v2 = {mv.x, mv.y, mv.z, mv.u, mv.v, mv.color};
                 transform_vert(c, *p.tgt, c.affineOn, v2, tri[k]);
+                /* 光照与透视校正的材料在这里搬进 RVert：位置/UV 走 v2（只有 6 个字段），
+                 * 法线与 w 是网格独有的，transform_vert 不认识。 */
+                tri[k].nx = mv.nx;
+                tri[k].ny = mv.ny;
+                tri[k].nz = mv.nz;
+                tri[k].iw = (mv.w > 1e-9f) ? (1.0f / mv.w) : 1.0f;
             }
             raster_tri(p, &tri[0], &tri[1], &tri[2]);
         }

@@ -4,6 +4,55 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.6.0] - 2026-11-19
+
+**ABI 3：固定功能光照 + 透视校正**。这两条是 bin3d 的 GPU 阶段能不能开的前提，
+所以连同"为什么之前做不了"一起记在这里。
+
+### Added
+
+- **`BgpuMeshVertex` 加 `float w`**（36 → 40 字节）：裁剪空间的**原始 w**。顶点位置
+  送进来时已经除过 w，属性如果按屏幕空间线性插值，"近处三角形被拉长、UV 却按屏幕
+  比例走"—— 纹理在斜面上会明显滑动。带下原始 w 之后后端能做 `Σ(attr/w·λ)/Σ(1/w·λ)`。
+  2D 路径（`BgpuVertex` / `draw_quads`）**一个字节没动**。
+- **固定功能 Lambert**：`BGPU_PIPE_LIGHTING` + `BgpuLight` + `bingpu_cmd_set_light` +
+  `BGPU_CAP_LIGHTING`。公式与 bin3d 的软光栅逐字一致：
+
+  ```
+  片元 = base·vcol·tex × (ambient + lightColor·max(dot(n, dir), 0))
+  ```
+
+  `n` 是世界空间法线的透视校正插值再归一化；光照在**直通空间** clamp 到 [0,1]
+  之后才乘 alpha（预乘空间里 clamp 会差一个 alpha 因子）。
+  方向必须单位长度（API 层校验长度平方 ∈ [1e-8, 4]），后端不做归一化。
+- `BGPU_CAP_PERSPECTIVE`：后端自报"网格属性做了透视校正"。
+
+### Fixed / 坑
+
+- **CPU 后端的"均匀色快路径"绕过了着色函数**：`raster_tri` 在顶点色一致时会把整片
+  颜色在三角形外算好直接填（2D 的主战场 —— 文字/图标几千个小四边形全靠它），
+  而光照与透视校正都是**逐像素**的。第一版忘了排除，表现为"开了 LIGHTING 但光照
+  完全没生效"（三个法线方向画出同一个颜色）。现在快路径带 `plain2d` 判据。
+- API 层挡掉 `BGPU_VERTEX_2D + BGPU_PIPE_LIGHTING`（2D 顶点没有法线）——
+  否则后端会画出一片黑，那种错要花半天找。
+
+### 测试
+
+- `test_cpu_render` 新增 `[lighting]` / `[perspective]`：判据是**手算的数值**，
+  不是"看起来对"。
+  - 光照三例：法线朝光源 ndl=1 → clamp(0.1+1.0)=**255**；背光 ndl=0 → ambient **26**；
+    斜 45° → 0.1+0.7071=0.8071 → **206**。
+  - 透视：一条水平线段，左端 w=1、右端 w=4，纹理 2×1 黑白。x=4 处屏幕线性 u=0.5625
+    （白）而透视校正 u=0.2432（黑）—— 两者结果相反，一点就能分辨走的哪条公式。
+- `test_abi` 247 项、`test_cpu_render` 378 项全过；VK / D3D11 / GL 各 13 项照旧全过。
+
+### 还没做（下一步）
+
+- VK / D3D11 / GL 三个后端的光照与透视：shader 要重编（`fxc` / `glslc` 本机都有），
+  目前它们**自报不支持** `BGPU_CAP_LIGHTING` / `BGPU_CAP_PERSPECTIVE`，行为与 0.5.2
+  完全一致（网格照旧不校正、不光照）。
+- bin3d 的 `GpuRenderer` 接上 binGPU（`../bin3D/src/gpu.cpp` 现在还是纯桩）。
+
 ## [0.5.2] - 2026-11-18
 
 **两条性能/语义的坑，都是 bin2d 的图层合成基准逼出来的**（`../bin2D/tools/bin2d_bench_gpu.cpp`

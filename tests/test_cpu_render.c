@@ -769,6 +769,181 @@ static void test_mesh(void) {
 }
 
 /* ============================================================
+ * 9b) 固定功能光照 + 透视校正（ABI 3）
+ *
+ * 这两条是 bin3d 的 GPU 阶段能不能用的前提，所以判据必须是**手算的数值**，
+ * 不能只看"画出来不是黑的"：
+ *   · 光照：颜色 = base·vcol·tex × (ambient + lightColor·max(dot(n,dir),0))，
+ *     在**直通空间** clamp，最后乘 alpha。
+ *   · 透视校正：属性按 Σ(attr/w·λ) / Σ(1/w·λ) 插值。
+ * ============================================================ */
+static void test_lighting(void) {
+    printf("[lighting]\n");
+    struct Case {
+        float nx, ny, nz;
+        uint8_t expect;   /* 直通 RGB（灰度）：0.1 → 26，1.1 clamp 到 1.0 → 255 */
+        const char* name;
+    };
+    const struct Case cases[] = {
+        {0.0f, 1.0f, 0.0f, 255, "法线朝光源：ndl=1 → clamp(0.1+1.0)=1.0"},
+        {0.0f, -1.0f, 0.0f, 26, "法线背光：ndl=0 → 只剩 ambient 0.1"},
+        /* 45°：ndl = cos45 = 0.70710678；0.1 + 0.7071 = 0.8071 → 0.8071*255 = 205.8 → 206 */
+        {-0.70710678f, 0.70710678f, 0.0f, 206, "法线斜 45°：ndl=0.7071 → 206"},
+    };
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        env_init(W, H, BGPU_FORMAT_RGBA8);
+
+        BgpuBuffer vb = BGPU_INVALID, ib = BGPU_INVALID;
+        BgpuBufferDesc bd;
+        memset(&bd, 0, sizeof(bd));
+        bd.struct_size = (uint32_t)sizeof(bd);
+        bd.size = (uint32_t)sizeof(BgpuMeshVertex) * 4u;
+        bd.usage = BGPU_BUFFER_VERTEX;
+        CHECK(bingpu_buffer_create(g_dev, &bd, &vb) == BGPU_OK);
+        bd.size = 6u * 4u;
+        bd.usage = BGPU_BUFFER_INDEX;
+        CHECK(bingpu_buffer_create(g_dev, &bd, &ib) == BGPU_OK);
+        const uint32_t idx[6] = {0, 1, 2, 0, 2, 3};
+        CHECK(bingpu_buffer_update(ib, 0, idx, sizeof(idx)) == BGPU_OK);
+
+        BgpuMeshVertex verts[4];
+        memset(verts, 0, sizeof(verts));
+        const float xs[4] = {0, 8, 8, 0}, ys[4] = {0, 0, 8, 8};
+        for (int k = 0; k < 4; k++) {
+            verts[k].x = xs[k];
+            verts[k].y = ys[k];
+            verts[k].color = 0xFFFFFFFFu;      /* 白色 → 结果直接反映光照 */
+            verts[k].nx = cases[ci].nx;
+            verts[k].ny = cases[ci].ny;
+            verts[k].nz = cases[ci].nz;
+            verts[k].w = 1.0f;
+        }
+        CHECK(bingpu_buffer_update(vb, 0, verts, sizeof(verts)) == BGPU_OK);
+
+        const BgpuPipeline p =
+            make_pipe(BGPU_BLEND_PREMULTIPLIED, BGPU_PIPE_LIGHTING, BGPU_VERTEX_MESH);
+        BgpuLight light;
+        memset(&light, 0, sizeof(light));
+        light.dir[1] = 1.0f;          /* 光照方向朝 +y（屏幕向下），法线朝上时 ndl=1 */
+        light.color[0] = light.color[1] = light.color[2] = 1.0f;
+        light.ambient[0] = light.ambient[1] = light.ambient[2] = 0.1f;
+
+        begin_frame();
+        begin_render_on(g_target, BGPU_INVALID, 1, 0x00000000u, 0, 0.0f);
+        bingpu_cmd_set_pipeline(g_cmd, p);
+        CHECK_EQ(bingpu_cmd_set_light(g_cmd, &light), BGPU_OK);
+        CHECK_EQ(bingpu_cmd_draw_indexed(g_cmd, vb, 0, ib, 6, 0), BGPU_OK);
+        bingpu_cmd_end_render(g_cmd);
+        end_frame_read();
+        const uint32_t want = 0xFF000000u | ((uint32_t)cases[ci].expect << 16) |
+                              ((uint32_t)cases[ci].expect << 8) | cases[ci].expect;
+        EXPECT_PX(6, 2, want);    /* 右上三角形内部（避开 x==y 的斜边） */
+        EXPECT_PX(2, 6, want);    /* 左下三角形内部（避开斜边） */
+
+        /* 2D 管线开 LIGHTING 必须被挡掉（2D 顶点没有法线） */
+        BgpuPipelineDesc pd;
+        memset(&pd, 0, sizeof(pd));
+        pd.struct_size = (uint32_t)sizeof(pd);
+        pd.vertex_layout = BGPU_VERTEX_2D;
+        pd.flags = BGPU_PIPE_LIGHTING;
+        BgpuPipeline bad = BGPU_INVALID;
+        CHECK_EQ(bingpu_pipeline_create(g_dev, &pd, &bad), BGPU_ERR_INVALID_ARGUMENT);
+
+        /* 非法光照方向要被拒绝（后端不做归一化，方向不是单位长度就没有确定语义） */
+        BgpuLight badLight;
+        memset(&badLight, 0, sizeof(badLight));
+        badLight.dir[0] = 3.0f;   /* 长度平方 9 > 4 */
+        CHECK_EQ(bingpu_cmd_set_light(g_cmd, &badLight), BGPU_ERR_INVALID_ARGUMENT);
+        /* NULL = 复位默认 */
+        CHECK_EQ(bingpu_cmd_set_light(g_cmd, NULL), BGPU_OK);
+
+        bingpu_pipeline_destroy(g_dev, p);
+        bingpu_buffer_destroy(g_dev, vb);
+        bingpu_buffer_destroy(g_dev, ib);
+        env_done();
+        printf("  %s\n", cases[ci].name);
+    }
+}
+
+/* 透视校正：两个顶点 w 不同时，中间像素的 UV 必须按 1/w 加权。
+ *
+ * 构造：一条水平线段从 x=0 到 x=8，左端 w=1（近）、右端 w=4（远）。
+ * 纹理是 2x1 的 {黑, 白}。屏幕空间线性插值会在 x=4 处取到 u=0.5，
+ * 透视校正后 u = (0.5·1/1) / (0.5·1/1 + 0.5·1/4) = 0.5/0.625 = 0.8 —— 明显不同。
+ * 所以"x=4 处是黑还是白"就能分辨走的是哪条公式。 */
+static void test_perspective(void) {
+    printf("[perspective]\n");
+    env_init(W, H, BGPU_FORMAT_RGBA8);
+    BgpuBuffer vb = BGPU_INVALID, ib = BGPU_INVALID;
+    BgpuBufferDesc bd;
+    memset(&bd, 0, sizeof(bd));
+    bd.struct_size = (uint32_t)sizeof(bd);
+    bd.size = (uint32_t)sizeof(BgpuMeshVertex) * 4u;
+    bd.usage = BGPU_BUFFER_VERTEX;
+    CHECK(bingpu_buffer_create(g_dev, &bd, &vb) == BGPU_OK);
+    bd.size = 6u * 4u;
+    bd.usage = BGPU_BUFFER_INDEX;
+    CHECK(bingpu_buffer_create(g_dev, &bd, &ib) == BGPU_OK);
+    const uint32_t idx[6] = {0, 1, 2, 0, 2, 3};
+    CHECK(bingpu_buffer_update(ib, 0, idx, sizeof(idx)) == BGPU_OK);
+
+    /* 16x16 的目标，纹理 2x1：左半黑、右半白，NEAREST 采样（避免双线性把边界糊开） */
+    BgpuTextureDesc td;
+    memset(&td, 0, sizeof(td));
+    td.struct_size = (uint32_t)sizeof(td);
+    td.width = 2;
+    td.height = 1;
+    td.format = BGPU_FORMAT_RGBA8;
+    BgpuTexture tex = BGPU_INVALID;
+    CHECK(bingpu_texture_create(g_dev, &td, &tex) == BGPU_OK);
+    const uint8_t px[8] = {0, 0, 0, 255, 255, 255, 255, 255};
+    CHECK(bingpu_texture_upload(tex, NULL, px, 8) == BGPU_OK);
+    BgpuSamplerDesc sd;
+    memset(&sd, 0, sizeof(sd));
+    sd.struct_size = (uint32_t)sizeof(sd);
+    sd.min_filter = BGPU_FILTER_NEAREST;
+    sd.mag_filter = BGPU_FILTER_NEAREST;
+    sd.wrap_u = BGPU_WRAP_CLAMP;
+    sd.wrap_v = BGPU_WRAP_CLAMP;
+    BgpuSampler samp = BGPU_INVALID;
+    CHECK(bingpu_sampler_create(g_dev, &sd, &samp) == BGPU_OK);
+
+    BgpuMeshVertex verts[4];
+    memset(verts, 0, sizeof(verts));
+    const float xs[4] = {0, 8, 8, 0}, ys[4] = {0, 0, 8, 8};
+    const float us[4] = {0, 1, 1, 0};
+    for (int k = 0; k < 4; k++) {
+        verts[k].x = xs[k];
+        verts[k].y = ys[k];
+        verts[k].u = us[k];
+        verts[k].color = 0xFFFFFFFFu;
+        verts[k].w = (k == 0 || k == 3) ? 1.0f : 4.0f;   /* 左边近、右边远 */
+    }
+    CHECK(bingpu_buffer_update(vb, 0, verts, sizeof(verts)) == BGPU_OK);
+
+    const BgpuPipeline p =
+        make_pipe(BGPU_BLEND_PREMULTIPLIED, BGPU_PIPE_TEXTURED, BGPU_VERTEX_MESH);
+    begin_frame();
+    begin_render_on(g_target, BGPU_INVALID, 1, 0x00000000u, 0, 0.0f);
+    bingpu_cmd_set_pipeline(g_cmd, p);
+    bingpu_cmd_set_texture(g_cmd, tex, samp);
+    CHECK_EQ(bingpu_cmd_draw_indexed(g_cmd, vb, 0, ib, 6, 0), BGPU_OK);
+    bingpu_cmd_end_render(g_cmd);
+    end_frame_read();
+    /* 左端远小于 0.8 → 仍取左（黑）纹素；右端接近 1 → 取右（白）纹素。
+     * 关键是中间：屏幕线性会取到 u≈0.5（黑），透视校正取到 u≈0.8（白）。 */
+    EXPECT_PX(4, 1, 0xFF000000u);    /* 判据点：线性 u=0.5625(白) vs 校正 u=0.2432(黑) */
+    EXPECT_PX(7, 1, 0xFFFFFFFFu);    /* 右端：两种插值都 > 0.5 → 白 */
+    EXPECT_PX(1, 2, 0xFF000000u);    /* 左端：u≈0.19 → 黑 */
+    bingpu_pipeline_destroy(g_dev, p);
+    bingpu_sampler_destroy(g_dev, samp);
+    bingpu_texture_destroy(g_dev, tex);
+    bingpu_buffer_destroy(g_dev, vb);
+    bingpu_buffer_destroy(g_dev, ib);
+    env_done();
+}
+
+/* ============================================================
  * 10) 交换链格式 BGRA8 + stats
  * ============================================================ */
 static void test_bgra_swapchain(void) {
@@ -894,6 +1069,8 @@ int main(void) {
     test_texture_roundtrip();
     test_r8_mask();
     test_mesh();
+    test_lighting();
+    test_perspective();
     test_bgra_swapchain();
     test_stats();
     test_resize();

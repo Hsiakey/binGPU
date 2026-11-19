@@ -71,15 +71,18 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 5
-#define BINGPU_VERSION_PATCH 2
-#define BINGPU_VERSION_STRING "0.5.2"
+#define BINGPU_VERSION_MINOR 6
+#define BINGPU_VERSION_PATCH 0
+#define BINGPU_VERSION_STRING "0.6.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
  *   ABI 2：0.4.0（新增 BGPU_BACKEND_D3D11 枚举值；既有值、结构体、签名全部不变）
- *          0.5.0 落 GL 后端时**一个字节都没动** —— GL 的枚举值 0.1.0 就在。 */
-#define BINGPU_ABI_VERSION 2u
+ *          0.5.0 落 GL 后端时**一个字节都没动** —— GL 的枚举值 0.1.0 就在。
+ *   ABI 3：0.6.0（**BgpuMeshVertex 加 float w** —— 透视校正的源头；
+ *          新增 BgpuLight + bingpu_cmd_set_light；新增两个 cap 位。
+ *          2D 路径（BgpuVertex / draw_quads）一个字节没动。） */
+#define BINGPU_ABI_VERSION 3u
 
 /* 句柄都是 uint64_t；0 = 无效 */
 #define BGPU_INVALID 0ull
@@ -174,13 +177,23 @@ typedef struct BgpuVertex {
 
 typedef struct BgpuMeshVertex {
     float x, y, z;
-    float nx, ny, nz;   /* 世界空间法线 */
+    /* 世界空间法线（上层自己变换好；bingpu 只管插值与 Lambert）。
+     * 为什么是世界空间而不是模型空间：固定管线没有"模型矩阵"这个状态 ——
+     * 顶点位置送进来时已经是目标像素坐标，法线如果还是模型空间就没法参与光照。 */
+    float nx, ny, nz;
     float u, v;
     uint32_t color;
+    /* 裁剪空间的**原始 w**（透视除法之前）；0 视为 1（正交投影）。
+     *
+     * 为什么必须要它（ABI 3 新增）：顶点位置送进来时已经除过 w，属性如果按屏幕空间
+     * 线性插值，"近处三角形被拉长、UV 却按屏幕比例走"—— 纹理在斜面上会明显滑动。
+     * 上层把原始 w 带下来，后端用 `Σ(attr/w·λ) / Σ(1/w·λ)` 插值就是透视正确的。
+     * 2D 四边形（BGPU_VERTEX_2D）没有这个字段：它按定义就在屏幕空间。 */
+    float w;
 } BgpuMeshVertex;
 
 BGPU_STATIC_ASSERT(sizeof(BgpuVertex) == 24, "BgpuVertex 必须 24 字节");
-BGPU_STATIC_ASSERT(sizeof(BgpuMeshVertex) == 36, "BgpuMeshVertex 必须 36 字节");
+BGPU_STATIC_ASSERT(sizeof(BgpuMeshVertex) == 40, "BgpuMeshVertex 必须 40 字节（ABI 3）");
 
 /* ---------------------------------------------------------------
  * 设备
@@ -222,7 +235,10 @@ typedef enum BgpuCapFlag {
     BGPU_CAP_MSAA = 1u << 6,
     BGPU_CAP_MESH = 1u << 7,            /* draw_indexed（网格） */
     BGPU_CAP_SAMPLERS = 1u << 8,        /* 支持自定义采样器（线性/最近、重复/钳制） */
-    BGPU_CAP_AFFINE = 1u << 9           /* 支持 set_affine（任意四边形） */
+    BGPU_CAP_AFFINE = 1u << 9,          /* 支持 set_affine（任意四边形） */
+    /* ABI 3：追加在末尾，旧枚举值一个都没动 */
+    BGPU_CAP_LIGHTING = 1u << 10,       /* 固定功能 Lambert（BGPU_PIPE_LIGHTING 可用） */
+    BGPU_CAP_PERSPECTIVE = 1u << 11     /* 网格顶点带 w、属性按 1/w 透视校正插值 */
 } BgpuCapFlag;
 
 typedef struct BgpuCaps {
@@ -423,7 +439,10 @@ typedef enum BgpuPipelineFlag {
     BGPU_PIPE_DEPTH_TEST = 1u << 0,   /* 打开深度测试（默认深度函数 LESS） */
     BGPU_PIPE_DEPTH_WRITE = 1u << 1,
     BGPU_PIPE_CULL_BACK = 1u << 2,    /* 背面剔除（3D） */
-    BGPU_PIPE_TEXTURED = 1u << 3      /* 采样纹理；关掉时顶点色直接出（纯色） */
+    BGPU_PIPE_TEXTURED = 1u << 3,     /* 采样纹理；关掉时顶点色直接出（纯色） */
+    /* ABI 3：固定功能 Lambert。只对 BGPU_VERTEX_MESH 有意义（需要法线），
+     * 光照参数由 bingpu_cmd_set_light 给。2D 管线设这一位是 BGPU_ERR_INVALID_ARGUMENT。 */
+    BGPU_PIPE_LIGHTING = 1u << 4
 } BgpuPipelineFlag;
 
 typedef struct BgpuPipelineDesc {
@@ -482,6 +501,28 @@ BgpuResult bingpu_cmd_set_texture(BgpuCmd cmd, BgpuTexture texture, BgpuSampler 
  * 传 NULL 复位成单位阵。这是**状态**而不是逐顶点参数 —— 文字/图标是几百个
  * 小四边形，逐四边形传矩阵不现实。 */
 BgpuResult bingpu_cmd_set_affine(BgpuCmd cmd, const float xf[6]);
+
+/* ---------------------------------------------------------------
+ * 光照（ABI 3）：固定功能 Lambert，与 bin3d 软光栅的公式逐字一致
+ *
+ *   片元颜色 = base × vcol × tex × (ambient + lightColor · max(dot(n, dir), 0))
+ *
+ * 其中 n 是**世界空间**法线的透视校正插值再归一化。base 是上层的材质色
+ * （折进顶点色送下来）。整套只有三个参数，没有衰减、没有多光源、没有 specular ——
+ * 因为这些是"上层 3D 语义"，不是设备层该管的。真要更复杂的光照，那是自定义
+ * 着色器的事（见 docs/backends.md 的"用户着色器"一节）。
+ *
+ * 默认值必须与 bin3d 的 ShadeCtx 一致（dir=(0,1,0), color=(1,1,1), ambient=(0.1,0.1,0.1)），
+ * 否则"没设光照就跑"的那一帧两边对不上。
+ * 传 NULL = 复位成默认。requires BGPU_PIPE_LIGHTING 的管线。
+ * --------------------------------------------------------------- */
+typedef struct BgpuLight {
+    float dir[3];       /* 归一化方向（指向光源） */
+    float color[3];     /* 光源颜色（线性，可 > 1 用来过曝） */
+    float ambient[3];   /* 环境光 */
+} BgpuLight;
+
+BgpuResult bingpu_cmd_set_light(BgpuCmd cmd, const BgpuLight* light);
 
 /* 一次下发 quad_count 个四边形，每 4 个顶点按 TL,TR,BL,BR 排。
  * 顶点是 CPU 数组：后端自己攒批后一次性提交（binUI 的三端都是这个形状，

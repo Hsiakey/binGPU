@@ -107,6 +107,8 @@ struct Cmd : ObjectBase {
     int32_t sc[4] = {0, 0, 0, 0};
     bool affineOn = false;
     float xf[6] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+    /* ABI 3：光照状态。默认值与 bin3d 的 ShadeCtx 一致（见 bingpu.h） */
+    BgpuLight light{{0.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.1f, 0.1f, 0.1f}};
 
     Cmd(Backend& b, BgpuDevice owner, Device& d);
 
@@ -180,6 +182,13 @@ public:
     virtual BgpuResult setPipeline(Cmd& cmd, Pipeline& pipe) = 0;
     virtual BgpuResult setTexture(Cmd& cmd, Texture* tex, Sampler* samp) = 0;
     virtual BgpuResult setAffine(Cmd& cmd, const float* xf) = 0;
+    /* 光照状态（ABI 3）。默认实现只把参数记进 cmd —— 真正的后端要覆写它，
+     * 把三个向量搬进 shader 的 uniform/常量缓冲。默认实现是**完整正确**的
+     * 语义（NULL 后端与 CPU 后端都靠它），覆写只加"怎么让 GPU 看见"。 */
+    virtual BgpuResult setLight(Cmd& cmd, const BgpuLight& light) {
+        cmd.light = light;
+        return BGPU_OK;
+    }
     virtual BgpuResult drawQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t quad_count) = 0;
     virtual BgpuResult drawIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset, Buffer& ib,
                                    uint32_t index_count, uint32_t index_offset) = 0;

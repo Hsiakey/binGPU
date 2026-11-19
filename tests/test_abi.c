@@ -67,16 +67,19 @@ static void check_error_shape(const char* fn_name) {
 static void test_version(void) {
     printf("[version]\n");
     CHECK_EQ(BINGPU_VERSION_MAJOR, 0);
-    CHECK_EQ(BINGPU_VERSION_MINOR, 5);   /* 0.5.0：GL 后端（ABI 停在 2） */
-    CHECK_EQ(BINGPU_VERSION_PATCH, 2);   /* 0.5.2：D3D11 上传路径 + wait_idle */
+    CHECK_EQ(BINGPU_VERSION_MINOR, 6);   /* 0.6.0：光照 + 透视校正（ABI 3） */
+    CHECK_EQ(BINGPU_VERSION_PATCH, 0);
     CHECK(strcmp(bingpu_version_string(), BINGPU_VERSION_STRING) == 0);
-    CHECK(strcmp(bingpu_version_string(), "0.5.2") == 0);
+    CHECK(strcmp(bingpu_version_string(), "0.6.0") == 0);
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
-    /* ABI 2 = 新增 BGPU_BACKEND_D3D11 枚举值（追加在末尾，既有值不变） */
-    CHECK_EQ(BINGPU_ABI_VERSION, 2u);
+    /* ABI 3 = BgpuMeshVertex 加 w（透视校正）+ BgpuLight + 两个 cap 位。
+     * 2D 路径（BgpuVertex / draw_quads）一个字节没动 —— 那一行的断言仍然钉 24。
+     * 枚举值全部是追加，旧二进制调用方不受影响。 */
+    CHECK_EQ(BINGPU_ABI_VERSION, 3u);
     /* 结构体布局是 ABI 的一部分（头里也 static_assert 了，这里再钉一次） */
     CHECK_EQ(sizeof(BgpuVertex), 24u);
-    CHECK_EQ(sizeof(BgpuMeshVertex), 36u);
+    CHECK_EQ(sizeof(BgpuMeshVertex), 40u);
+    CHECK_EQ(sizeof(BgpuLight), 36u);   /* 3 个 float[3] */
     CHECK_EQ(sizeof(BgpuDevice), 8u);
     CHECK(sizeof(BgpuDeviceDesc) >= sizeof(uint32_t) * 3);
 }

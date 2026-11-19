@@ -576,6 +576,12 @@ BgpuResult bingpu_pipeline_create(BgpuDevice device, const BgpuPipelineDesc* des
         return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
                     cat("blend=", blend, " 非法（0..4）"));
     }
+    /* ABI 3：光照需要法线，而 2D 顶点（BGPU_VERTEX_2D）没有法线字段。
+     * 在 API 层就挡掉，而不是让后端画出一片黑 —— 那种错会花掉半天找。 */
+    if ((desc->flags & BGPU_PIPE_LIGHTING) && desc->vertex_layout != BGPU_VERTEX_MESH) {
+        return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
+                    "BGPU_PIPE_LIGHTING 需要 BGPU_VERTEX_MESH 顶点（2D 顶点没有法线）");
+    }
     return settle(dev->be->createPipeline(*dev, *desc, out_pipeline), __FILE__, __LINE__, s0);
     BGPU_API_CATCH_RESULT()
 }
@@ -741,6 +747,28 @@ BgpuResult bingpu_cmd_set_affine(BgpuCmd cmd, const float xf[6]) {
     Cmd* c = static_cast<Cmd*>(take(cmd, kObjCmd, "cmd", __FILE__, __LINE__));
     if (!c) return BGPU_ERR_INVALID_HANDLE;
     return settle(c->be->setAffine(*c, xf), __FILE__, __LINE__, s0);
+    BGPU_API_CATCH_RESULT()
+}
+
+BgpuResult bingpu_cmd_set_light(BgpuCmd cmd, const BgpuLight* light) {
+    ApiScope scope("bingpu_cmd_set_light");
+    const unsigned s0 = errorSeq();
+    BGPU_API_TRY
+    Cmd* c = static_cast<Cmd*>(take(cmd, kObjCmd, "cmd", __FILE__, __LINE__));
+    if (!c) return BGPU_ERR_INVALID_HANDLE;
+    /* NULL = 复位成默认。默认值必须与 bin3d 的 ShadeCtx 一致（见 bingpu.h 的注释），
+     * 否则"没设光照就跑"的那一帧软光栅与 GPU 两边对不上。 */
+    static const BgpuLight kDefault = {
+        {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.1f, 0.1f, 0.1f}};
+    const BgpuLight& l = light ? *light : kDefault;
+    /* 方向必须是单位向量：后端不做归一化（每帧归一化一次是白给的乘法，
+     * 而"方向不是单位长度"会让 Lambert 的亮度差一个常数，那种错很难看出来） */
+    const float len2 = l.dir[0] * l.dir[0] + l.dir[1] * l.dir[1] + l.dir[2] * l.dir[2];
+    if (!(len2 > 1e-8f) || !(len2 < 4.0f)) {
+        return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
+                    "light.dir 必须是单位向量（长度平方应在 1e-8..4 之间）");
+    }
+    return settle(c->be->setLight(*c, l), __FILE__, __LINE__, s0);
     BGPU_API_CATCH_RESULT()
 }
 
