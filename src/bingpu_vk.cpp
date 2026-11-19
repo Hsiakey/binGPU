@@ -376,17 +376,59 @@ uint32_t pickMemoryType(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFl
     return 0;
 }
 
-/* 与 quad.vert 的 push_constant 逐字段对应（48 字节） */
-/* std430 布局（GLSL push_constant 块）：vec4 在 0，vec2 在 16，然后**补到 32**
- * 才是下一个 vec4 —— C++ 结构体必须逐字节对上，否则仿射矩阵读到的是错位数据。
- * （第一版就是这里错的：xf0 落在 24，GLSL 读 32。） */
+/* 与 quad.vert / quad.frag 的 push_constant 块逐字段对应（112 字节）。
+ * std430 布局（GLSL push_constant 块）：vec4 在 0，vec2 在 16，下一个 vec2 在 24，
+ * 然后 vec4 从 32 开始 —— C++ 结构体必须逐字节对上，否则读到的是错位数据。
+ * （ABI 2 时这里踩过：xf0 落在 24，GLSL 读 32。）
+ *
+ * ABI 3 把原来的 pad[2] 用成 flags（前排布不变，2D 用例逐字节不受影响），
+ * 再接三组 vec4 放光照。总长 112 ≤ 规范保证的 maxPushConstantsSize 128。 */
 struct PushConstants {
-    float vp[4];       /* offset  0 */
-    float target[2];   /* offset 16 */
-    float pad[2];      /* offset 24（std430 对齐用，恒 0） */
-    float xf0[4];      /* offset 32 */
-    float xf1[4];      /* offset 48 */
+    float vp[4];          /* offset   0 */
+    float target[2];      /* offset  16 */
+    float flags[2];       /* offset  24：x = 透视校正（网格），y = 光照（ABI 3） */
+    float xf0[4];         /* offset  32 */
+    float xf1[4];         /* offset  48 */
+    float light_dir[4];   /* offset  64：xyz = 指向光源的单位方向 */
+    float light_color[4]; /* offset  80：rgb = 光色（可 > 1） */
+    float light_amb[4];   /* offset  96：rgb = 环境光 */
 };
+
+/* 把一条命令的状态拍成 push constant。
+ * 2D 与网格两条 draw 路径共用它 —— 光照/透视的字段只在这里算一次，
+ * 免得两边各写一段、日后漂移（这正是 ABI 3 之前三端圆角漂移的老路）。 */
+void fillPushConstants(const Cmd& cmd, bool perspective, uint32_t target_w, uint32_t target_h,
+                       PushConstants& pc) {
+    pc.vp[0] = cmd.vp[0];
+    pc.vp[1] = cmd.vp[1];
+    pc.vp[2] = cmd.vp[2];
+    pc.vp[3] = cmd.vp[3];
+    pc.target[0] = static_cast<float>(target_w);
+    pc.target[1] = static_cast<float>(target_h);
+    pc.flags[0] = perspective ? 1.0f : 0.0f;
+    pc.flags[1] = (cmd.pipe->pipe_flags & BGPU_PIPE_LIGHTING) ? 1.0f : 0.0f;
+    if (cmd.affineOn) {
+        /* cmd.xf 的 6 个数就是 [a c e | b d f]，与 quad.vert 里两行的顺序一致，
+         * 直接搬；别按列主序重排（第一版就这么错的，仿射用例整块画不出来）。 */
+        pc.xf0[0] = cmd.xf[0];
+        pc.xf0[1] = cmd.xf[1];
+        pc.xf0[2] = cmd.xf[2];
+        pc.xf0[3] = 1.0f;
+        pc.xf1[0] = cmd.xf[3];
+        pc.xf1[1] = cmd.xf[4];
+        pc.xf1[2] = cmd.xf[5];
+    } else {
+        pc.xf0[0] = 1.0f;
+        pc.xf1[1] = 1.0f;
+    }
+    /* 光照参数：即使管线没开 LIGHTING 也推进去（片元侧由 flags.y 决定用不用），
+     * 于是"设了光再换管线"不需要额外的状态同步。 */
+    for (int i = 0; i < 3; i++) {
+        pc.light_dir[i] = cmd.light.dir[i];
+        pc.light_color[i] = cmd.light.color[i];
+        pc.light_amb[i] = cmd.light.ambient[i];
+    }
+}
 
 inline bool trace2() {
     static const bool on = std::getenv("BINGPU_VK_TRACE") != nullptr;
@@ -870,7 +912,8 @@ BgpuResult VkBackend::createDevice(const BgpuDeviceDesc& desc, BgpuDevice* out) 
     }
 
     VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    /* ABI 3 起片元着色器也要读（flags / light*），所以范围覆盖两个阶段 */
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.size = sizeof(PushConstants);
     VkPipelineLayoutCreateInfo plc{};
     plc.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -979,7 +1022,9 @@ void VkBackend::deviceInfo(Device& dev, BgpuDeviceInfo& out) {
 void VkBackend::deviceCaps(Device& dev, BgpuCaps& out) {
     (void)dev;
     out.flags = BGPU_CAP_DEPTH | BGPU_CAP_OFFSCREEN | BGPU_CAP_READBACK | BGPU_CAP_PRESENT_PACES |
-                BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH;
+                BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH |
+                /* ABI 3：光照（片元里做 Lambert）与透视校正（顶点带 w）都已实现 */
+                BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
     out.max_texture_size = BGPU_MAX_TEXTURE_SIZE;
     out.max_frames_in_flight = 1;   /* 每帧 submit + 等 fence */
     out.msaa_samples = 1;           /* 与 CPU 参考后端一致（0 差验收的前提） */
@@ -1426,27 +1471,34 @@ VkPipeline VkBackend::pipelineFor(VkPipelineObj& p, VkDeviceObj& dev, VkFormat c
     stages[1].pName = "main";
 
     VkVertexInputBindingDescription bind{};
-    VkVertexInputAttributeDescription attrs[3]{};
+    VkVertexInputAttributeDescription attrs[5]{};
     VkPipelineVertexInputStateCreateInfo vin{};
     vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     if (p.layout == BGPU_VERTEX_2D) {
         bind.binding = 0;
-        bind.stride = sizeof(BgpuVertex);   /* 24 */
+        bind.stride = sizeof(BgpuVertex);   /* 24（ABI 3 未变） */
         bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
         attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
         attrs[1] = {1, 0, VK_FORMAT_R32G32_SFLOAT, 12};
         attrs[2] = {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 20};
+        /* location 3/4 是 ABI 3 的网格字段。2D 顶点没有它们，但着色器里声明了
+         * 就必须由管线提供（验证层 VUID-...-Input-07904），所以指向本顶点的
+         * 位置字节：值无意义、但**落在缓冲区内**；flags.x = 0 时用不到它们。 */
+        attrs[3] = {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
+        attrs[4] = {4, 0, VK_FORMAT_R32_SFLOAT, 0};
     } else {
         bind.binding = 0;
-        bind.stride = sizeof(BgpuMeshVertex);   /* 36 */
+        bind.stride = sizeof(BgpuMeshVertex);   /* 40（ABI 3：末尾加了 w） */
         bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
-        attrs[1] = {1, 0, VK_FORMAT_R32G32_SFLOAT, 24};
-        attrs[2] = {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 32};
+        attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};     /* x, y, z   */
+        attrs[1] = {1, 0, VK_FORMAT_R32G32_SFLOAT, 24};       /* u, v      */
+        attrs[2] = {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 32};      /* color     */
+        attrs[3] = {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 12};    /* nx, ny, nz */
+        attrs[4] = {4, 0, VK_FORMAT_R32_SFLOAT, 36};          /* w         */
     }
     vin.vertexBindingDescriptionCount = 1;
     vin.pVertexBindingDescriptions = &bind;
-    vin.vertexAttributeDescriptionCount = 3;
+    vin.vertexAttributeDescriptionCount = 5;
     vin.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
@@ -2253,34 +2305,17 @@ BgpuResult VkBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
     g_vk.vkCmdSetScissor(c.cb, 0, 1, &sc);
 
     PushConstants pc{};
-    pc.vp[0] = cmd.vp[0];
-    pc.vp[1] = cmd.vp[1];
-    pc.vp[2] = cmd.vp[2];
-    pc.vp[3] = cmd.vp[3];
-    pc.target[0] = static_cast<float>(target.w);
-    pc.target[1] = static_cast<float>(target.h);
-    if (cmd.affineOn) {
-        /* cmd.xf 的 6 个数就是 [a c e | b d f]，与 quad.vert 里两行的顺序一致，
-         * 直接搬；别按列主序重排（第一版就这么错的，仿射用例整块画不出来）。 */
-        pc.xf0[0] = cmd.xf[0];
-        pc.xf0[1] = cmd.xf[1];
-        pc.xf0[2] = cmd.xf[2];
-        pc.xf0[3] = 1.0f;
-        pc.xf1[0] = cmd.xf[3];
-        pc.xf1[1] = cmd.xf[4];
-        pc.xf1[2] = cmd.xf[5];
-    } else {
-        pc.xf0[0] = 1.0f;
-        pc.xf1[1] = 1.0f;
-    }
-    g_vk.vkCmdPushConstants(c.cb, d.pipe_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+    fillPushConstants(cmd, /*perspective=*/false, target.w, target.h, pc);
+    g_vk.vkCmdPushConstants(c.cb, d.pipe_layout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                            sizeof(pc), &pc);
     if (trace2())
         std::fprintf(stderr,
                      "[vk] push: target=%.0fx%.0f vp=(%.0f,%.0f,%.0f,%.0f) affine=%.1f "
-                     "xf0=(%.2f,%.2f,%.2f) xf1=(%.2f,%.2f,%.2f)\n",
+                     "persp=%.0f lighting=%.0f lightDir=(%.2f,%.2f,%.2f)\n",
                      pc.target[0], pc.target[1], pc.vp[0], pc.vp[1], pc.vp[2], pc.vp[3],
-                     pc.xf0[3], pc.xf0[0], pc.xf0[1], pc.xf0[2], pc.xf1[0], pc.xf1[1],
-                     pc.xf1[2]);
+                     pc.xf0[3], pc.flags[0], pc.flags[1], pc.light_dir[0], pc.light_dir[1],
+                     pc.light_dir[2]);
     /* 顶点：追加到本帧的流缓冲，索引固定 TL,TR,BL / BL,TR,BR（raster_rules §2） */
     const uint64_t bytes = static_cast<uint64_t>(quad_count) * 4 * sizeof(BgpuVertex);
     if (!ensureVertexSpace(c, d, bytes)) {
@@ -2357,34 +2392,17 @@ BgpuResult VkBackend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset
     g_vk.vkCmdSetScissor(c.cb, 0, 1, &sc);
 
     PushConstants pc{};
-    pc.vp[0] = cmd.vp[0];
-    pc.vp[1] = cmd.vp[1];
-    pc.vp[2] = cmd.vp[2];
-    pc.vp[3] = cmd.vp[3];
-    pc.target[0] = static_cast<float>(target.w);
-    pc.target[1] = static_cast<float>(target.h);
-    if (cmd.affineOn) {
-        /* cmd.xf 的 6 个数就是 [a c e | b d f]，与 quad.vert 里两行的顺序一致，
-         * 直接搬；别按列主序重排（第一版就这么错的，仿射用例整块画不出来）。 */
-        pc.xf0[0] = cmd.xf[0];
-        pc.xf0[1] = cmd.xf[1];
-        pc.xf0[2] = cmd.xf[2];
-        pc.xf0[3] = 1.0f;
-        pc.xf1[0] = cmd.xf[3];
-        pc.xf1[1] = cmd.xf[4];
-        pc.xf1[2] = cmd.xf[5];
-    } else {
-        pc.xf0[0] = 1.0f;
-        pc.xf1[1] = 1.0f;
-    }
-    g_vk.vkCmdPushConstants(c.cb, d.pipe_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+    fillPushConstants(cmd, /*perspective=*/true, target.w, target.h, pc);
+    g_vk.vkCmdPushConstants(c.cb, d.pipe_layout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                            sizeof(pc), &pc);
     if (trace2())
         std::fprintf(stderr,
                      "[vk] push: target=%.0fx%.0f vp=(%.0f,%.0f,%.0f,%.0f) affine=%.1f "
-                     "xf0=(%.2f,%.2f,%.2f) xf1=(%.2f,%.2f,%.2f)\n",
+                     "persp=%.0f lighting=%.0f lightDir=(%.2f,%.2f,%.2f)\n",
                      pc.target[0], pc.target[1], pc.vp[0], pc.vp[1], pc.vp[2], pc.vp[3],
-                     pc.xf0[3], pc.xf0[0], pc.xf0[1], pc.xf0[2], pc.xf1[0], pc.xf1[1],
-                     pc.xf1[2]);
+                     pc.xf0[3], pc.flags[0], pc.flags[1], pc.light_dir[0], pc.light_dir[1],
+                     pc.light_dir[2]);
     VkBufferObj& vbo = static_cast<VkBufferObj&>(vb);
     VkBufferObj& ibo = static_cast<VkBufferObj&>(ib);
     const VkDeviceSize voff = vertex_offset;

@@ -27,6 +27,8 @@ static void print_caps(const BgpuCaps* c) {
     if (c->flags & BGPU_CAP_MESH) printf(" MESH");
     if (c->flags & BGPU_CAP_SAMPLERS) printf(" SAMPLERS");
     if (c->flags & BGPU_CAP_AFFINE) printf(" AFFINE");
+    if (c->flags & BGPU_CAP_LIGHTING) printf(" LIGHTING");
+    if (c->flags & BGPU_CAP_PERSPECTIVE) printf(" PERSPECTIVE");
     printf("\n");
     printf("  max_texture_size=%u  max_frames_in_flight=%u  msaa=%u  max_quads_per_draw=%u\n",
            c->max_texture_size, c->max_frames_in_flight, c->msaa_samples,

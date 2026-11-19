@@ -68,9 +68,9 @@ static void test_version(void) {
     printf("[version]\n");
     CHECK_EQ(BINGPU_VERSION_MAJOR, 0);
     CHECK_EQ(BINGPU_VERSION_MINOR, 6);   /* 0.6.0：光照 + 透视校正（ABI 3） */
-    CHECK_EQ(BINGPU_VERSION_PATCH, 0);
+    CHECK_EQ(BINGPU_VERSION_PATCH, 1);   /* 0.6.1：三个 GPU 后端补上光照 + 透视 */
     CHECK(strcmp(bingpu_version_string(), BINGPU_VERSION_STRING) == 0);
-    CHECK(strcmp(bingpu_version_string(), "0.6.0") == 0);
+    CHECK(strcmp(bingpu_version_string(), "0.6.1") == 0);
     CHECK_EQ(bingpu_abi_version(), BINGPU_ABI_VERSION);
     /* ABI 3 = BgpuMeshVertex 加 w（透视校正）+ BgpuLight + 两个 cap 位。
      * 2D 路径（BgpuVertex / draw_quads）一个字节没动 —— 那一行的断言仍然钉 24。

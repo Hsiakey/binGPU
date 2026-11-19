@@ -532,6 +532,175 @@ static void run_swapchain_case(const char* name, uint32_t w, uint32_t h, int max
 /* ---------------------------------------------------------------
  * 入口：各 test_*.c 调一次
  * --------------------------------------------------------------- */
+/* ============================================================
+ * ABI 3：固定功能 Lambert + 透视校正
+ *
+ * 这两条是 bin3d 的 GPU 阶段能不能用的前提，判据是**手算的数值**（与
+ * test_cpu_render.c 的 [lighting] / [perspective] 同源），不是"看着不黑"。
+ *
+ * 为什么放在共享 harness 里而不是各后端的 test 里：三个后端算的是同一个公式，
+ * 一份场景 + 0 容差就是最硬的验收；分开写三份只会慢慢漂移（0.25.0 的 VK
+ * strokeRounded 就是这么漏的）。
+ * ============================================================ */
+static void scene_lighting(BgpuDevice dev, BgpuCmd cmd, BgpuTexture t) {
+    static const float kNormals[3][3] = {
+        {0.0f, 1.0f, 0.0f},                      /* 朝光源：ndl=1 → 1.1 → clamp 1.0 → 255 */
+        {0.0f, -1.0f, 0.0f},                     /* 背光：ndl=0 → ambient 0.1 → 26         */
+        {-0.70710678f, 0.70710678f, 0.0f},       /* 斜 45°：ndl=0.7071 → 0.8071 → 206      */
+    };
+    BgpuMeshVertex verts[12];
+    memset(verts, 0, sizeof(verts));
+    uint32_t idx[18];
+    for (int q = 0; q < 3; q++) {
+        const float x0 = 8.0f * (float)q;
+        const float xs[4] = {x0, x0 + 8.0f, x0, x0 + 8.0f};   /* TL,TR,BL,BR */
+        const float ys[4] = {0.0f, 0.0f, 8.0f, 8.0f};
+        for (int k = 0; k < 4; k++) {
+            BgpuMeshVertex* v = &verts[q * 4 + k];
+            v->x = xs[k];
+            v->y = ys[k];
+            v->z = 0.5f;
+            v->u = 0.0f;
+            v->v = 0.0f;
+            v->color = 0xFFFFFFFFu;              /* 白：结果 = 光照系数 */
+            v->nx = kNormals[q][0];
+            v->ny = kNormals[q][1];
+            v->nz = kNormals[q][2];
+            v->w = 1.0f;                         /* 正交：iw=1，走普通插值 */
+        }
+        const uint32_t base = (uint32_t)(q * 4);
+        idx[q * 6 + 0] = base + 0;
+        idx[q * 6 + 1] = base + 1;
+        idx[q * 6 + 2] = base + 2;
+        idx[q * 6 + 3] = base + 2;
+        idx[q * 6 + 4] = base + 1;
+        idx[q * 6 + 5] = base + 3;
+    }
+
+    BgpuBufferDesc bd;
+    memset(&bd, 0, sizeof(bd));
+    bd.struct_size = (uint32_t)sizeof(bd);
+    bd.size = (uint32_t)sizeof(verts);
+    bd.usage = BGPU_BUFFER_VERTEX;
+    BgpuBuffer vb = BGPU_INVALID;
+    if (bingpu_buffer_create(dev, &bd, &vb) != BGPU_OK) return;
+    if (bingpu_buffer_update(vb, 0, verts, (uint32_t)sizeof(verts)) != BGPU_OK) return;
+    bd.size = (uint32_t)sizeof(idx);
+    bd.usage = BGPU_BUFFER_INDEX;
+    BgpuBuffer ib = BGPU_INVALID;
+    if (bingpu_buffer_create(dev, &bd, &ib) != BGPU_OK) return;
+    if (bingpu_buffer_update(ib, 0, idx, (uint32_t)sizeof(idx)) != BGPU_OK) return;
+
+    const BgpuPipeline p =
+        make_pipe(dev, BGPU_VERTEX_MESH, BGPU_BLEND_PREMULTIPLIED, BGPU_PIPE_LIGHTING);
+    BgpuLight light;
+    memset(&light, 0, sizeof(light));
+    light.dir[1] = 1.0f;
+    light.color[0] = light.color[1] = light.color[2] = 1.0f;
+    /* ambient 故意取 0.1：0.1·255 = 25.5 是 8 位量化的**平局点** —— CPU 的 q8 向上
+     * 收敛给 26，而 GPU 的 float→UNORM8 向下收敛给 25。三个后端都在光照分支里先按
+     * CPU 的口径量化了一次（见各自的 shader 注释），所以这里能钉 0 容差。
+     * 换成 0.12 就绕开了这个点，这条断言也就测不到量化口径了。 */
+    light.ambient[0] = light.ambient[1] = light.ambient[2] = 0.1f;
+
+    begin(cmd, t, 0xFF000000u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, p);
+    if (bingpu_cmd_set_light(cmd, &light) != BGPU_OK)
+        printf("  set_light 失败：%s\n", bingpu_last_error());
+    if (bingpu_cmd_draw_indexed(cmd, vb, 0, ib, 18, 0) != BGPU_OK)
+        printf("  draw_indexed 失败：%s\n", bingpu_last_error());
+    bingpu_cmd_end_render(cmd);
+
+    bingpu_pipeline_destroy(dev, p);
+    bingpu_buffer_destroy(dev, vb);
+    bingpu_buffer_destroy(dev, ib);
+}
+
+/* 透视校正：一条水平四边形从 x=0 到 x=8，左端 w=1（近）、右端 w=4（远），UV 0→1。
+ * 纹理是 2×1 的 {黑, 白}，NEAREST 采样。
+ *
+ *   屏幕空间线性：x=4 处 u = 0.5625 → 白
+ *   透视校正：    x=4 处 u = 0.2432 → 黑
+ *
+ * 所以"x=4 那个像素是黑还是白"就是判据。 */
+static void scene_perspective(BgpuDevice dev, BgpuCmd cmd, BgpuTexture t) {
+    BgpuMeshVertex verts[4];
+    memset(verts, 0, sizeof(verts));
+    const float xs[4] = {0.0f, 8.0f, 0.0f, 8.0f};   /* TL,TR,BL,BR */
+    const float ys[4] = {0.0f, 0.0f, 8.0f, 8.0f};
+    const float us[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+    for (int k = 0; k < 4; k++) {
+        BgpuMeshVertex* v = &verts[k];
+        v->x = xs[k];
+        v->y = ys[k];
+        v->z = 0.5f;
+        v->u = us[k];
+        v->v = 0.0f;
+        v->color = 0xFFFFFFFFu;
+        v->nx = 0.0f;
+        v->ny = 0.0f;
+        v->nz = 1.0f;
+        v->w = (k == 0 || k == 2) ? 1.0f : 4.0f;     /* TL/BL 近，TR/BR 远 */
+    }
+    const uint32_t idx[6] = {0, 1, 2, 2, 1, 3};
+
+    BgpuBufferDesc bd;
+    memset(&bd, 0, sizeof(bd));
+    bd.struct_size = (uint32_t)sizeof(bd);
+    bd.size = (uint32_t)sizeof(verts);
+    bd.usage = BGPU_BUFFER_VERTEX;
+    BgpuBuffer vb = BGPU_INVALID;
+    if (bingpu_buffer_create(dev, &bd, &vb) != BGPU_OK) return;
+    if (bingpu_buffer_update(vb, 0, verts, (uint32_t)sizeof(verts)) != BGPU_OK) return;
+    bd.size = (uint32_t)sizeof(idx);
+    bd.usage = BGPU_BUFFER_INDEX;
+    BgpuBuffer ib = BGPU_INVALID;
+    if (bingpu_buffer_create(dev, &bd, &ib) != BGPU_OK) return;
+    if (bingpu_buffer_update(ib, 0, idx, (uint32_t)sizeof(idx)) != BGPU_OK) return;
+
+    /* 2×1 纹理：左黑右白 */
+    const BgpuTexture tex = make_tex(dev, 2, 1, BGPU_FORMAT_RGBA8, 0);
+    const uint8_t px[8] = {0, 0, 0, 255, 255, 255, 255, 255};
+    if (bingpu_texture_upload(tex, NULL, px, 8) != BGPU_OK) return;
+    const BgpuSampler samp = make_sampler(dev, BGPU_FILTER_NEAREST, BGPU_WRAP_CLAMP);
+
+    const BgpuPipeline p =
+        make_pipe(dev, BGPU_VERTEX_MESH, BGPU_BLEND_PREMULTIPLIED, BGPU_PIPE_TEXTURED);
+
+    begin(cmd, t, 0xFF000000u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, p);
+    bingpu_cmd_set_texture(cmd, tex, samp);
+    if (bingpu_cmd_draw_indexed(cmd, vb, 0, ib, 6, 0) != BGPU_OK)
+        printf("  draw_indexed 失败：%s\n", bingpu_last_error());
+    bingpu_cmd_end_render(cmd);
+
+    bingpu_pipeline_destroy(dev, p);
+    bingpu_sampler_destroy(dev, samp);
+    bingpu_texture_destroy(dev, tex);
+    bingpu_buffer_destroy(dev, vb);
+    bingpu_buffer_destroy(dev, ib);
+}
+
+/* 后端自报的能力位：给 ABI 3 的 두 用例决定"跑"还是"skip"。
+ * 单独建设备读一次 caps —— run_case 内部每次自己建/销设备，没有可复用的句柄。 */
+static int backend_has_cap(BgpuBackendKind kind, uint32_t cap) {
+    BgpuDeviceDesc dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.struct_size = (uint32_t)sizeof(dd);
+    dd.backend = kind;
+    dd.width = 8;
+    dd.height = 8;
+    dd.flags = BGPU_DEVICE_HEADLESS | BGPU_DEVICE_VALIDATE;
+    BgpuDevice dev = BGPU_INVALID;
+    if (bingpu_device_create(&dd, &dev) != BGPU_OK) return 0;
+    BgpuCaps caps;
+    memset(&caps, 0, sizeof(caps));
+    caps.struct_size = (uint32_t)sizeof(caps);
+    const int has = (bingpu_device_caps(dev, &caps) == BGPU_OK) && ((caps.flags & cap) != 0);
+    bingpu_device_destroy(dev);
+    return has;
+}
+
 static int parity_run(const char* label, BgpuBackendKind kind) {
     g_kind = kind;
     printf("%s vs CPU 像素对照（binGPU %s，ABI %u）\n", label, bingpu_version_string(),
@@ -560,6 +729,17 @@ static int parity_run(const char* label, BgpuBackendKind kind) {
     /* 交换链路径（frame_begin → … → frame_end → frame_read）：与上面的 texture_read
      * 是两条回读实现。bin2d 的 GPU 桥就长这样，0.5.0 的两个后端 bug 都只在这条路上。 */
     run_swapchain_case("swapchain(frame_read 满幅纹理)", 96, 64, 0, 0.0);
+
+    /* ABI 3：两个能力都要真的实现才置 cap 位。没实现的末端会自报不支持，
+     * 于是这两条会以"必失败"的形式暴露出来，而不是悄悄跳过。 */
+    if (backend_has_cap(kind, BGPU_CAP_LIGHTING))
+        run_case("lighting(Lambert：255/26/206)", scene_lighting, 24, 8, 0, 0.0);
+    else
+        printf("  [skip] lighting：这个后端自报不支持 BGPU_CAP_LIGHTING\n");
+    if (backend_has_cap(kind, BGPU_CAP_PERSPECTIVE))
+        run_case("perspective(u=0.5625 vs 0.2432)", scene_perspective, 16, 16, 0, 0.0);
+    else
+        printf("  [skip] perspective：这个后端自报不支持 BGPU_CAP_PERSPECTIVE\n");
 
     printf("\n通过 %d 项，失败 %d 项\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

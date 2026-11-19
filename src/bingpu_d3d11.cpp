@@ -265,13 +265,19 @@ inline BgpuFormat fromDxgiFormat(DXGI_FORMAT f) {
     return f == DXGI_FORMAT_B8G8R8A8_UNORM ? BGPU_FORMAT_BGRA8 : BGPU_FORMAT_RGBA8;
 }
 
-/* HLSL 的 cbuffer Push 逐字段对应（64 字节，16 字节对齐打包） */
+/* HLSL 的 cbuffer Push 逐字段对应（128 字节，16 字节对齐打包） */
 struct PushConstants {
-    float vp[4];       /* offset  0 */
-    float target[2];   /* offset 16 */
-    float pad[2];      /* offset 24（cbuffer 对齐用，恒 0） */
-    float xf0[4];      /* offset 32 */
-    float xf1[4];      /* offset 48 */
+    float vp[4];         /* offset   0 */
+    float target[2];     /* offset  16 */
+    float pad[2];        /* offset  24（cbuffer 对齐用，恒 0） */
+    float xf0[4];        /* offset  32 */
+    float xf1[4];        /* offset  48 */
+    /* ABI 3：固定功能 Lambert 的三个参数 + 两个开关（都在 w 分量里，省一组标量）。
+     * 与 bingpu_cpu.cpp 的 shade_general 用同一组默认值：dir=(0,1,0)、color=1、ambient=0.1。 */
+    float light_dir[4];  /* offset  64：xyz = 指向光源（已归一化）；w = 是否开光照 */
+    float light_color[4];/* offset  80：rgb = 光色 */
+    float light_amb[4];  /* offset  96：rgb = 环境光 */
+    float flags[4];      /* offset 112：x = 是否透视校正（网格布局 = 1，2D = 0） */
 };
 static_assert(sizeof(PushConstants) % 16 == 0, "cbuffer 必须是 16 字节的倍数");
 
@@ -332,6 +338,7 @@ struct D3dDeviceObj final : Device {
 
     /* 设备级共享对象：固定功能的全部"管线状态"都在这里，按需绑定 */
     Com<ID3D11VertexShader> vs;
+    Com<ID3D11VertexShader> vs_mesh;   /* ABI 3：网格 VS（读法线 + w） */
     Com<ID3D11PixelShader> ps;
     Com<ID3D11InputLayout> il_2d;
     Com<ID3D11InputLayout> il_mesh;
@@ -428,6 +435,7 @@ struct D3dCmdObj final : Cmd {
     ID3D11DepthStencilState* last_ds = nullptr;
     ID3D11RasterizerState* last_rs = nullptr;
     ID3D11InputLayout* last_il = nullptr;
+    ID3D11VertexShader* last_vs = nullptr;   /* 2D 与网格是两个 VS，跟着布局切 */
     ID3D11ShaderResourceView* last_srv = nullptr;
     ID3D11SamplerState* last_samp = nullptr;
     bool have_shaders = false;   /* 着色器 / 拓扑每个 pass 绑一次 */
@@ -512,7 +520,7 @@ private:
     /* 返回 false = 裁剪矩形是空的（这一笔什么也不画） */
     bool applyScissor(D3dCmdObj& c, D3dTextureObj& target);
     bool ensureQuadBuffers(D3dCmdObj& c, D3dDeviceObj& d, uint32_t quads);
-    void updateConstants(D3dCmdObj& c, D3dDeviceObj& d, D3dTextureObj& target);
+    void updateConstants(D3dCmdObj& c, D3dDeviceObj& d, D3dTextureObj& target, Pipeline& pipe);
     bool initDeviceObjects(D3dDeviceObj& d);
 };
 
@@ -558,13 +566,21 @@ bool D3d11Backend::initDeviceObjects(D3dDeviceObj& d) {
                                        d.vs.put()))) {
         return false;
     }
+    /* ABI 3：网格顶点要读法线与裁剪空间 w，输入签名与 2D 不同，必须是**另一个**
+     * VS 入口（D3D11 的输入布局必须覆盖 VS 声明的全部语义，而 2D 顶点没有这两个字段）。 */
+    if (FAILED(dev->CreateVertexShader(d3d11shader::kQuadVsMeshDxbc, d3d11shader::kQuadVsMeshSize,
+                                       nullptr, d.vs_mesh.put()))) {
+        return false;
+    }
     if (FAILED(dev->CreatePixelShader(d3d11shader::kQuadPsDxbc, d3d11shader::kQuadPsSize, nullptr,
                                       d.ps.put()))) {
         return false;
     }
 
-    /* 两种顶点布局，语义名与 quad.hlsl 的 VSIn 对上；stride/offset 是
-     * BgpuVertex(24) / BgpuMeshVertex(36) 的**逐字节**镜像 */
+    /* 两种顶点布局，语义名与 quad.hlsl 的 VSIn2D / VSInMesh 对上；stride/offset 是
+     * BgpuVertex(24) / BgpuMeshVertex(40) 的**逐字节**镜像。
+     * 网格：POSITION/COLOR/TEXCOORD 的位置与旧版一致，ABI 3 只多读已有的
+     * NORMAL(12) 与末尾新增的 TEXCOORD1=w(36)。 */
     const D3D11_INPUT_ELEMENT_DESC e2d[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
@@ -572,15 +588,17 @@ bool D3d11Backend::initDeviceObjects(D3dDeviceObj& d) {
     };
     const D3D11_INPUT_ELEMENT_DESC emesh[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 1, DXGI_FORMAT_R32_FLOAT, 0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
     if (FAILED(dev->CreateInputLayout(e2d, 3, d3d11shader::kQuadVsDxbc, d3d11shader::kQuadVsSize,
                                       d.il_2d.put()))) {
         return false;
     }
-    if (FAILED(dev->CreateInputLayout(emesh, 3, d3d11shader::kQuadVsDxbc,
-                                      d3d11shader::kQuadVsSize, d.il_mesh.put()))) {
+    if (FAILED(dev->CreateInputLayout(emesh, 5, d3d11shader::kQuadVsMeshDxbc,
+                                      d3d11shader::kQuadVsMeshSize, d.il_mesh.put()))) {
         return false;
     }
 
@@ -775,8 +793,11 @@ void D3d11Backend::deviceInfo(Device& dev, BgpuDeviceInfo& out) {
 
 void D3d11Backend::deviceCaps(Device& dev, BgpuCaps& out) {
     (void)dev;
+    /* ABI 3：光照（PS 里做固定功能 Lambert）与透视校正（网格 VS 读 w，PS 按 1/w 加权）
+     * 都在这一版实现了，如实上报；GL / VK 那边各自上报自己的。 */
     out.flags = BGPU_CAP_DEPTH | BGPU_CAP_OFFSCREEN | BGPU_CAP_READBACK | BGPU_CAP_PRESENT_PACES |
-                BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH;
+                BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH |
+                BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
     out.max_texture_size = BGPU_MAX_TEXTURE_SIZE;
     out.max_frames_in_flight = 1;   /* 立即上下文：Present 之后不等 GPU */
     out.msaa_samples = 1;           /* 与 CPU 参考后端一致（0 差验收的前提） */
@@ -1182,9 +1203,13 @@ BgpuResult D3d11Backend::bindState(D3dCmdObj& c, D3dDeviceObj& d, Pipeline& pipe
         c.last_il = il;
     }
 
-    /* 顶点/像素着色器与视图大小无关，一个 pass 只绑一次 */
+    /* 顶点着色器跟着布局走（2D / 网格是两个入口）；像素着色器与拓扑每 pass 一次 */
+    ID3D11VertexShader* vs = pipe.layout == BGPU_VERTEX_MESH ? d.vs_mesh.p : d.vs.p;
+    if (vs != c.last_vs) {
+        d.ctx->VSSetShader(vs, nullptr, 0);
+        c.last_vs = vs;
+    }
     if (!c.have_shaders) {
-        d.ctx->VSSetShader(d.vs.p, nullptr, 0);
         d.ctx->PSSetShader(d.ps.p, nullptr, 0);
         d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         c.have_shaders = true;
@@ -1239,7 +1264,8 @@ bool D3d11Backend::applyScissor(D3dCmdObj& c, D3dTextureObj& target) {
     return true;
 }
 
-void D3d11Backend::updateConstants(D3dCmdObj& c, D3dDeviceObj& d, D3dTextureObj& target) {
+void D3d11Backend::updateConstants(D3dCmdObj& c, D3dDeviceObj& d, D3dTextureObj& target,
+                                   Pipeline& pipe) {
     PushConstants pc{};
     pc.vp[0] = c.vp[0];
     pc.vp[1] = c.vp[1];
@@ -1260,9 +1286,29 @@ void D3d11Backend::updateConstants(D3dCmdObj& c, D3dDeviceObj& d, D3dTextureObj&
         pc.xf0[0] = 1.0f;
         pc.xf1[1] = 1.0f;
     }
+    /* ABI 3：光照参数（Cmd::light 已由 API 层校验：方向是单位向量才放行）+ 两个开关。
+     * 不开光照时也照抄三组值：PS 只在 lightDir.w > 0.5 时才用它们。 */
+    pc.light_dir[0] = c.light.dir[0];
+    pc.light_dir[1] = c.light.dir[1];
+    pc.light_dir[2] = c.light.dir[2];
+    pc.light_dir[3] = (pipe.pipe_flags & BGPU_PIPE_LIGHTING) ? 1.0f : 0.0f;
+    pc.light_color[0] = c.light.color[0];
+    pc.light_color[1] = c.light.color[1];
+    pc.light_color[2] = c.light.color[2];
+    pc.light_amb[0] = c.light.ambient[0];
+    pc.light_amb[1] = c.light.ambient[1];
+    pc.light_amb[2] = c.light.ambient[2];
+    /* 透视校正只对网格布局有意义：2D 顶点没有 w，走原样插值（逐位等于 v0.5.x 的路径）。 */
+    pc.flags[0] = (pipe.layout == BGPU_VERTEX_MESH) ? 1.0f : 0.0f;
+    /* 不开纹理时 PS 直接取精确的 (1,1,1,1)：CPU 的非纹理路径不乘纹理，
+     * 而"绑一张白纹理"采样回来是 0.99999994（UNORM 的 1/255 表示误差），
+     * 会在 0.1*255=25.5 这类半点上把结果压成 25（CPU 是 26）。 */
+    pc.flags[1] = (pipe.pipe_flags & BGPU_PIPE_TEXTURED) ? 1.0f : 0.0f;
     d.ctx->UpdateSubresource(d.cb.p, 0, nullptr, &pc, 0, 0);
     if (!c.have_cb) {
-        d.ctx->VSSetConstantBuffers(0, 1, &d.cb.p);
+        ID3D11Buffer* cb = d.cb.p;
+        d.ctx->VSSetConstantBuffers(0, 1, &cb);
+        d.ctx->PSSetConstantBuffers(0, 1, &cb);   /* PS 现在也读 b0（光照/透视开关） */
         c.have_cb = true;
     }
 }
@@ -1357,6 +1403,7 @@ BgpuResult D3d11Backend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
     c.last_ds = nullptr;
     c.last_rs = nullptr;
     c.last_il = nullptr;
+    c.last_vs = nullptr;
     c.last_srv = nullptr;
     c.last_samp = nullptr;
     c.have_shaders = false;
@@ -1700,7 +1747,7 @@ BgpuResult D3d11Backend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t
     const UINT vbytes = quad_count * 4u * static_cast<UINT>(sizeof(BgpuVertex));
     const D3D11_BOX box{0, 0, 0, vbytes, 1, 1};
     d.ctx->UpdateSubresource(c.vbuf.p, 0, &box, verts, 0, 0);
-    updateConstants(c, d, target);
+    updateConstants(c, d, target, *c.pipe);
 
     UINT stride = sizeof(BgpuVertex);
     UINT offset = 0;
@@ -1730,7 +1777,7 @@ BgpuResult D3d11Backend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_off
     if (!vbo.buf || !ibo.buf) {
         return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "顶点/索引缓冲无效");
     }
-    updateConstants(c, d, target);
+    updateConstants(c, d, target, *c.pipe);
     /* 偏移是**字节**（raster_rules §11），D3D11 的两个偏移参数正好也是字节 */
     UINT stride = sizeof(BgpuMeshVertex);
     d.ctx->IASetVertexBuffers(0, 1, &vbo.buf.p, &stride, &vertex_offset);

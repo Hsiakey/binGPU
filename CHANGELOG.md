@@ -4,6 +4,51 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.6.1] - 2026-11-19
+
+**三个 GPU 后端补上 ABI 3**（0.6.0 只落了 CPU 参考实现）。ABI 不变（ABI 3），
+变的只是"自报不支持"变成"真的支持"：VK / D3D11 / GL 的 caps 现在都带
+`BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE`。
+
+### 各后端做了什么
+
+| 后端 | VS | PS/FS | 光照参数 |
+|---|---|---|---|
+| Vulkan | 5 个输入（+normal@3、w@4），四个插值量标 `noperspective`；`gl_Position.w` 恒 1 | `Σ(attr·iw)/Σ(iw)`；Lambert | push constant 64 → **112 字节** |
+| D3D11 | 拆成 `vs`(2D) / `vs_mesh` / `ps` 三个入口（input layout 必须覆盖 VS 全部语义）；`il_mesh` stride 40 | 同上 | cbuffer 64 → 128 字节 |
+| OpenGL | 加 attrib 3/4，2D 路径显式 `glDisableVertexAttribArray(3/4)`（取默认 0 → iw=1，与 ABI 2 逐位相同） | 同上 | `glUniform3fv` |
+
+### 一个三端都踩到的坑：GPU 帧缓冲写入的 `.5` 是向下收的
+
+CPU 的 q8 是 `(int)(v·255+0.5)`（`.5` 向上），而三个后端的 float→UNORM8 在平局处
+**向下**：实测 0.1/0.3/0.5 写进 RGBA8 得 25/76/127。环境光 0.1 正好踩在平局点上
+（`0.1×255 = 25.5`），于是同一份光照公式 CPU 给 26、GPU 给 25。
+
+第一版的处理是"把测试的 ambient 换成 0.12 绕开"——那是回避。真正的修法是让片元在
+光照分支里**先按 CPU 的口径量化到 8 位**（`floor(v*255+0.5)/255`）再交给写入路径，
+之后误差 < 1/255 LSB，两种舍入规则落到同一个整数。三端都这么改了，测试的 ambient
+也回到 0.1 —— 这条断言现在同时盯着"光照公式"和"量化口径"两件事。
+
+另两个同类的小坑：**不采样纹理时不要绑白纹理凑数**（UNORM 白采样回来是 0.99999994，
+同样会把 .5 边界压下去），按 `flags.y` 直接返回精确 (1,1,1,1)；**插值量必须标
+`noperspective`**，否则硬件先做一遍自己的 1/w，恒定属性插值出 0.99999994。
+
+### 用例收口
+
+`lighting` / `perspective` 两个场景从 VK 的 test 搬进了 `tests/gpu_parity.h` ——
+一份场景，三端自动覆盖，0 容差。判据与 `test_cpu_render.c` 的手算值同源
+（255 / 26 / 206，u=0.5625 vs 0.2432）。
+
+### 验证
+
+```
+test_abi          247 ✓
+test_cpu_render   378 ✓（含 [lighting] / [perspective]）
+test_vk_render     15 ✓（13 + ABI 3 两项，三端全 0 差异）
+test_d3d11_render  15 ✓
+test_gl_render     15 ✓
+```
+
 ## [0.6.0] - 2026-11-19
 
 **ABI 3：固定功能光照 + 透视校正**。这两条是 bin3d 的 GPU 阶段能不能开的前提，

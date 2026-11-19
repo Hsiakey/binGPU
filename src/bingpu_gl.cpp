@@ -299,6 +299,7 @@ struct GlFns {
     void(APIENTRY* glBindVertexArray)(GLuint) = nullptr;
     void(APIENTRY* glDeleteVertexArrays)(GLsizei, const GLuint*) = nullptr;
     void(APIENTRY* glEnableVertexAttribArray)(GLuint) = nullptr;
+    void(APIENTRY* glDisableVertexAttribArray)(GLuint) = nullptr;
     void(APIENTRY* glVertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei,
                                           const void*) = nullptr;
     GLuint(APIENTRY* glCreateShader)(GLenum) = nullptr;
@@ -318,6 +319,7 @@ struct GlFns {
     void(APIENTRY* glUniform1i)(GLint, GLint) = nullptr;
     void(APIENTRY* glUniform1f)(GLint, GLfloat) = nullptr;
     void(APIENTRY* glUniform2fv)(GLint, GLsizei, const GLfloat*) = nullptr;
+    void(APIENTRY* glUniform3fv)(GLint, GLsizei, const GLfloat*) = nullptr;
     void(APIENTRY* glUniform4fv)(GLint, GLsizei, const GLfloat*) = nullptr;
 };
 
@@ -447,6 +449,7 @@ bool loadGlFunctions() {
     BGPU_GL_FN(glBindVertexArray);
     BGPU_GL_FN(glDeleteVertexArrays);
     BGPU_GL_FN(glEnableVertexAttribArray);
+    BGPU_GL_FN(glDisableVertexAttribArray);
     BGPU_GL_FN(glVertexAttribPointer);
     BGPU_GL_FN(glCreateShader);
     BGPU_GL_FN(glShaderSource);
@@ -465,6 +468,7 @@ bool loadGlFunctions() {
     BGPU_GL_FN(glUniform1i);
     BGPU_GL_FN(glUniform1f);
     BGPU_GL_FN(glUniform2fv);
+    BGPU_GL_FN(glUniform3fv);
     BGPU_GL_FN(glUniform4fv);
 #undef BGPU_GL_FN
     if (trace4()) std::fprintf(stderr, "[gl] loadGlFunctions ok=%d\n", (int)ok);
@@ -473,18 +477,44 @@ bool loadGlFunctions() {
 
 /* ---------------------------------------------------------------
  * 着色器（GLSL 330 core，与 quad.vert/quad.frag、quad.hlsl 逐行同构）
+ *
+ * ABI 3 加进来的两条能力都只落在这一对着色器里（GL 没有别的着色器通路）：
+ *
+ *   ① 透视校正：MESH 顶点带裁剪空间原始 w，属性按 Σ(attr/w·λ)/Σ(1/w·λ) 插值。
+ *      GL 的插值本身是**屏幕空间**线性（本后端的 gl_Position.w 恒为 1，位置进来时
+ *      已经除过 w），所以校正只能自己做：VS 把 `attr·(1/w)` 与 `1/w` 一起送到 FS，
+ *      FS 做一次除法。这就是 CPU 的 shade_general 用的同一条公式。
+ *      2D 顶点没有 w 字段（属性数组不启用 → 泛型属性默认 0）→ iw 恒 1，
+ *      `vUvOverW * invIw` 与 ABI 2 的 `vUv` 逐位相同，老用例一个像素都不该动。
+ *
+ *   ② 固定功能 Lambert：直通 · vcol · tex，再 × (ambient + color·max(dot(n,dir),0))，
+ *      **在直通空间 clamp 到 [0,1] 再乘 alpha**。frag 是预乘的，所以要先 ÷alpha
+ *      还原直通（alpha≈0 时颜色没有意义，给 0，与 CPU 的 invA 分支一致）——
+ *      先乘光照再 clamp 会差一个 alpha 因子，那是三端不一致的老坑。
+ *      顶点色按 CPU 的口径**不做**透视校正（CPU 也是屏幕空间线性插值颜色）。
+ *
+ *      还有一处必须写在着色器里：直通值在离开之前先量化成 8 位（floor(v*255+0.5)/255）。
+ *      CPU 参考后端本来就是在写像素时 q8 的，而 GPU 的帧缓冲写入**不是**四舍五入：
+ *      实测（RTX 4060 Ti / 驱动 610.88）0.1→25、0.3→76、0.5→127、0.9→229（这些值乘 255
+ *      正好落在 .5 上，一律向下收），而 0.8071（乘 255 = 205.81）正常进位成 206 ——
+ *      即写入路径把定标后的值截断了。不先量化的话，"back-lit 只剩 ambient=0.1 → 26"
+ *      这条手算判据（tests/test_cpu_render.c 的 [lighting]）就差 1 个 LSB。
  * --------------------------------------------------------------- */
 const char* kVertSrc =
     "#version 330 core\n"
     "layout(location = 0) in vec3 inPos;\n"
     "layout(location = 1) in vec2 inUv;\n"
     "layout(location = 2) in vec4 inColor;\n"
+    "layout(location = 3) in vec3 inNormal;  // MESH only; array disabled for 2D\n"
+    "layout(location = 4) in float inW;      // clip-space w; 0 == 1 (2D uses default 0)\n"
     "uniform vec4 uVp;     // x, y, w, h（目标像素）\n"
     "uniform vec2 uTarget; // 目标尺寸\n"
     "uniform vec4 uXf0;    // 仿射第 0 行 a, c, e；w = 是否打开\n"
     "uniform vec4 uXf1;    // 仿射第 1 行 b, d, f\n"
     "uniform float uFlip;  // 1 = 默认帧缓冲（图像原来的 y 朝上）\n"
-    "out vec2 vUv;\n"
+    "out vec2 vUvOverW;\n"
+    "out vec3 vNormalOverW;\n"
+    "out float vIW;\n"
     "out vec4 vColor;\n"
     "void main() {\n"
     "  vec2 s = vec2(uVp.x + (inPos.x / uTarget.x) * uVp.z,\n"
@@ -496,20 +526,45 @@ const char* kVertSrc =
     "  float yDown = s.y / uTarget.y * 2.0 - 1.0;\n"
     "  float yUp = 1.0 - s.y / uTarget.y * 2.0;\n"
     "  gl_Position = vec4(s.x / uTarget.x * 2.0 - 1.0, mix(yDown, yUp, uFlip), inPos.z, 1.0);\n"
-    "  vUv = inUv;\n"
+    "  float iw = (inW > 1e-9) ? (1.0 / inW) : 1.0;\n"
+    "  vIW = iw;\n"
+    "  vUvOverW = inUv * iw;\n"
+    "  vNormalOverW = inNormal * iw;\n"
     "  vColor = inColor.zyxw;   // 内存 (B,G,R,A) -> (R,G,B,A)\n"
     "}\n";
 
 const char* kFragSrc =
     "#version 330 core\n"
-    "in vec2 vUv;\n"
+    "in vec2 vUvOverW;\n"
+    "in vec3 vNormalOverW;\n"
+    "in float vIW;\n"
     "in vec4 vColor;\n"
     "uniform sampler2D uTex;\n"
+    "uniform float uLightOn;\n"
+    "uniform vec3 uLightDir;\n"
+    "uniform vec3 uLightColor;\n"
+    "uniform vec3 uLightAmbient;\n"
     "out vec4 outColor;\n"
     "void main() {\n"
-    "  vec4 t = texture(uTex, vUv);\n"   // 纹理是预乘的
+    "  float invIw = (vIW > 1e-9) ? (1.0 / vIW) : 1.0;\n"
+    "  vec4 t = texture(uTex, vUvOverW * invIw);\n"   // 纹理是预乘的
     "  float a = vColor.a;\n"
-    "  outColor = vec4(t.rgb * vColor.rgb * a, t.a * a);\n"
+    "  vec3 rgb = t.rgb * vColor.rgb * a;\n"
+    "  float alpha = t.a * a;\n"
+    "  if (uLightOn > 0.5) {\n"
+    "    vec3 nraw = vNormalOverW * invIw;\n"
+    "    float nlen2 = dot(nraw, nraw);\n"
+    "    float ndl = 0.0;\n"
+    "    if (nlen2 > 1e-12) {\n"
+    "      ndl = max(dot(nraw * inversesqrt(nlen2), uLightDir), 0.0);\n"
+    "    }\n"
+    "    vec3 lit = uLightAmbient + uLightColor * ndl;\n"
+    "    float invA = (alpha > 1e-6) ? (1.0 / alpha) : 0.0;\n"
+    "    vec3 srgb = clamp(rgb * invA * lit, 0.0, 1.0);\n"
+    "    srgb = floor(srgb * 255.0 + 0.5) / 255.0;\n"
+    "    rgb = srgb * alpha;\n"
+    "  }\n"
+    "  outColor = vec4(rgb, alpha);\n"
     "}\n";
 
 /* ---------------------------------------------------------------
@@ -593,6 +648,8 @@ struct GlDeviceObj final : Device {
     GLuint vao = 0;
     GLuint prog = 0;
     GLint u_vp = -1, u_target = -1, u_xf0 = -1, u_xf1 = -1, u_flip = -1, u_tex = -1;
+    /* ABI 3：光照 uniform（LIGHTING 管线才推进去；2D/无光照时 uLightOn=0） */
+    GLint u_light_on = -1, u_light_dir = -1, u_light_color = -1, u_light_ambient = -1;
     GLuint def_samp = 0;
     BgpuTexture white_handle = BGPU_INVALID;
     GlTextureObj* white = nullptr;
@@ -943,6 +1000,10 @@ bool GlBackend::compileProgram(GlDeviceObj& d) {
     d.u_xf1 = g_gl.glGetUniformLocation(d.prog, "uXf1");
     d.u_flip = g_gl.glGetUniformLocation(d.prog, "uFlip");
     d.u_tex = g_gl.glGetUniformLocation(d.prog, "uTex");
+    d.u_light_on = g_gl.glGetUniformLocation(d.prog, "uLightOn");
+    d.u_light_dir = g_gl.glGetUniformLocation(d.prog, "uLightDir");
+    d.u_light_color = g_gl.glGetUniformLocation(d.prog, "uLightColor");
+    d.u_light_ambient = g_gl.glGetUniformLocation(d.prog, "uLightAmbient");
     g_gl.glUseProgram(d.prog);
     if (d.u_tex >= 0) g_gl.glUniform1i(d.u_tex, 0);
     return true;
@@ -1055,7 +1116,9 @@ void GlBackend::deviceCaps(Device& dev, BgpuCaps& out) {
     GLint max_tex = 0;
     if (activate(d)) g_gl.glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
     out.flags = BGPU_CAP_DEPTH | BGPU_CAP_OFFSCREEN | BGPU_CAP_READBACK | BGPU_CAP_PRESENT_PACES |
-                BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH;
+                BGPU_CAP_VSYNC | BGPU_CAP_SAMPLERS | BGPU_CAP_AFFINE | BGPU_CAP_MESH |
+                /* ABI 3：固定功能光照（uniform 驱动）与透视校正（网格顶点带 w）。 */
+                BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
     out.max_texture_size = std::min<uint32_t>(BGPU_MAX_TEXTURE_SIZE,
                                               max_tex > 0 ? static_cast<uint32_t>(max_tex)
                                                           : BGPU_MAX_TEXTURE_SIZE);
@@ -1511,6 +1574,17 @@ void GlBackend::updateUniforms(GlCmdObj& c, GlDeviceObj& d, GlTextureObj& target
     if (d.u_xf0 >= 0) g_gl.glUniform4fv(d.u_xf0, 1, xf0);
     if (d.u_xf1 >= 0) g_gl.glUniform4fv(d.u_xf1, 1, xf1);
     if (d.u_flip >= 0) g_gl.glUniform1f(d.u_flip, target.window_target ? 1.0f : 0.0f);
+
+    /* ABI 3 光照：开关每笔都推（值取管线位），参数只在开着时推。
+     * `c.light` 由基类的 setLight 存好（默认值 dir=(0,1,0)/color=1/ambient=0.1，
+     * 与 CPU 后端、bin3d 的 ShadeCtx 一致），这里只负责"让 GPU 看见"。 */
+    const bool lighting = c.pipe && (c.pipe->pipe_flags & BGPU_PIPE_LIGHTING) != 0;
+    if (d.u_light_on >= 0) g_gl.glUniform1f(d.u_light_on, lighting ? 1.0f : 0.0f);
+    if (lighting) {
+        if (d.u_light_dir >= 0) g_gl.glUniform3fv(d.u_light_dir, 1, c.light.dir);
+        if (d.u_light_color >= 0) g_gl.glUniform3fv(d.u_light_color, 1, c.light.color);
+        if (d.u_light_ambient >= 0) g_gl.glUniform3fv(d.u_light_ambient, 1, c.light.ambient);
+    }
 }
 
 /* ---------------------------------------------------------------
@@ -1851,10 +1925,15 @@ BgpuResult GlBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
     g_gl.glBufferSubData(GL_ARRAY_BUFFER, 0, vbytes, verts);
     g_gl.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, c.ibuf);
 
-    /* 属性指针是 VAO 状态，每笔都重指（3 次调用，换来"缓冲随时换"的自由） */
+    /* 属性指针是 VAO 状态，每笔都重指（3 次调用，换来"缓冲随时换"的自由）。
+     * 3/4 是 MESH 独有的法线/原始 w：2D 顶点只有 24 字节，必须**关掉**（否则读越界），
+     * 关掉之后着色器读到泛型属性的默认值 —— inW 拿到 0 → iw 恒 1，
+     * 与 ABI 2 的"屏幕空间线性插值"逐位相同。 */
     g_gl.glEnableVertexAttribArray(0);
     g_gl.glEnableVertexAttribArray(1);
     g_gl.glEnableVertexAttribArray(2);
+    g_gl.glDisableVertexAttribArray(3);
+    g_gl.glDisableVertexAttribArray(4);
     g_gl.glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(BgpuVertex),
                                reinterpret_cast<const void*>(0));
     g_gl.glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(BgpuVertex),
@@ -1894,6 +1973,10 @@ BgpuResult GlBackend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset
     g_gl.glEnableVertexAttribArray(0);
     g_gl.glEnableVertexAttribArray(1);
     g_gl.glEnableVertexAttribArray(2);
+    g_gl.glEnableVertexAttribArray(3);
+    g_gl.glEnableVertexAttribArray(4);
+    /* BgpuMeshVertex 40 字节：xyz(0) nxyz(12) uv(24) color(32) w(36)。
+     * 最后那个 float w 是 ABI 3 的透视校正源头（0 视为 1，着色器里判）。 */
     const GLsizei stride = sizeof(BgpuMeshVertex);
     g_gl.glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride,
                                reinterpret_cast<const void*>(static_cast<size_t>(vertex_offset)));
@@ -1901,6 +1984,10 @@ BgpuResult GlBackend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset
                                reinterpret_cast<const void*>(static_cast<size_t>(vertex_offset) + 24));
     g_gl.glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride,
                                reinterpret_cast<const void*>(static_cast<size_t>(vertex_offset) + 32));
+    g_gl.glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, stride,
+                               reinterpret_cast<const void*>(static_cast<size_t>(vertex_offset) + 12));
+    g_gl.glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride,
+                               reinterpret_cast<const void*>(static_cast<size_t>(vertex_offset) + 36));
     g_gl.glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(index_count), GL_UNSIGNED_INT,
                         reinterpret_cast<const void*>(static_cast<size_t>(index_offset)));
     if (glFail("draw_indexed") != BGPU_OK) {
