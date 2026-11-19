@@ -4,6 +4,39 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.7.0] - 2026-11-20
+
+**上传可以声明"数据已经是预乘"**，省掉一次整幅转换（ABI 不变，仍为 3）。
+新增一个 `BgpuTextureDesc::flags` 位，属于"解释方式"的变化，不影响任何结构体布局。
+
+### 起因
+
+bin2d 的 `Surface` 本来就是预乘 RGBA。以前上屏要把它**反预乘**成直通喂给 bingpu，
+后端上传时再**预乘**回来（`premultiply()`）——一趟往返，纯浪费且有舍入。1020×684 的一帧：
+
+| | 改前 | 改后 |
+|---|---|---|
+| 上传（含转换） | 4.79 ms | **0.10 ms** |
+| present 的 CPU 工作 | 5.09 ms | **0.59 ms** |
+
+### 改动
+
+- `BGPU_TEXTURE_PREMULTIPLIED = 1u << 4`：纹理内容已是预乘。三个后端在整幅与局部上传时
+  都跳过 `premultiply()`；CPU 参照后端同样认这个位（否则 GPU 与参照会分叉）。
+- 顺带修掉上传路径的中转缓冲：行紧凑时 GL/VK **不再分配** 2.8 MB 中转再整幅 memcpy，
+  D3D11 直接把调用方指针交给 `UpdateSubresource`（连行拷贝都省）。
+- `present_paces_frames` / `BGPU_DEVICE_VSYNC` 现在真的被上层用上了（bin2d 0.14.0 的
+  `GpuCompositor::createWindow(..., vsync)`），这里只是确认语义：**声明**的是交换链模式，
+  驱动是否真的阻塞由 backend 决定，上层不要只凭这一位判断"能否掐拍"。
+
+### 门禁
+
+bin2D `make test` 全绿（test_gpu_bridge 20 项，新增"预乘直传不多预乘"四条，四端用读回值
+判定：正确读出 (20,40,60)，多预乘一次会变 (10,20,30)）；binUI `make pixels-bin2d` 18/18
+容差 0、`pixels` / `pixels-vk` / `pixels-d3d11` 全绿 —— **像素 ±1 一个都没有**，因为
+Surface 的预乘与 `premultiply()` 是同一个整数公式 `(c·a+127)/255`。
+
+---
 ## [0.6.1] - 2026-11-19
 
 **三个 GPU 后端补上 ABI 3**（0.6.0 只落了 CPU 参考实现）。ABI 不变（ABI 3），

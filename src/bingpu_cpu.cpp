@@ -1052,12 +1052,18 @@ public:
         }
         const uint8_t* src = static_cast<const uint8_t*>(pixels);
         uint8_t* base = tex.data();
+        const bool premulInput = (tex.tex_flags & BGPU_TEXTURE_PREMULTIPLIED) != 0;
         for (uint32_t y = 0; y < h; y++) {
             const uint8_t* srow = src + static_cast<size_t>(y) * row;
             uint8_t* drow = base + (static_cast<size_t>(y0 + y) * tex.w + x0) * bpp;
             for (uint32_t x = 0; x < w; x++) {
                 const uint8_t* s = srow + static_cast<size_t>(x) * bpp;
                 uint8_t* d = drow + static_cast<size_t>(x) * bpp;
+                if (premulInput) {
+                    /* 调用方给的就是预乘：原样存（GPU 三端同样跳过 premultiply） */
+                    for (uint32_t k = 0; k < bpp; k++) d[k] = s[k];
+                    continue;
+                }
                 if (tex.fmt == BGPU_FORMAT_R8) {
                     d[0] = s[0];   /* 遮罩：原样存，采样时当作 (v,v,v,v) */
                 } else if (tex.fmt == BGPU_FORMAT_BGRA8) {

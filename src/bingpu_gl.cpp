@@ -1232,19 +1232,30 @@ BgpuResult GlBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
                     cat("stride=", src_stride, " 小于一行 ", b.w * bpp, " 字节"));
     }
     /* 先压成紧凑行（GL 的 UNPACK_ROW_LENGTH 要 3.0+，但紧凑行更省事也更可控），
-     * 再预乘 —— 局部上传也要预乘，与 CPU/VK/D3D11 完全一致。 */
-    std::vector<uint8_t> tmp(static_cast<size_t>(b.w) * b.h * bpp);
-    for (uint32_t y = 0; y < b.h; y++) {
-        std::memcpy(tmp.data() + static_cast<size_t>(y) * b.w * bpp,
-                    static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * src_stride,
-                    static_cast<size_t>(b.w) * bpp);
+     * 再预乘 —— 局部上传也要预乘，与 CPU/VK/D3D11 完全一致。
+     *
+     * 两个例外可以省掉这块临时缓冲（bin2d 的上屏路径每帧都走这条）：
+     *   · 纹理建的时候带了 BGPU_TEXTURE_PREMULTIPLIED（数据本来就是预乘的，不用预乘）；
+     *   · 行本来就是紧凑的（src_stride == b.w*bpp，不用压行）。
+     * 两条都满足时直接把调用方的指针交给驱动 —— 2.8MB 的分配 + 一次整幅 memcpy 就没了。 */
+    const bool premulInput = (t.tex_flags & BGPU_TEXTURE_PREMULTIPLIED) != 0;
+    const uint8_t* src = static_cast<const uint8_t*>(pixels);
+    std::vector<uint8_t> tmp;
+    if (!premulInput || src_stride != b.w * bpp) {
+        tmp.resize(static_cast<size_t>(b.w) * b.h * bpp);
+        for (uint32_t y = 0; y < b.h; y++) {
+            std::memcpy(tmp.data() + static_cast<size_t>(y) * b.w * bpp,
+                        static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * src_stride,
+                        static_cast<size_t>(b.w) * bpp);
+        }
+        if (!premulInput && bpp == 4) premultiply(tmp.data(), static_cast<size_t>(b.w) * b.h);
+        src = tmp.data();
     }
-    if (bpp == 4) premultiply(tmp.data(), static_cast<size_t>(b.w) * b.h);
 
     g_gl.glBindTexture(GL_TEXTURE_2D, t.tex);
     g_gl.glTexSubImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(b.x), static_cast<GLint>(b.y),
                          static_cast<GLsizei>(b.w), static_cast<GLsizei>(b.h),
-                         toGlExternal(t.fmt), GL_UNSIGNED_BYTE, tmp.data());
+                         toGlExternal(t.fmt), GL_UNSIGNED_BYTE, src);
     if (glFail("glTexSubImage2D") != BGPU_OK) {
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "glTexSubImage2D 失败");
     }

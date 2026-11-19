@@ -1211,16 +1211,27 @@ BgpuResult VkBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
     const uint32_t src_stride = stride ? stride : b.w * bpp;
     const uint32_t bytes = b.w * b.h * bpp;
 
-    std::vector<uint8_t> tmp(bytes);
-    for (uint32_t y = 0; y < b.h; y++) {
-        std::memcpy(tmp.data() + static_cast<size_t>(y) * b.w * bpp,
-                    static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * src_stride,
-                    static_cast<size_t>(b.w) * bpp);
-    }
     /* 直通 → 预乘：**局部上传也要预乘**（CPU 是按区域预乘的；只在整张上传时预乘
      * 会让"局部更新的半透明贴图"混出偏亮的结果 —— 0.3.0 就是这么写的，
-     * tests/gpu_parity.h 的 texture(box) 用例把它钉住了）。 */
-    if (bpp == 4) premultiply(tmp.data(), static_cast<size_t>(b.w) * b.h);
+     * tests/gpu_parity.h 的 texture(box) 用例把它钉住了）。
+     *
+     * 两个例外连这块临时缓冲都不必分配（bin2d 的上屏路径每帧都走这条）：
+     *   · 纹理带 BGPU_TEXTURE_PREMULTIPLIED（数据本来就是预乘，不用预乘）；
+     *   · 行本来就紧凑（src_stride == b.w*bpp，不用压行）。
+     * 都满足时直接把调用方的指针 memcpy 进暂存缓冲，省掉一次整幅中转。 */
+    const bool premulInput = (t.tex_flags & BGPU_TEXTURE_PREMULTIPLIED) != 0;
+    const uint8_t* src = static_cast<const uint8_t*>(pixels);
+    std::vector<uint8_t> tmp;
+    if (!premulInput || src_stride != b.w * bpp) {
+        tmp.resize(bytes);
+        for (uint32_t y = 0; y < b.h; y++) {
+            std::memcpy(tmp.data() + static_cast<size_t>(y) * b.w * bpp,
+                        static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * src_stride,
+                        static_cast<size_t>(b.w) * bpp);
+        }
+        if (!premulInput && bpp == 4) premultiply(tmp.data(), static_cast<size_t>(b.w) * b.h);
+        src = tmp.data();
+    }
 
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory staging_mem = VK_NULL_HANDLE;
@@ -1229,7 +1240,7 @@ BgpuResult VkBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
     if (!allocHostBuffer(d, bytes, &staging, &staging_mem, &staging_map)) {
         return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "上传暂存分配失败");
     }
-    std::memcpy(staging_map, tmp.data(), bytes);
+    std::memcpy(staging_map, src, bytes);
 
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo cbi{};

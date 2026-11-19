@@ -71,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 6
-#define BINGPU_VERSION_PATCH 1
-#define BINGPU_VERSION_STRING "0.6.1"
+#define BINGPU_VERSION_MINOR 7
+#define BINGPU_VERSION_PATCH 0
+#define BINGPU_VERSION_STRING "0.7.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -331,7 +331,13 @@ typedef enum BgpuTextureFlag {
     BGPU_TEXTURE_RENDER_TARGET = 1u << 0, /* 可当渲染目标（离屏图层 / 视口 / 出图） */
     BGPU_TEXTURE_CPU_READ = 1u << 1,      /* 允许 texture_read 回读 */
     BGPU_TEXTURE_DYNAMIC = 1u << 2,       /* 每帧 upload 覆盖（视频帧 / 动态位图） */
-    BGPU_TEXTURE_MIPMAPS = 1u << 3        /* 生成 mip 链（缩小时不闪） */
+    BGPU_TEXTURE_MIPMAPS = 1u << 3,       /* 生成 mip 链（缩小时不闪） */
+    /* 上传的数据**已经是预乘**的：后端跳过 straight→premul 这一步，原样存进去。
+     * 给"上游本来就是预乘"的场景用（bin2D 的 Surface 就是预乘，每帧整张直传），
+     * 省掉一次反预乘 + 再预乘的往返 —— 那趟往返每帧要多分配一块同尺寸的直通缓冲、
+     * 再做 3×像素数 次整数除法，而且不是无损的。
+     * 只影响 upload 的**解释方式**：纹理在采样/混合里始终按预乘参与（与其他纹理一致）。 */
+    BGPU_TEXTURE_PREMULTIPLIED = 1u << 4
 } BgpuTextureFlag;
 
 typedef struct BgpuTextureDesc {

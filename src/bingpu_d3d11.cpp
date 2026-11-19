@@ -949,6 +949,27 @@ BgpuResult D3d11Backend::textureUpload(Texture& tex, const BgpuBox* box, const v
      * 现在：先在普通内存里把这一段的行**连续**排好并预乘，再一次 UpdateSubresource
      * 写进目标纹理的 (b.x,b.y) 区域。代价是一次额外拷贝（分配复用 thread_local 缓冲），
      * 换来的是驱动侧的正常上传路径。 */
+    /* 注意参数顺序：**目的**区域在 box 里，源数据用 srcRowPitch/srcDepthPitch 描述。
+     * box 传 nullptr 才是"整张"；局部上传必须给 (x,y)。 */
+    D3D11_BOX dst_box{};
+    dst_box.left = b.x;
+    dst_box.top = b.y;
+    dst_box.front = 0;
+    dst_box.right = b.x + b.w;
+    dst_box.bottom = b.y + b.h;
+    dst_box.back = 1;
+    const bool whole = (b.x == 0 && b.y == 0 && b.w == t.w && b.h == t.h);
+
+    if (t.tex_flags & BGPU_TEXTURE_PREMULTIPLIED) {
+        /* 调用方给的已经是预乘：连行也不需要重排 —— UpdateSubresource 本来就按
+         * srcRowPitch 逐行读，直接拿调用方的指针 + 它的行距即可（box 上传时 D3D11
+         * 从 pSrcData 的"box 首行"开始读，正好等于 surface.row(y0) + x0*4）。
+         * bin2d 的上屏路径每帧都走这条：0 次分配、0 次预乘、0 次行拷贝。 */
+        d.ctx->UpdateSubresource(t.tex.p, 0, whole ? nullptr : &dst_box, pixels, src_stride, 0);
+        d.bytes_uploaded += static_cast<uint64_t>(b.w) * b.h * bpp;
+        return BGPU_OK;
+    }
+
     const uint32_t dst_row = b.w * bpp;
     std::vector<uint8_t>& scratch = uploadScratch();
     scratch.resize(static_cast<size_t>(dst_row) * b.h);
@@ -962,16 +983,6 @@ BgpuResult D3d11Backend::textureUpload(Texture& tex, const BgpuBox* box, const v
         if (bpp == 4) premultiply(drow, b.w);
     }
 
-    /* 注意参数顺序：**目的**区域在 box 里，源数据用 srcRowPitch/srcDepthPitch 描述。
-     * box 传 nullptr 才是"整张"；局部上传必须给 (x,y)。 */
-    D3D11_BOX dst_box{};
-    dst_box.left = b.x;
-    dst_box.top = b.y;
-    dst_box.front = 0;
-    dst_box.right = b.x + b.w;
-    dst_box.bottom = b.y + b.h;
-    dst_box.back = 1;
-    const bool whole = (b.x == 0 && b.y == 0 && b.w == t.w && b.h == t.h);
     d.ctx->UpdateSubresource(t.tex.p, 0, whole ? nullptr : &dst_box, scratch.data(), dst_row, 0);
     d.bytes_uploaded += static_cast<uint64_t>(b.w) * b.h * bpp;
     return BGPU_OK;
