@@ -152,6 +152,122 @@ static int render(BgpuBackendKind kind, uint8_t* out, int* out_cov_count) {
     return 1;
 }
 
+/* ② 混画：**同一条命令缓冲里 2D 四边形与形状交错**。
+ *
+ * 这一条钉的是两个实现细节，都是实测撞出来的（不是防御性编程）：
+ *   · Vulkan 的顶点流是 2D（24 字节）与形状（36 字节）共用的一段字节。追加前必须把
+ *     游标对齐到本笔的 stride，否则 `vused / stride` 截断 —— 先画一个四边形（96 字节）
+ *     再画形状时 96/36 = 2，顶点从第 72 字节读，读到上一笔的尾巴，**形状整块不见**。
+ *     症状是"一整条圆角在 VK 上消失"，只有交错时出现（单独画形状永远是 0 对齐）。
+ *   · GL 的程序是 begin_render 时 glUseProgram 一次就再不切回来：形状画完必须把 quad
+ *     的程序装回去，否则下一笔 draw_quads 会拿形状的程序去解 2D 顶点（驱动报
+ *     INVALID_OPERATION，整笔失败）。
+ *
+ * 两个 bug 都只在"形状后面还有 2D"时暴露，所以判据只能是四端逐像素一致。
+ */
+static int render_mixed(BgpuBackendKind kind, uint8_t* out) {
+    BgpuDevice dev = BGPU_INVALID;
+    BgpuSwapchain sc = BGPU_INVALID;
+    BgpuCmd cmd = BGPU_INVALID;
+    BgpuPipeline p2d = BGPU_INVALID;
+    BgpuPipeline psh = BGPU_INVALID;
+
+    BgpuDeviceDesc dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.struct_size = (uint32_t)sizeof(dd);
+    dd.backend = kind;
+    dd.width = W;
+    dd.height = H;
+    dd.flags = BGPU_DEVICE_HEADLESS;
+    if (bingpu_device_create(&dd, &dev) != BGPU_OK) return 0;
+
+    BgpuCaps caps;
+    memset(&caps, 0, sizeof(caps));
+    caps.struct_size = (uint32_t)sizeof(caps);
+    if (bingpu_device_caps(dev, &caps) != BGPU_OK || !(caps.flags & BGPU_CAP_SHAPE)) {
+        bingpu_device_destroy(dev);
+        return 0;
+    }
+
+    BgpuSwapchainDesc sd;
+    memset(&sd, 0, sizeof(sd));
+    sd.struct_size = (uint32_t)sizeof(sd);
+    sd.width = W;
+    sd.height = H;
+    sd.format = BGPU_FORMAT_RGBA8;
+    if (bingpu_swapchain_create(dev, &sd, &sc) != BGPU_OK) { bingpu_device_destroy(dev); return 0; }
+    if (bingpu_cmd_create(dev, &cmd) != BGPU_OK) { bingpu_device_destroy(dev); return 0; }
+
+    BgpuPipelineDesc pd;
+    memset(&pd, 0, sizeof(pd));
+    pd.struct_size = (uint32_t)sizeof(pd);
+    pd.vertex_layout = BGPU_VERTEX_2D;
+    pd.blend = BGPU_BLEND_PREMULTIPLIED;
+    pd.flags = BGPU_PIPE_TEXTURED;
+    if (bingpu_pipeline_create(dev, &pd, &p2d) != BGPU_OK) { bingpu_device_destroy(dev); return 0; }
+    pd.vertex_layout = BGPU_VERTEX_SHAPE;
+    pd.flags = BGPU_PIPE_SHAPE;
+    if (bingpu_pipeline_create(dev, &pd, &psh) != BGPU_OK) {
+        bingpu_device_destroy(dev);
+        return 0;
+    }
+
+    BgpuTexture target = BGPU_INVALID;
+    if (bingpu_frame_begin(sc, cmd, &target) != BGPU_OK) return 0;
+    BgpuRenderBeginDesc rd;
+    memset(&rd, 0, sizeof(rd));
+    rd.struct_size = (uint32_t)sizeof(rd);
+    rd.target = target;
+    rd.flags = BGPU_RENDER_CLEAR_COLOR;
+    rd.clear_color = 0x00000000u;
+    (void)bingpu_cmd_begin_render(cmd, &rd);
+    (void)bingpu_cmd_set_viewport(cmd, 0.0f, 0.0f, (float)W, (float)H);
+    (void)bingpu_cmd_set_scissor(cmd, 0, 0, (int32_t)W, (int32_t)H);
+    (void)bingpu_cmd_set_affine(cmd, NULL);
+
+    /* 四笔交错：四边形(裸色) → 形状 → 四边形 → 形状。
+     * 顺序刻意让 vused 在 96 / 240 / 336 / 480 这些**非 36 倍数**的偏移上过一遍。 */
+    for (int i = 0; i < 4; ++i) {
+        const float y = 6.0f + (float)i * 22.0f;
+        if ((i & 1) == 0) {
+            const BgpuVertex q[4] = {
+                {6.0f, y, 0.0f, 0.5f, 0.5f, 0xFF203040u},
+                {70.0f, y, 0.0f, 0.5f, 0.5f, 0xFF203040u},
+                {6.0f, y + 16.0f, 0.0f, 0.5f, 0.5f, 0xFF203040u},
+                {70.0f, y + 16.0f, 0.0f, 0.5f, 0.5f, 0xFF203040u},
+            };
+            (void)bingpu_cmd_set_pipeline(cmd, p2d);
+            const BgpuResult r = bingpu_cmd_draw_quads(cmd, q, 1);
+            if (r != BGPU_OK) printf("  draw_quads 失败：%s\n", bingpu_last_error());
+        } else {
+            BgpuShapeVertex v[4];
+            push_shape(v, 80.0f, y, 70.0f, 16.0f, 7.0f, 0.0f, 0xFFE0C020u);
+            (void)bingpu_cmd_set_pipeline(cmd, psh);
+            const BgpuResult r = bingpu_cmd_draw_shapes(cmd, v, 1);
+            if (r != BGPU_OK) printf("  draw_shapes 失败：%s\n", bingpu_last_error());
+        }
+    }
+    (void)bingpu_cmd_end_render(cmd);
+    (void)bingpu_frame_end(sc, cmd);
+    memset(g_shot, 0xCD, sizeof(g_shot));
+    uint32_t stride = 0;
+    (void)bingpu_frame_read(sc, g_shot, sizeof(g_shot), &stride);
+    if (stride == 0) stride = W * 4u;
+    if (stride != W * 4u) {
+        uint32_t y;
+        for (y = 0; y < H; ++y)
+            memmove(g_shot + (size_t)y * W * 4u, g_shot + (size_t)y * stride, W * 4u);
+    }
+    if (out) memcpy(out, g_shot, sizeof(g_shot));
+
+    bingpu_pipeline_destroy(dev, psh);
+    bingpu_pipeline_destroy(dev, p2d);
+    bingpu_cmd_destroy(dev, cmd);
+    bingpu_swapchain_destroy(dev, sc);
+    bingpu_device_destroy(dev);
+    return 1;
+}
+
 int main(void) {
     printf("[test_shape] 解析圆角（SDF，AA 在片元里）\n");
 
@@ -237,6 +353,50 @@ int main(void) {
             }
             printf("  [%s] 与 CPU 参考后端：差>1 的通道 %d 个，最大 %d（半覆盖像素 %d）\n",
                    backends[i].n, n, mx, partial);
+            CHECK(mx <= 1);
+        }
+    }
+
+    /* ⑤ 混画：形状与 2D 四边形交错，四端仍逐像素一致（见 render_mixed 的注释） */
+    {
+        uint8_t cpu_mix[W * H * 4];
+        if (!render_mixed(BGPU_BACKEND_CPU, cpu_mix)) {
+            printf("  FATAL：CPU 参考后端不支持混画\n");
+            return 1;
+        }
+        /* 混画确实画上了：形状那一列有色、四边形那一列也有色 */
+        int shape_px = 0, quad_px = 0;
+        uint32_t x, y;
+        for (y = 0; y < H; ++y)
+            for (x = 0; x < W; ++x) {
+                const uint8_t a = cpu_mix[((size_t)y * W + x) * 4u + 3];
+                if (a == 0) continue;
+                if (x < 72) ++quad_px;
+                else if (x > 78) ++shape_px;
+            }
+        CHECK(quad_px > 1000);
+        CHECK(shape_px > 1000);
+
+        struct { const char* n; BgpuBackendKind k; } backends[] = {
+            {"vulkan", BGPU_BACKEND_VULKAN},
+            {"d3d11", BGPU_BACKEND_D3D11},
+            {"gl", BGPU_BACKEND_GL},
+        };
+        for (int i = 0; i < 3; ++i) {
+            uint8_t px[W * H * 4];
+            if (!render_mixed(backends[i].k, px)) {
+                printf("  [%s] 没有 BGPU_CAP_SHAPE，跳过混画\n", backends[i].n);
+                continue;
+            }
+            int n = 0, mx = 0;
+            uint32_t k;
+            for (k = 0; k < W * H * 4u; ++k) {
+                const int dv = abs((int)px[k] - (int)cpu_mix[k]);
+                if (dv > 1) ++n;
+                if (dv > mx) mx = dv;
+            }
+            printf("  [%s] 混画（四边形/形状交错）与 CPU：差>1 的通道 %d 个，最大 %d\n",
+                   backends[i].n, n, mx);
             CHECK(mx <= 1);
         }
     }

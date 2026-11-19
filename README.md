@@ -138,7 +138,7 @@ viewport / affine / 双线性 / 最近+重复 / 局部上传 / 深度 / 网格�
 
 ## 版本
 
-- 语义化版本 `0.12.0`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档、0.3.0 = **Vulkan 后端**、0.4.0 = **D3D11 后端**、0.5.0 = **OpenGL 后端**、0.5.1 = 交换链回读的两个 bug、0.5.2 = D3D11 上传路径 + `wait_idle` 真的等 GPU、0.6.0/0.6.1 = 光照 + 透视校正、0.7.0/0.8.0 = `bingpu_render_plan` 决策面、**0.9.0 = 帧节拍器 `bingpu_pace_*` + GL 的 `wglSwapIntervalEXT` 装载修复**、0.10.0 = 圆角矩形九宫格图元、0.11.0 = 四角带色圆角矩形、0.11.1 = CPU 参考后端共享边 1px 空洞、**0.12.0 = 解析圆角：AA 数学搬进片元着色器（四端）**）。
+- 语义化版本 `0.12.1`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档、0.3.0 = **Vulkan 后端**、0.4.0 = **D3D11 后端**、0.5.0 = **OpenGL 后端**、0.5.1 = 交换链回读的两个 bug、0.5.2 = D3D11 上传路径 + `wait_idle` 真的等 GPU、0.6.0/0.6.1 = 光照 + 透视校正、0.7.0/0.8.0 = `bingpu_render_plan` 决策面、**0.9.0 = 帧节拍器 `bingpu_pace_*` + GL 的 `wglSwapIntervalEXT` 装载修复**、0.10.0 = 圆角矩形九宫格图元、0.11.0 = 四角带色圆角矩形、0.11.1 = CPU 参考后端共享边 1px 空洞、**0.12.0 = 解析圆角：AA 数学搬进片元着色器（四端）、0.12.1 = 交错绘制时 VK 顶点流截断 + GL 程序没还原**）。
 - **二进制 ABI 号 4**：0.12.0 追加 `BGPU_VERTEX_SHAPE` 布局 + `BgpuShapeVertex`（36 字节）+ `BGPU_PIPE_SHAPE` / `BGPU_CAP_SHAPE` + `bingpu_cmd_draw_shapes()`，既有结构体与枚举值一个字节没动。ABI 3 = 0.6.0 给 `BgpuMeshVertex` 加 `float w`（透视校正）并新增光照状态；ABI 2 = 0.4.0 新增 `BGPU_BACKEND_D3D11`；ABI 1 的 0.1.0–0.3.0 未动过。
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)。
 

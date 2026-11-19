@@ -2385,17 +2385,21 @@ BgpuResult VkBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
                      pc.target[0], pc.target[1], pc.vp[0], pc.vp[1], pc.vp[2], pc.vp[3],
                      pc.xf0[3], pc.flags[0], pc.flags[1], pc.light_dir[0], pc.light_dir[1],
                      pc.light_dir[2]);
-    /* 顶点：追加到本帧的流缓冲，索引固定 TL,TR,BL / BL,TR,BR（raster_rules §2） */
-    const uint64_t bytes = static_cast<uint64_t>(quad_count) * 4 * sizeof(BgpuVertex);
-    if (!ensureVertexSpace(c, d, bytes)) {
+    /* 顶点：追加到本帧的流缓冲，索引固定 TL,TR,BL / BL,TR,BR（raster_rules §2）。
+     * 对齐理由同 rasterShapes：形状那一路是 36 字节的 stride，与 24 交错之后
+     * `vused / sizeof(BgpuVertex)` 会截断。 */
+    const uint64_t stride = sizeof(BgpuVertex);
+    const uint64_t base = (c.vused + stride - 1) / stride * stride;
+    const uint64_t bytes = static_cast<uint64_t>(quad_count) * 4 * stride;
+    if (!ensureVertexSpace(c, d, (base - c.vused) + bytes)) {
         return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "顶点流扩容失败");
     }
     if (!ensureIndexSpace(c, d, quad_count)) {
         return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "索引缓冲扩容失败");
     }
-    std::memcpy(static_cast<uint8_t*>(c.vmap) + c.vused, verts, bytes);
-    const uint32_t first_vertex = static_cast<uint32_t>(c.vused / sizeof(BgpuVertex));
-    c.vused += bytes;
+    std::memcpy(static_cast<uint8_t*>(c.vmap) + base, verts, bytes);
+    const uint32_t first_vertex = static_cast<uint32_t>(base / stride);
+    c.vused = base + bytes;
     const VkDeviceSize off = 0;
     g_vk.vkCmdBindVertexBuffers(c.cb, 0, 1, &c.vbuf, &off);
     g_vk.vkCmdBindIndexBuffer(c.cb, c.ibuf, 0, VK_INDEX_TYPE_UINT32);
@@ -2445,16 +2449,23 @@ BgpuResult VkBackend::rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
                             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                             sizeof(pc), &pc);
 
-    const uint64_t bytes = static_cast<uint64_t>(quad_count) * 4 * sizeof(BgpuShapeVertex);
-    if (!ensureVertexSpace(c, d, bytes)) {
+    /* 顶点流是 **2D（24 字节）与形状（36 字节）共用**的一段字节，而 first_vertex
+     * 是按本笔的 stride 倒算的，所以追加前必须把游标对齐到本笔的 stride。
+     * 不对齐就会截断：先画一个 2D 四边形（占 96 字节）再画形状时 96/36 = 2，
+     * 顶点从第 72 字节开始读 —— 读到上一笔的尾巴，形状整块不见。
+     * （bin2d 的 display_list 跨执行体对拍抓到的：VK 上"上半透明圆角渐变"整条消失。） */
+    const uint64_t stride = sizeof(BgpuShapeVertex);
+    const uint64_t base = (c.vused + stride - 1) / stride * stride;
+    const uint64_t bytes = static_cast<uint64_t>(quad_count) * 4 * stride;
+    if (!ensureVertexSpace(c, d, (base - c.vused) + bytes)) {
         return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "顶点流扩容失败");
     }
     if (!ensureIndexSpace(c, d, quad_count)) {
         return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "索引缓冲扩容失败");
     }
-    std::memcpy(static_cast<uint8_t*>(c.vmap) + c.vused, verts, bytes);
-    const uint32_t first_vertex = static_cast<uint32_t>(c.vused / sizeof(BgpuShapeVertex));
-    c.vused += bytes;
+    std::memcpy(static_cast<uint8_t*>(c.vmap) + base, verts, bytes);
+    const uint32_t first_vertex = static_cast<uint32_t>(base / stride);
+    c.vused = base + bytes;
     const VkDeviceSize off = 0;
     g_vk.vkCmdBindVertexBuffers(c.cb, 0, 1, &c.vbuf, &off);
     g_vk.vkCmdBindIndexBuffer(c.cb, c.ibuf, 0, VK_INDEX_TYPE_UINT32);

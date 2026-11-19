@@ -4,6 +4,45 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.12.1] - 2026-11-20
+
+**修掉"形状与 2D 四边形交错"时暴露的两个 bug —— 都是 0.12.0 新代码的锅，都被 bin2d 的
+跨执行体对拍抓到。**（ABI 不变。）
+
+### ① Vulkan：顶点流按不同的 stride 共用，`first_vertex` 被截断
+
+VK 的顶点流是一条按帧增长的字节缓冲，2D 顶点 24 字节、形状顶点 36 字节**追加在同一段**
+里，而 `first_vertex = vused / stride` 是按本笔的 stride 倒算的。24 与 36 互不整除：
+
+- 先画一个 2D 四边形（96 字节）再画形状 → `96 / 36 = 2`，顶点从第 **72** 字节开始读，
+  读到的是上一笔的尾巴 ⇒ **整个形状不见**；
+- 反过来，形状画了奇数个（36·n）再画四边形，`n` 为奇数时同样截断。
+
+修法：追加前把游标**向上对齐到本笔的 stride**（`base = roundUp(vused, stride)`），
+`first_vertex = base / stride` 于是整除。两条 draw 路径都这么做了。
+
+症状很刁：单独画形状（对齐在 0）永远正常，只有交错时才有，而且是"一整条圆角消失"。
+bin2d 的 display_list 跨执行体对拍里是"VK 上上半透明圆角渐变一整块不见了"（2954 像素）。
+
+### ② OpenGL：形状画完没把 quad 的程序装回去
+
+GL 的程序是 `begin_render` 时 `glUseProgram(d.prog)` 一次就不管了的，两条 draw 路径都
+假定"当前程序就是 d.prog"。`rasterShapes` 换成 `prog_shape` 之后没有还原，于是下一笔
+`draw_quads` 拿形状的程序去解 2D 顶点 —— 驱动报 `INVALID_OPERATION`（0x1282），整笔
+失败；就算不报错，像素也是错的。
+
+修法：`rasterShapes` 画完 `glUseProgram(d.prog)`。顺带把 `rasterQuads`/`rasterShapes` 里
+`glFail()` 的失败结果**直接返回**（不再包一层 `fail(...)`）：那个消息里带着 `glGetError`
+的具体码，外面再包一层就把码覆盖掉了 —— 排查时最想看的恰好是它。
+
+### 验收
+
+- `tests/test_shape.c` 新增 5 项"**混画**"：同一条命令缓冲里 2D 四边形与形状交错
+  （4 笔，让 `vused` 在 96/240/336/480 这些非 36 倍数上各过一遍），四端逐像素对齐 ——
+  `vulkan`/`d3d11`/`gl` 都是 **差 >1 的通道 0 个，最大 0**；
+- 全套 8 个测试通过（test_shape 23 项）；
+- bin2d 的 `test_gpu_bridge`（40 项）与 `test_display_list`（45 项）全绿。
+
 ## [0.12.0] - 2026-11-20
 
 **解析圆角进设备层：圆角的抗锯齿数学从 CPU 搬到**像素着色器**里算。**（ABI 4）

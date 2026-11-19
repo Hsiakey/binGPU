@@ -2098,9 +2098,10 @@ BgpuResult GlBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
                                reinterpret_cast<const void*>(20));
     g_gl.glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(quad_count * 6), GL_UNSIGNED_INT,
                         reinterpret_cast<const void*>(0));
-    if (glFail("draw_quads") != BGPU_OK) {
-        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "GL 绘制失败");
-    }
+    /* 直接把 glFail 的结果返回上去：它的消息里带着 glGetError 的具体码，
+     * 而外面再包一层 fail() 会把那个码覆盖掉 —— 排查时最想看的恰好就是它。 */
+    const BgpuResult glr = glFail("draw_quads");
+    if (glr != BGPU_OK) return glr;
     return BGPU_OK;
 }
 
@@ -2175,9 +2176,13 @@ BgpuResult GlBackend::rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
                                reinterpret_cast<const void*>(32));
     g_gl.glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(quad_count * 6), GL_UNSIGNED_INT,
                         reinterpret_cast<const void*>(0));
-    if (glFail("draw_shapes") != BGPU_OK) {
-        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "GL 绘制失败");
-    }
+    const BgpuResult glr = glFail("draw_shapes");
+    /* **必须**把 quad 的程序装回去：begin_render 只在开头 glUseProgram(d.prog) 一次，
+     * 后续两条 draw 路径都假定"当前程序就是 d.prog"。留 prog_shape 挂着的话，下一次
+     * draw_quads 会拿形状的程序去解 2D 顶点（像素错）并让驱动报 INVALID_OPERATION ——
+     * 这是 bin2d 的 display_list 跨执行体对拍抓到的（圆角渐变页整页失败）。 */
+    g_gl.glUseProgram(d.prog);
+    if (glr != BGPU_OK) return glr;
     return BGPU_OK;
 }
 
