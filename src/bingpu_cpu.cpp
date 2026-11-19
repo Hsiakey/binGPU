@@ -394,7 +394,17 @@ struct Paint {
 };
 
 inline float edgef(const RVert* a, const RVert* b, float px, float py) {
-    return (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
+    const float e = (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
+    /* 贴着边就**吸成精确 0**（±1e-6 边函数单位 ≈ 1e-7 px，远小于一个像素）。
+     *
+     * 为什么必须吸：顶点经过"设备坐标 → 视口除法 → 乘回"的往返
+     * （transform_vert 的 `in.x / tgt.w * vp[2]`），8/168*168 并不精确等于 8。
+     * 于是共享边上的像素会算出 ±1e-16 而不是 0，而 top-left 规则的判据是
+     * `e > 0 || (e == 0 && tl)` —— 两个三角形各得一个"极小负数"，**都**把像素丢掉，
+     * 对角线就出现 1px 空洞（实测：168 宽的视口、圆角模板角片，(8,21) 与 (9,20) 全透明；
+     * 换成 32 宽的视口——2 的幂，往返精确——就复现不出来）。
+     * 吸成 0 之后判据重新是确定的：恰好一侧的 top-left 为真，像素只被覆盖一次。 */
+    return (e > -1e-6f && e < 1e-6f) ? 0.0f : e;
 }
 
 /* top-left 填充规则（y 向下、area>0 归一化之后）：
