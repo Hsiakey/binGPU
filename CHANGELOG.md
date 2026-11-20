@@ -4,6 +4,84 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.13.0] - 2026-11-20
+
+**修掉 Vulkan 后端在"一帧里多目标来回切换"时的三处缺陷（外加一处能力对齐）—— 全是
+"命令缓冲先录后执行"这个模型差异的锅，GL / D3D11 / CPU 都不会踩到。**（ABI 仍是 4，
+一个字节没动。）
+
+被 binUI 新加的"设备层建在 binGPU 上"后端（`binui_gpu.cpp`）撞出来的：同一个页面
+
+| 页面 | 用到的特性 | 修前 GL vs VK | 修后 |
+|---|---|---|---|
+| `circle.html` | 解析圆角 + 文字 | 0 像素不同 | 0 / 0 |
+| `opacity.html` | 图层（离屏 → 合成回来） | 0 像素不同 | 0 / 0 |
+| `svg-filter.html` | 模糊图层 / 外阴影（多级降采样链） | **86.9%**（最大通道差 244） | 0 / 0 |
+| `appshow/main.html` | 整页 + 毛玻璃弹窗 | **13.7%** | 0 / 0 |
+
+### ① 根因：顶点流扩容时把"已经录进命令缓冲的 buffer"销毁了
+
+VK 的顶点流是一条按帧增长的设备缓冲：一帧画得够多（约 682 个四边形）就要扩容。
+而命令缓冲是**先录后执行**的 —— 扩容那一刻，前面那些 draw 已经把
+`vkCmdBindVertexBuffers(旧 buffer)` 录进去了，旧 buffer 却在这时被
+`vkDestroyBuffer/vkFreeMemory` 当场销毁：显存立刻回到池子，紧接着的新 buffer 分配
+**大概率拿到同一段显存**（而且被 memset 成 0）。于是扩容之前录好的所有 draw 都变成
+"所有顶点都在原点"的退化三角形 —— **整块内容消失，不报错、不崩溃**。索引缓冲同理。
+
+整页渲染（binUI/bin2d 一帧几千个四边形）必然扩容，所以只有"内容多"的页面坏，
+`circle`/`opacity` 这种几个四边形的页面反而看不出问题。
+
+修法：扩容时旧 buffer 只**退役**（`VkCmdObj::retired`），真正的
+`vkDestroyBuffer/vkFreeMemory` 推迟到下一趟 `beginRecording`（此时上一帧已经
+`vkWaitForFences` 等完）。顶点数据不必往新 buffer 抄：每笔 draw 绑的是它录制时
+那一个 buffer。
+
+### ② 整个 cmd 共用一个 descriptor set
+
+descriptor set 的内容是**执行期**读的，不是录制期快照。原来 `createCmd` 只分配
+**一个** set，两条 draw 之间 `vkUpdateDescriptorSets` 改写它 —— 按规范这是
+"已提交的 set 被改写"，所有 draw 都可能看到**最后一次写入**的那张纹理。
+
+修法：按笔分配（`allocDescSet`，每池 512 个、池满再开一个），帧首
+`vkResetDescriptorPool` 整批回收（`resetDescSets`），set 数量按"一帧的笔数"走，
+不随帧累加。
+
+> 诚实说明：**这一条在 RTX 4060 Ti + 这版驱动上没有改变任何像素**（改前改后
+> 同一帧的 PNG 逐字节相同），上面那张表的 86.9% 全由 ① 造成。它是"顺手修掉的、
+> 明确违反规范的隐患"，不是本页缺陷的根因 —— 但换一个驱动/后端就可能变成真 bug。
+
+### ③ 同一目标连开多趟渲染时的依赖
+
+动态渲染（`vkCmdBeginRendering/vkCmdEndRendering`）**不插**任何依赖；而
+`transition()` 在"布局没变"时会直接跳过 barrier，于是"第一趟写目标、第二趟 load
+同一个目标"之间一条依赖都没有。另外采样源原来只在"换纹理"时才转布局，
+`last_tex` 缓存命中就漏转（目标刚渲染完布局还是颜色附件）。
+
+修法：`begin_render` 对目标**强制**插一条颜色附件的 RAW 依赖
+（`transitionImpl(..., /*force=*/true)`）；采样源每笔都确保在
+`SHADER_READ_ONLY_OPTIMAL`（布局相同就跳过，不会白插）。
+
+> 同 ②：**这一条在本机也没改变像素**（动态渲染下 NV 的执行是够"顺"的）。但它按
+> 规范是必须的 —— 换一台 GPU / 一个驱动就可能出现"上一趟内容读不到"。
+
+### ④ 顺手：VK 的 mip 从"建不出来"改成"降级"
+
+`BGPU_TEXTURE_MIPMAPS` 以前在 VK 上直接 `UNSUPPORTED`，而 CPU/GL/D3D11 都是
+"接受但降级为 1 级"。同一个上层代码（binUI 的贴图）于是在 GL 上正常、在 VK 上连
+纹理都建不出来 —— 设备层的"做不到"必须表现成**降级**，不是**失败**。
+（真正的 mip 采样仍是欠账，见 `docs/backends.md` §欠账 9。）
+
+### 验收
+
+- `tests/gpu_parity.h` 新增 `multipass(目标来回切 + 顶点流扩容)`：先画一个块、再画
+  1200 个四边形把顶点流撑过扩容点、然后把刚渲染完的目标当采样源抓一张、再贴回目标。
+  把 ① 的实现改回"当场销毁"，这条用例在 VK 上立刻失败（`texture_read` 都回读不了）；
+  GL / D3D11 / CPU 一直是绿的。
+- `mingw32-make test`：ABI 247 / CPU 378 / pace 72 / prims 32 / shape 23 /
+  VK 16 / D3D11 16 / GL 16，**失败 0**。
+- binUI 的四个页面（`circle` / `opacity` / `svg-filter` / `appshow` 整页）GL vs VK
+  逐像素 **0 差异、最大通道差 0**。
+
 ## [0.12.1] - 2026-11-20
 
 **修掉"形状与 2D 四边形交错"时暴露的两个 bug —— 都是 0.12.0 新代码的锅，都被 bin2d 的

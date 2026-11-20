@@ -189,6 +189,7 @@ struct VkFns {
     BGPU_VK_FN(vkDestroyDescriptorPool);
     BGPU_VK_FN(vkAllocateDescriptorSets);
     BGPU_VK_FN(vkUpdateDescriptorSets);
+    BGPU_VK_FN(vkResetDescriptorPool);
     BGPU_VK_FN(vkCreateCommandPool);
     BGPU_VK_FN(vkDestroyCommandPool);
     BGPU_VK_FN(vkAllocateCommandBuffers);
@@ -321,6 +322,7 @@ bool loadVulkan() {
     BGPU_LOAD(vkDestroyDescriptorPool);
     BGPU_LOAD(vkAllocateDescriptorSets);
     BGPU_LOAD(vkUpdateDescriptorSets);
+    BGPU_LOAD(vkResetDescriptorPool);
     BGPU_LOAD(vkCreateCommandPool);
     BGPU_LOAD(vkDestroyCommandPool);
     BGPU_LOAD(vkAllocateCommandBuffers);
@@ -393,6 +395,10 @@ struct PushConstants {
     float light_color[4]; /* offset  80：rgb = 光色（可 > 1） */
     float light_amb[4];   /* offset  96：rgb = 环境光 */
 };
+
+/* 一个描述符池装多少个 set：一帧的 draw 笔数通常会超过它，超了就再开一个池。
+ * 512 是"一次 vkAllocateDescriptorSets 批量拿"的粒度，不是上限。 */
+constexpr uint32_t kDescSetsPerPool = 512;
 
 /* 把一条命令的状态拍成 push constant。
  * 2D 与网格两条 draw 路径共用它 —— 光照/透视的字段只在这里算一次，
@@ -476,7 +482,10 @@ struct VkDeviceObj final : Device {
     uint32_t queue_family = 0;
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
-    VkDescriptorPool desc_pool = VK_NULL_HANDLE;
+    /* 描述符池按帧复用：每帧开始时 vkResetDescriptorPool 全部回收。
+     * 之所以要**多个池**：一笔 draw 一个 set（见 allocDescSet 的注释），一帧的笔数
+     * 不设上限，池满了就再开一个。 */
+    std::vector<VkDescriptorPool> desc_pools;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
     VkShaderModule vert = VK_NULL_HANDLE;
     VkShaderModule frag = VK_NULL_HANDLE;
@@ -589,7 +598,11 @@ struct VkCmdObj final : Cmd {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     bool recording = false;
     bool rendering = false;
-    VkDescriptorSet desc = VK_NULL_HANDLE;
+
+    /* 本趟录制里**按笔分配**的 descriptor set（见 allocDescSet 的注释）。
+     * desc_used 是游标；beginRecording 会整批回收，所以录制期间只增不减。 */
+    std::vector<VkDescriptorSet> desc_sets;
+    size_t desc_used = 0;
     VkDevice dev = VK_NULL_HANDLE;
     VkFormat color_fmt = VK_FORMAT_UNDEFINED;
     VkFormat depth_fmt = VK_FORMAT_UNDEFINED;
@@ -606,11 +619,25 @@ struct VkCmdObj final : Cmd {
     VkDeviceMemory imem = VK_NULL_HANDLE;
     uint64_t icap_quads = 0;
 
+    /* 扩容时**退役**的顶点/索引缓冲。命令缓冲是"先录后执行"的：扩容那一刻，
+     * 前面那些 draw 已经把 vkCmdBindVertexBuffers(旧 buf) 录进去了，旧 buf 必须在
+     * 这趟提交真正跑完之前一直活着（销毁 = 已录命令引用野内存）。回收点在
+     * beginRecording（此时上一趟已经 fence 等完）。 */
+    struct RetiredBuffer {
+        VkBuffer buf;
+        VkDeviceMemory mem;
+    };
+    std::vector<RetiredBuffer> retired;
+    void freeRetired() {
+        for (const RetiredBuffer& r : retired) {
+            if (r.buf) g_vk.vkDestroyBuffer(dev, r.buf, nullptr);
+            if (r.mem) g_vk.vkFreeMemory(dev, r.mem, nullptr);
+        }
+        retired.clear();
+    }
+
     /* 状态剔除（docs/layering.md §6.2 写的契约）：只有真的变了才记 vkCmd* */
     VkPipeline last_pipe = VK_NULL_HANDLE;
-    VkDescriptorSet last_desc = VK_NULL_HANDLE;
-    VkTextureObj* last_tex = nullptr;
-    VkSamplerObj* last_samp = nullptr;
     bool last_depth_test = false, last_depth_write = false, last_cull = false;
     bool have_state = false;
 
@@ -623,6 +650,7 @@ struct VkCmdObj final : Cmd {
         if (vmem) g_vk.vkFreeMemory(dev, vmem, nullptr);
         if (ibuf) g_vk.vkDestroyBuffer(dev, ibuf, nullptr);
         if (imem) g_vk.vkFreeMemory(dev, imem, nullptr);
+        freeRetired();
         /* cb 由设备销毁时随 command pool 一起回收（pool 非持久），这里不单 free */
     }
 };
@@ -638,7 +666,7 @@ VkDeviceObj::~VkDeviceObj() {
         if (vert_shape) g_vk.vkDestroyShaderModule(dev, vert_shape, nullptr);
         if (frag_shape) g_vk.vkDestroyShaderModule(dev, frag_shape, nullptr);
         if (pipe_layout) g_vk.vkDestroyPipelineLayout(dev, pipe_layout, nullptr);
-        if (desc_pool) g_vk.vkDestroyDescriptorPool(dev, desc_pool, nullptr);
+        for (VkDescriptorPool p : desc_pools) g_vk.vkDestroyDescriptorPool(dev, p, nullptr);
         if (set_layout) g_vk.vkDestroyDescriptorSetLayout(dev, set_layout, nullptr);
         if (cmd_pool) g_vk.vkDestroyCommandPool(dev, cmd_pool, nullptr);
         g_vk.vkDestroyDevice(dev, nullptr);
@@ -716,6 +744,10 @@ protected:
 
 private:
     BgpuResult transition(VkCmdObj& c, VkTextureObj& t, VkImageLayout want);
+    BgpuResult transitionImpl(VkCmdObj& c, VkTextureObj& t, VkImageLayout want, bool force);
+    bool createDescPool(VkDeviceObj& d);
+    VkDescriptorSet allocDescSet(VkCmdObj& c, VkDeviceObj& d);
+    void resetDescSets(VkCmdObj& c, VkDeviceObj& d);
     bool beginRecording(VkCmdObj& c, VkDeviceObj& dev);
     VkPipeline pipelineFor(VkPipelineObj& p, VkDeviceObj& dev, VkFormat color_fmt,
                            VkFormat depth_fmt);
@@ -906,18 +938,11 @@ BgpuResult VkBackend::createDevice(const BgpuDeviceDesc& desc, BgpuDevice* out) 
         return vkFail(vr, "vkCreateDescriptorSetLayout");
     }
 
-    VkDescriptorPoolSize psz{};
-    psz.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    psz.descriptorCount = 128;
-    VkDescriptorPoolCreateInfo dpc{};
-    dpc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpc.maxSets = 64;
-    dpc.poolSizeCount = 1;
-    dpc.pPoolSizes = &psz;
-    vr = g_vk.vkCreateDescriptorPool(vkdev, &dpc, nullptr, &d->desc_pool);
-    if (vr != VK_SUCCESS) {
+    /* 描述符池：先开一个，之后按需增长（allocDescSet）。一笔 draw 一个 set ——
+     * 见那里关于"set 内容在执行期读取"的注释。 */
+    if (!createDescPool(*d)) {
         destroyObject(handle);
-        return vkFail(vr, "vkCreateDescriptorPool");
+        return vkFail(VK_ERROR_OUT_OF_HOST_MEMORY, "vkCreateDescriptorPool");
     }
 
     VkPushConstantRange pcr{};
@@ -1100,10 +1125,10 @@ BgpuResult VkBackend::createTexture(Device& dev, const BgpuTextureDesc& desc,
         return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
                     cat("纹理超过上限 ", BGPU_MAX_TEXTURE_SIZE));
     }
-    if (desc.flags & BGPU_TEXTURE_MIPMAPS) {
-        return fail(BGPU_ERR_UNSUPPORTED, __FILE__, __LINE__,
-                    "Vulkan 后端这一版不支持 mip 链（见 docs/backends.md 欠账）");
-    }
+    /* mip：与 CPU/GL/D3D11 一致 —— 接受 BGPU_TEXTURE_MIPMAPS 但**降级为 1 级**
+     * （固定管线没有 LOD 输入，采样永远取第 0 级；info 里报真实值）。
+     * 这一版以前直接 UNSUPPORTED，于是同一个 binUI 在 VK 上连贴图都建不出来，
+     * 而 GL 上一切正常 —— 设备层的"能力差异"不该变成"上层要分支"。 */
     const uint64_t handle = makeObject<VkTextureObj>(*this, d.self);
     if (handle == BGPU_INVALID) return failOom(__FILE__, __LINE__);
     VkTextureObj* t = static_cast<VkTextureObj*>(lookupObject(handle, kObjTexture));
@@ -1177,7 +1202,16 @@ void VkBackend::textureInfo(Texture& tex, BgpuTextureInfo& out) {
 }
 
 BgpuResult VkBackend::transition(VkCmdObj& c, VkTextureObj& t, VkImageLayout want) {
-    if (t.layout == want) return BGPU_OK;
+    return transitionImpl(c, t, want, /*force=*/false);
+}
+
+/* force=true：**布局不变也插 barrier**。用于"同一个目标连续开两个渲染实例"——
+ * 第一个实例的写入必须在第二个实例的 load 之前落地（RAW）。动态渲染的
+ * vkCmdBeginRendering/vkCmdEndRendering 自己**不插**任何依赖，靠布局变化带出来的
+ * barrier 又会在布局相同的时候被跳过，于是第二趟的 load 可能读到旧内容。 */
+BgpuResult VkBackend::transitionImpl(VkCmdObj& c, VkTextureObj& t, VkImageLayout want,
+                                     bool force) {
+    if (t.layout == want && !force) return BGPU_OK;
     const VkImageAspectFlags aspect =
         t.is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageMemoryBarrier b{};
@@ -1234,6 +1268,62 @@ BgpuResult VkBackend::transition(VkCmdObj& c, VkTextureObj& t, VkImageLayout wan
     g_vk.vkCmdPipelineBarrier(c.cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
     t.layout = want;
     return BGPU_OK;
+}
+
+bool VkBackend::createDescPool(VkDeviceObj& d) {
+    VkDescriptorPoolSize psz{};
+    psz.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    psz.descriptorCount = kDescSetsPerPool;
+    VkDescriptorPoolCreateInfo dpc{};
+    dpc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpc.maxSets = kDescSetsPerPool;
+    dpc.poolSizeCount = 1;
+    dpc.pPoolSizes = &psz;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (g_vk.vkCreateDescriptorPool(d.dev, &dpc, nullptr, &pool) != VK_SUCCESS) return false;
+    d.desc_pools.push_back(pool);
+    return true;
+}
+
+/* 一笔 draw 一个 descriptor set。
+ *
+ * 为什么必须按笔分配：descriptor set 的内容是**执行期**读取的，不是录制期快照。
+ * 整个 cmd 共用一个 set、在两条 draw 之间 vkUpdateDescriptorSets 改写它，等于两条
+ * draw 都去采样**最后一次写入**的那张纹理 —— 0.12.x 就是这样：一帧里换着采样
+ * 一堆纹理（模糊降采样链、从当前帧目标抓背景）时，所有 draw 都读到同一张图，
+ * 画面大面积错乱。GL 后端是逐笔真实绑定，所以它一直是对的。
+ *
+ * 每帧开始整批回收（resetDescSets），所以 set 数量按"一帧的笔数"走，不按帧累加。 */
+VkDescriptorSet VkBackend::allocDescSet(VkCmdObj& c, VkDeviceObj& d) {
+    if (c.desc_used < c.desc_sets.size()) return c.desc_sets[c.desc_used++];
+    if (d.desc_pools.empty() && !createDescPool(d)) return VK_NULL_HANDLE;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        std::vector<VkDescriptorSet> batch(kDescSetsPerPool);
+        /* pSetLayouts 是**数组**（descriptorSetCount 个），不是单个 layout —— 批量
+         * 分配时传一个指针进来，驱动会顺着往后读越界的句柄（当场 SIGSEGV）。 */
+        const std::vector<VkDescriptorSetLayout> layouts(kDescSetsPerPool, d.set_layout);
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = d.desc_pools.back();
+        ai.descriptorSetCount = kDescSetsPerPool;
+        ai.pSetLayouts = layouts.data();
+        if (g_vk.vkAllocateDescriptorSets(d.dev, &ai, batch.data()) == VK_SUCCESS) {
+            c.desc_sets.insert(c.desc_sets.end(), batch.begin(), batch.end());
+            return c.desc_sets[c.desc_used++];
+        }
+        /* 当前池满了（每池固定 kDescSetsPerPool 个）：再开一个池继续 */
+        if (!createDescPool(d)) return VK_NULL_HANDLE;
+    }
+    return VK_NULL_HANDLE;
+}
+
+/* 回收本趟录制用掉的所有 set。调用点保证"上一帧已经 fence 等完"（frame_end /
+ * 离屏 end_render 都会等），所以这里重置池是安全的。 */
+void VkBackend::resetDescSets(VkCmdObj& c, VkDeviceObj& d) {
+    if (c.desc_sets.empty()) return;
+    for (VkDescriptorPool p : d.desc_pools) g_vk.vkResetDescriptorPool(d.dev, p, 0);
+    c.desc_sets.clear();
+    c.desc_used = 0;
 }
 
 BgpuResult VkBackend::textureUpload(Texture& tex, const BgpuBox* box, const void* pixels,
@@ -1703,30 +1793,43 @@ bool VkBackend::beginRecording(VkCmdObj& c, VkDeviceObj& dev) {
     c.vused = 0;
     c.have_state = false;
     c.last_pipe = VK_NULL_HANDLE;
-    c.last_desc = VK_NULL_HANDLE;
-    c.last_tex = nullptr;
-    c.last_samp = nullptr;
     c.color_fmt = VK_FORMAT_UNDEFINED;
     c.depth_fmt = VK_FORMAT_UNDEFINED;
+    resetDescSets(c, dev);   /* 上一趟已经 fence 等完：整批回收 set */
+    c.freeRetired();         /* 同理：上一趟的顶点/索引缓冲可以真正销毁了 */
     return true;
 }
 
+/* 顶点流扩容。
+ *
+ * 命令缓冲是**先录后执行**的：扩容那一刻，前面那些 draw 已经把
+ * `vkCmdBindVertexBuffers(旧 buffer)` 录进去了。所以旧 buffer **不能当场销毁** ——
+ * 驱动会把它的显存立刻放回池子，下一笔分配（就是这里的新 buffer）很可能拿到同一段
+ * 显存，于是已经录好的 draw 读到的是"全 0 的新顶点流"：整块内容消失，
+ * 既不出错也不崩溃，特别难查（bin2d/binUI 整页渲染一帧几千个四边形，必然扩容；
+ * GL/D3D11 是即时执行 —— glBufferData / Map 立刻生效，没有这个坑）。
+ *
+ * 所以这里只把旧 buffer"退役"，真正的销毁放在 beginRecording（上一趟已经 fence
+ * 等完）。顶点数据不用往新 buffer 抄：每笔 draw 的 vkCmdBindVertexBuffers 绑的是
+ * 它录制时的那一个 buffer，各画各的。 */
 bool VkBackend::ensureVertexSpace(VkCmdObj& c, VkDeviceObj& dev, uint64_t need) {
     if (c.vcap >= c.vused + need) return true;
     uint64_t cap = c.vcap ? c.vcap : 64 * 1024;
     while (cap < c.vused + need) cap *= 2;
-    if (c.vmap) {
-        g_vk.vkUnmapMemory(dev.dev, c.vmem);
-        c.vmap = nullptr;
-    }
-    if (c.vbuf) g_vk.vkDestroyBuffer(dev.dev, c.vbuf, nullptr);
-    if (c.vmem) g_vk.vkFreeMemory(dev.dev, c.vmem, nullptr);
-    c.vbuf = VK_NULL_HANDLE;
-    c.vmem = VK_NULL_HANDLE;
-    if (!allocHostBuffer(dev, cap, &c.vbuf, &c.vmem, &c.vmap)) {
+    VkBuffer nbuf = VK_NULL_HANDLE;
+    VkDeviceMemory nmem = VK_NULL_HANDLE;
+    void* nmap = nullptr;
+    if (!allocHostBuffer(dev, cap, &nbuf, &nmem, &nmap)) {
         c.vcap = 0;
         return false;
     }
+    if (c.vbuf) {
+        if (c.vmap) g_vk.vkUnmapMemory(dev.dev, c.vmem);
+        c.retired.push_back({c.vbuf, c.vmem});
+    }
+    c.vbuf = nbuf;
+    c.vmem = nmem;
+    c.vmap = nmap;
     c.vcap = cap;
     return true;
 }
@@ -1735,8 +1838,6 @@ bool VkBackend::ensureIndexSpace(VkCmdObj& c, VkDeviceObj& dev, uint64_t quads) 
     if (c.icap_quads >= quads) return true;
     uint64_t cap = c.icap_quads ? c.icap_quads : 4096;
     while (cap < quads) cap *= 2;
-    if (c.ibuf) g_vk.vkDestroyBuffer(dev.dev, c.ibuf, nullptr);
-    if (c.imem) g_vk.vkFreeMemory(dev.dev, c.imem, nullptr);
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     void* map = nullptr;
@@ -1751,6 +1852,8 @@ bool VkBackend::ensureIndexSpace(VkCmdObj& c, VkDeviceObj& dev, uint64_t quads) 
         idx[i * 6 + 4] = base + 1;
         idx[i * 6 + 5] = base + 3;
     }
+    /* 旧索引缓冲同样只"退役"不销毁：前面的 draw 还指着它 */
+    if (c.ibuf) c.retired.push_back({c.ibuf, c.imem});
     c.ibuf = buf;
     c.imem = mem;
     c.icap_quads = cap;
@@ -1782,15 +1885,7 @@ BgpuResult VkBackend::createCmd(Device& dev, BgpuCmd* out) {
     *out = handle;
     VkCmdObj* c = static_cast<VkCmdObj*>(lookupObject(*out, kObjCmd));
     c->dev = d.dev;
-    VkDescriptorSetAllocateInfo ai{};
-    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    ai.descriptorPool = d.desc_pool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &d.set_layout;
-    if (g_vk.vkAllocateDescriptorSets(d.dev, &ai, &c->desc) != VK_SUCCESS) {
-        destroyObject(*out);
-        return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "descriptor set 分配失败");
-    }
+    /* descriptor set 不在这里预分配：一笔 draw 一个，录制时按需拿（allocDescSet）。 */
     return BGPU_OK;
 }
 
@@ -2085,7 +2180,8 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
         c.depth_fmt = dt.vfmt;
         depth_view = dt.view;
     }
-    if (transition(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) != BGPU_OK) {
+    if (transitionImpl(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, /*force=*/true) !=
+        BGPU_OK) {
         cmd.inRender = false;
         return BGPU_ERR_BACKEND_FAILED;
     }
@@ -2228,6 +2324,7 @@ BgpuResult VkBackend::frameEnd(Swapchain& sc_, Cmd& cmd) {
         sc.dev->frames_presented++;
         sc.dev->frame_index++;
     }
+
     return BGPU_OK;
 }
 
@@ -2337,28 +2434,30 @@ BgpuResult VkBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
         tex = static_cast<VkTextureObj*>(c.tex);
         samp = c.samp ? static_cast<VkSamplerObj*>(c.samp) : nullptr;
     }
-    if (tex != c.last_tex || samp != c.last_samp) {
-        transition(c, *tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    /* 采样前必须把它转到 SHADER_READ_ONLY：目标刚渲染完（布局是 COLOR_ATTACHMENT）
+     * 就要在这里转回来 —— 这个"来回横跳"是 end_render 之后**必须**补的那一步，
+     * 因为离屏 pass 在帧内不会自动转（帧内的 end_render 只结束渲染实例）。
+     * transition 自己会在布局已经对的时候跳过，不会白插 barrier。 */
+    transition(c, *tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    {
+        const VkDescriptorSet set = allocDescSet(c, d);
+        if (set == VK_NULL_HANDLE) {
+            return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "descriptor set 分配失败");
+        }
         VkDescriptorImageInfo ii{};
         ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         ii.imageView = tex->view;
         ii.sampler = samp ? samp->sampler : d.default_sampler;
         VkWriteDescriptorSet w{};
         w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = c.desc;
+        w.dstSet = set;
         w.dstBinding = 0;
         w.descriptorCount = 1;
         w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w.pImageInfo = &ii;
         g_vk.vkUpdateDescriptorSets(d.dev, 1, &w, 0, nullptr);
-        c.last_tex = tex;
-        c.last_samp = samp;
-        c.last_desc = VK_NULL_HANDLE;   /* 强制重绑 */
-    }
-    if (c.last_desc != c.desc) {
         g_vk.vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_layout, 0, 1,
-                                     &c.desc, 0, nullptr);
-        c.last_desc = c.desc;
+                                     &set, 0, nullptr);
     }
 
     /* scissor：与目标求交；负数宽度已在 setScissor 里变成"关闭裁剪" */
@@ -2496,28 +2595,28 @@ BgpuResult VkBackend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset
         tex = static_cast<VkTextureObj*>(c.tex);
         samp = c.samp ? static_cast<VkSamplerObj*>(c.samp) : nullptr;
     }
-    if (tex != c.last_tex || samp != c.last_samp) {
-        transition(c, *tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    /* 同 rasterQuads：采样前一定把布局转回 SHADER_READ_ONLY，并**逐笔**拿一个新的
+     * descriptor set（set 内容是执行期读的，跨笔共用会串）。 */
+    transition(c, *tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    {
+        const VkDescriptorSet set = allocDescSet(c, d);
+        if (set == VK_NULL_HANDLE) {
+            return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "descriptor set 分配失败");
+        }
         VkDescriptorImageInfo ii{};
         ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         ii.imageView = tex->view;
         ii.sampler = samp ? samp->sampler : d.default_sampler;
         VkWriteDescriptorSet w{};
         w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = c.desc;
+        w.dstSet = set;
         w.dstBinding = 0;
         w.descriptorCount = 1;
         w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w.pImageInfo = &ii;
         g_vk.vkUpdateDescriptorSets(d.dev, 1, &w, 0, nullptr);
-        c.last_tex = tex;
-        c.last_samp = samp;
-        c.last_desc = VK_NULL_HANDLE;
-    }
-    if (c.last_desc != c.desc) {
         g_vk.vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipe_layout, 0, 1,
-                                     &c.desc, 0, nullptr);
-        c.last_desc = c.desc;
+                                     &set, 0, nullptr);
     }
     VkRect2D sc{{0, 0}, {target.w, target.h}};
     if (cmd.scissorOn) {

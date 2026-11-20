@@ -93,6 +93,19 @@ static void begin(BgpuCmd cmd, BgpuTexture target, uint32_t clear, int with_dept
     }
 }
 
+/* begin_render 但**不清**（load）：钉"同一个目标连开多趟时上一趟的内容还在"。
+ * begin() 总是带 CLEAR，所以这条得单独写。 */
+static void begin_load(BgpuCmd cmd, BgpuTexture target) {
+    BgpuRenderBeginDesc rd;
+    memset(&rd, 0, sizeof(rd));
+    rd.struct_size = (uint32_t)sizeof(rd);
+    rd.target = target;
+    rd.flags = 0;
+    if (bingpu_cmd_begin_render(cmd, &rd) != BGPU_OK) {
+        printf("  begin_render(load) 失败：%s\n", bingpu_last_error());
+    }
+}
+
 static void quad(BgpuCmd cmd, float x0, float y0, float x1, float y1, uint32_t color) {
     const BgpuVertex v[4] = {{x0, y0, 0, 0, 0, color},
                              {x1, y0, 0, 1, 0, color},
@@ -171,6 +184,60 @@ static void scene_viewport(BgpuDevice dev, BgpuCmd cmd, BgpuTexture t) {
     bingpu_cmd_set_pipeline(cmd, p);
     bingpu_cmd_set_viewport(cmd, 16, 16, 32, 32);
     quad(cmd, 0, 0, 64, 64, 0xFF123456u);
+    bingpu_cmd_end_render(cmd);
+}
+
+/* 一帧里"渲染目标 ⇄ 采样源"来回切 + 把顶点流撑过扩容点。
+ *
+ * 钉的是 0.13.0 修掉的那个 VK 缺陷：命令缓冲**先录后执行**，顶点流扩容时
+ * 前面那些 draw 已经绑了旧 buffer，旧内容必须抄进新 buffer、旧 buffer 也不能
+ * 当场销毁。否则一帧几千个四边形的页面会从扩容那一刻开始整块消失 ——
+ * 既不出错也不崩溃。bin2d/binUI 的整页渲染必然踩到，而原有的 12 个用例
+ * （每笔只有一两个四边形）一个都抓不到。
+ *
+ * 场景：目标先清底色 + 一个红块（扩容**之前**画），再画 kQuads 个绿点把顶点流
+ * 撑过 64KB，然后把目标当采样源抓一张离屏图、再贴回目标左上 32×32。 */
+static void scene_multipass(BgpuDevice dev, BgpuCmd cmd, BgpuTexture t) {
+    enum { kQuads = 1200 };
+    static BgpuVertex many[kQuads * 4];
+    const BgpuPipeline solid = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, 0);
+    const BgpuPipeline textured =
+        make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_PREMULTIPLIED, BGPU_PIPE_TEXTURED);
+    const BgpuSampler samp = make_sampler(dev, BGPU_FILTER_NEAREST, BGPU_WRAP_CLAMP);
+    int i;
+
+    begin(cmd, t, 0xFF202020u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, solid);
+    bingpu_cmd_set_scissor(cmd, 0, 0, 16, 16);
+    quad(cmd, 0, 0, 16, 16, 0xFFFF0000u);   /* 扩容前的一笔：丢了就露馅 */
+    bingpu_cmd_set_scissor(cmd, 0, 0, -1, -1);
+    for (i = 0; i < kQuads; i++) {
+        const float x = (float)(16 + (i % 32));
+        const float y = (float)(16 + ((i / 32) % 16));
+        BgpuVertex* v = many + i * 4;
+        memset(v, 0, sizeof(BgpuVertex) * 4);
+        v[0].x = x;      v[0].y = y;      v[0].color = 0xFF00C000u;
+        v[1].x = x + 1;  v[1].y = y;      v[1].color = 0xFF00C000u;
+        v[2].x = x;      v[2].y = y + 1;  v[2].color = 0xFF00C000u;
+        v[3].x = x + 1;  v[3].y = y + 1;  v[3].color = 0xFF00C000u;
+    }
+    bingpu_cmd_draw_quads(cmd, many, kQuads);
+    bingpu_cmd_end_render(cmd);
+
+    /* 目标刚渲染完就是采样源（布局 颜色附件 → 只读 来回横跳） */
+    BgpuTexture a = make_tex(dev, 64, 64, BGPU_FORMAT_RGBA8, BGPU_TEXTURE_RENDER_TARGET);
+    begin(cmd, a, 0x00000000u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, textured);
+    bingpu_cmd_set_texture(cmd, t, samp);
+    quad(cmd, 0, 0, 64, 64, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+
+    /* 同一帧里再回到目标（load，不清）：左上 32×32 盖回来 */
+    begin_load(cmd, t);
+    bingpu_cmd_set_pipeline(cmd, textured);
+    bingpu_cmd_set_texture(cmd, a, samp);
+    bingpu_cmd_set_scissor(cmd, 0, 0, 32, 32);
+    quad(cmd, 0, 0, 32, 32, 0xFFFFFFFFu);
     bingpu_cmd_end_render(cmd);
 }
 
@@ -718,6 +785,8 @@ static int parity_run(const char* label, BgpuBackendKind kind) {
     run_case("scissor", scene_scissor, 64, 64, 0, 0.0);
     run_case("viewport", scene_viewport, 64, 64, 0, 0.0);
     run_case("affine", scene_affine, 64, 64, 0, 0.0);
+    /* 一帧多趟 + 顶点流扩容（0.13.0 的 VK 缺陷）：整页渲染才会踩到的那条路 */
+    run_case("multipass(目标来回切 + 顶点流扩容)", scene_multipass, 64, 64, 0, 0.0);
     /* 双线性取样：CPU 逐像素用 double 累加、GPU 用 float 插值（D3D11 还有定点
      * 子纹素精度）→ 偶发 1 个通道差。这是"两条数值路径"的固有差异，不是不一致；
      * 容差写在这里而不是含糊过去。 */

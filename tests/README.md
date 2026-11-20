@@ -70,6 +70,7 @@ build-mingw/bin/tests/test_gl_render      # 没有可用 GL 3.3 时整份跳过�
 | `depth(LESS)` | 深度测试 + 写入，"相等不通过" |
 | `mesh(draw_indexed)` | 网格顶点布局（36 字节，零转换） |
 | `swapchain(frame_read 满幅纹理)` | **另一条回读路径**：`frame_begin → frame_end → frame_read`（离屏目标那条用 `texture_read`）。0.5.0 的两个后端 bug 只在这条路上，是 bin2d 的 GPU 桥先撞出来的 |
+| `multipass(目标来回切 + 顶点流扩容)` | 一帧里同一目标连开多趟 + 把顶点流撑过扩容点：顶点流扩容不能丢掉已录进命令缓冲的顶点、目标刚渲染完就能当采样源（0.13.0 的 VK 缺陷，原有 12 条每笔只有一两个四边形，一个都抓不到） |
 
 判据：默认**逐像素 0 差**；只有上面那条双线性用例放宽到"差异像素 ≤ 25% 且通道差 ≤ 2"。
 

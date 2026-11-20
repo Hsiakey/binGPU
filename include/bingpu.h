@@ -71,9 +71,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 12
-#define BINGPU_VERSION_PATCH 1
-#define BINGPU_VERSION_STRING "0.12.1"
+#define BINGPU_VERSION_MINOR 13
+#define BINGPU_VERSION_PATCH 0
+#define BINGPU_VERSION_STRING "0.13.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -84,7 +84,8 @@ extern "C" {
  *          2D 路径（BgpuVertex / draw_quads）一个字节没动。）
  *   ABI 4：0.12.0（新增 BGPU_VERTEX_SHAPE 枚举值 + BgpuShapeVertex +
  *          BGPU_PIPE_SHAPE + BGPU_CAP_SHAPE + bingpu_cmd_draw_shapes；
- *          既有结构体、枚举值、签名全部不变） */
+ *          既有结构体、枚举值、签名全部不变）
+ *   0.13.0 是**纯 VK 后端实现**的修复（布局/依赖/顶点流），ABI 仍是 4 —— 一个字节没动。 */
 #define BINGPU_ABI_VERSION 4u
 
 /* 句柄都是 uint64_t；0 = 无效 */
