@@ -406,4 +406,13 @@ present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` �
    不是"建不出来" —— 这条仍然成立：上层问 `BGPU_CAP_MIPMAPS` 就能分流，不需要 try/except。
 10. **一个 HWND 只能绑一个 GL 设备**：WGL 的上下文绑在 DC 上，`contracts.md` §4 本来就规定
    "一个 native_window 同一时刻只能绑一个呈现后端"。binUI 的多面板要共用一个设备，不是多个。
+11. **MSAA 在"多目标 / 图层"路径上还会丢内容**（0.14.1 记录，未修）：单目标用例（斜边、
+   两趟 LOAD、depth）都过，但 binUI 的 `svg-filter` 页（图层 + 模糊 + 多次换渲染目标 + 合成）
+   在 4× 下**整页空白** —— 对着基线是 100% 差异、最大通道差 255，同一页 1× 下是 0 差异。
+   也就是"每次换目标都新建/解析一张多采样 companion"这条链上还有一处没接对（最可能是
+   主画布的 resolve 没有落到被 present 采样的那张单采样 image 上）。在修好之前：
+   binGPU 照常报 `BGPU_CAP_MSAA`（能力是真的），但**调用方别在"一帧里多目标"的场景默认开
+   高档** —— 已知唯一受害者 binUI 的 `binui_gpu` 已显式钉 1×（见 binUI 0.37.1 的 CHANGELOG）。
+   修好之后 `image-round`（旋转边）与 `image-mip` 两页的旧账会一起清掉（实测 4× 下两页都是
+   0 差异）。
 
