@@ -213,10 +213,33 @@ int backendAvailable(BgpuBackendKind kind) noexcept {
     return 1;
 }
 
+/* 质量档：**MSAA 开不开由这一层按后端定**，不在调用方各写一份。
+ *
+ * 为什么收在这里：以前 PlanFor 无条件给 4，于是"GL 的窗口路径 4× 还坏着"这件事
+ * 变成每个调用方各自记一条"VK 才放开"的钉子（binUI 的 binui_gpu 里就有一颗）。
+ * 判断一旦分家，新接一个上层（bin2d 的 GPU 执行体正是）就得再抄一份，抄漏一次
+ * 就是"画质停在 1× 而没人发现"。档位属于设备层：哪家后端真开得对，这里最清楚。
+ *
+ * 逐后端（对应 docs/backends.md "质量档"一节）：
+ *   · VULKAN → 4：18 页对 docs/pixels 基线 0 像素差异（最大通道差 ≤7），
+ *                真 mip + 多目标 MSAA 都在 0.15.0 修通；
+ *   · GL     → 1：**窗口**路径 4× 还会丢内容，见 docs/backends.md **欠账 12**
+ *                （circle 94.6% / max 255、shadow 95.9%、svg-filter 9.1%，同页 1×
+ *                都是 0；照搬 VK 的延迟释放无改善 ⇒ 是 GL multisample FBO /
+ *                glBlitFramebuffer resolve 这条链自己的问题）。headless 用例在 GL 上
+ *                4× 是逐像素对的，但调用方要的是窗口，所以这里不给 4 —— 等欠账 12
+ *                补上窗口用例再放开，那之前上层不许自己偷偷开（那正是要消掉的钉子）;
+ *   · D3D11  → 1：D3D11 后端的 MSAA 还没做（欠账 3），caps 也报 1，不谎报；
+ *   · CPU / NULL / 一个都不可用 → 1：参考实现恒等于 1。
+ *
+ * 注：这里给的是**默认建议档**，调用方仍可在 device desc 里显式要别的值（设备会按
+ * 自己的上限降级）。读实际生效值一律看 BgpuSwapchainInfo.msaa_samples。 */
+static uint32_t msaaFor(BgpuBackendKind kind) noexcept {
+    return kind == BGPU_BACKEND_VULKAN ? 4u : 1u;
+}
+
 /* 渲染计划（0.8.0）：上层问"用哪个 API、在哪执行、什么质量档"。
- * 优先级：**VULKAN → GL → D3D11**，一个都没有就 CPU（同一套图元语义，只是执行体不同）。
- * MSAA 按后端声明的上限取 4（CPU 恒为 1）；真要在某个后端上开到别的档，
- * 由调用方在 device desc 里自己指定，这里给的是**默认建议值**。 */
+ * 优先级：**VULKAN → GL → D3D11**，一个都没有就 CPU（同一套图元语义，只是执行体不同）。 */
 BgpuResult PlanFor(BgpuBackendKind want, BgpuRenderPlan* out) noexcept {
     if (!out) return BGPU_ERR_INVALID_ARGUMENT;
     out->struct_size = sizeof(*out);
@@ -233,7 +256,7 @@ BgpuResult PlanFor(BgpuBackendKind want, BgpuRenderPlan* out) noexcept {
         if (backendAvailable(want)) {
             out->backend = want;
             out->exec = BGPU_EXEC_GPU;
-            out->msaa_samples = 4;
+            out->msaa_samples = msaaFor(want);
             return BGPU_OK;
         }
         out->backend = BGPU_BACKEND_CPU;
@@ -245,7 +268,7 @@ BgpuResult PlanFor(BgpuBackendKind want, BgpuRenderPlan* out) noexcept {
         if (!backendAvailable(k)) continue;
         out->backend = k;
         out->exec = BGPU_EXEC_GPU;
-        out->msaa_samples = 4;
+        out->msaa_samples = msaaFor(k);
         return BGPU_OK;
     }
     out->backend = BGPU_BACKEND_CPU;

@@ -267,6 +267,23 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
 本机（RTX 4060 Ti / 驱动 610.x）实测：**VK 与 GL 的 `caps.msaa_samples` 都是 8**，
 两个后端都带 `MSAA` + `MIPMAPS` 位；D3D11 / CPU / NULL 仍是 1、没有这两个位。
 
+### 档位由谁定：`bingpu_render_plan` 按后端给（2026-11-20）
+
+**"开不开 MSAA"收在设备层**，不在调用方各写一份（以前 binUI 的 `binui_gpu` 与 bin2d 的
+`GpuExec` 各有一颗"只有 VK 放开 4×"的钉子，漏抄一次就是画质悄悄停在 1×）。
+`bingpu_render_plan()` 返回的 `msaa_samples` 就是**该后端该给的默认档**：
+
+| 后端 | `plan.msaa_samples` | 理由 |
+|---|---|---|
+| `BGPU_BACKEND_VULKAN` | **4** | 18 页对 `binUI/docs/pixels` 基线 0 像素差异（最大通道差 ≤7），多目标 MSAA 与真 mip 都在 0.15.0 修通 |
+| `BGPU_BACKEND_GL` | **1** | **窗口**路径 4× 还会丢内容，见下面欠账 12（照搬 VK 的延迟释放无改善）；headless 用例在 GL 上 4× 是逐像素对的，等窗口用例补上再放开 |
+| `BGPU_BACKEND_D3D11` | 1 | D3D11 后端的 MSAA 还没做（欠账 3），caps 也报 1，不谎报 |
+| `BGPU_BACKEND_CPU` / `NULL` / 一个都不可用 | 1 | 参考实现恒为 1 |
+
+调用方**直接采信**这一项（`dd.msaa_samples = plan.msaa_samples`），想要别的档再在
+`BgpuDeviceDesc` 里显式指定；实际生效值一律读 `bingpu_swapchain_info().msaa_samples`。
+行为变化不需要改 ABI：结构体布局没动。
+
 ### VK：多采样附件 + pass 末 resolve；mip 逐级 blit
 
 - **MSAA**：设备档 `d.msaa`（按 `desc.msaa_samples` 与

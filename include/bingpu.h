@@ -88,8 +88,8 @@ extern "C" {
 
 #define BINGPU_VERSION_MAJOR 0
 #define BINGPU_VERSION_MINOR 15
-#define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.15.0"
+#define BINGPU_VERSION_PATCH 1
+#define BINGPU_VERSION_STRING "0.15.1"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -199,7 +199,13 @@ typedef struct BgpuRenderPlan {
  *   want = BGPU_BACKEND_AUTO 时按 **VULKAN → GL → D3D11** 取第一个可用的 GPU 后端；
  *          一个都没有则返回 exec=CPU、backend=CPU（也就是"没显卡，用 CPU 算"）。
  *   want 指定某个后端时，只在那一个上判断（不可用则同样退 CPU 并在 last_error 里说明）。
- * 这是**唯一**该被上层用来决定"用 GPU 还是 CPU"的入口。 */
+ *
+ * 返回的 msaa_samples 是**按后端定好的质量档**（0.15.x）：VULKAN = 4，GL / D3D11 /
+ * CPU = 1。GL 只给 1 是因为窗口路径 4× 还有欠账（docs/backends.md 欠账 12），不是
+ * 忘了开 —— 上层**直接采信**这一项即可，不许再写"哪个后端能开 MSAA"的判断。
+ * 实际生效值仍然读 BgpuSwapchainInfo.msaa_samples（设备可能按自己的上限降级）。
+ *
+ * 这是**唯一**该被上层用来决定"用 GPU 还是 CPU、开不开 MSAA"的入口。 */
 BgpuResult bingpu_render_plan(BgpuBackendKind want, BgpuRenderPlan* out_plan);
 /* "gpu" / "cpu"，只用于日志 */
 const char* bingpu_exec_mode_name(BgpuExecMode mode);
