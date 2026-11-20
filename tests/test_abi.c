@@ -83,8 +83,13 @@ static void test_version(void) {
      * 2D 路径（BgpuVertex / draw_quads）一个字节没动 —— 那一行的断言仍然钉 24。
      * 枚举值全部是追加，旧二进制调用方不受影响。
      *   ABI 4 = 0.12.0 追加 BGPU_VERTEX_SHAPE / BgpuShapeVertex / BGPU_PIPE_SHAPE /
-     *           BGPU_CAP_SHAPE / bingpu_cmd_draw_shapes。既有结构体与签名未动。 */
-    CHECK_EQ(BINGPU_ABI_VERSION, 5u);
+     *           BGPU_CAP_SHAPE / bingpu_cmd_draw_shapes。既有结构体与签名未动。
+     *   ABI 5 = 0.14.0 追加 BGPU_CAP_MSAA / BGPU_CAP_MIPMAPS 两个 cap 位。
+     *   ABI 6 = 0.16.0 追加 BGPU_RENDER_DEFER_RESOLVE 枚举值 +
+     *           bingpu_cmd_resolve_target 签名。结构体布局仍然一个字节没动。 */
+    CHECK_EQ(BINGPU_ABI_VERSION, 6u);
+    /* 0.16 的延迟 resolve 位：值必须等于 1<<2，老调用方的 flags 里不会有它 */
+    CHECK_EQ((uint32_t)BGPU_RENDER_DEFER_RESOLVE, 4u);
     /* 结构体布局是 ABI 的一部分（头里也 static_assert 了，这里再钉一次） */
     CHECK_EQ(sizeof(BgpuVertex), 24u);
     CHECK_EQ(sizeof(BgpuMeshVertex), 40u);
@@ -435,6 +440,10 @@ static void test_state_machine(void) {
     CHECK(bingpu_cmd_begin_render(cmd, &rb) == BGPU_OK);
     /* 重复 begin_render */
     CHECK(bingpu_cmd_begin_render(cmd, &rb) == BGPU_ERR_STATE);
+    /* 0.16：resolve_target 不能在渲染实例里调用（要插也只能插在两次
+     * vkCmd*Rendering 之间，API 层直接挡掉） */
+    CHECK(bingpu_cmd_resolve_target(cmd, rt) == BGPU_ERR_STATE);
+    check_error_shape("bingpu_cmd_resolve_target");
     /* 没有 set_pipeline 就 draw */
     CHECK(bingpu_cmd_draw_quads(cmd, quad, 1) == BGPU_ERR_STATE);
     CHECK(bingpu_cmd_set_pipeline(cmd, pipe) == BGPU_OK);
@@ -442,6 +451,11 @@ static void test_state_machine(void) {
     /* 空绘制合法 */
     CHECK(bingpu_cmd_draw_quads(cmd, NULL, 0) == BGPU_OK);
     CHECK(bingpu_cmd_end_render(cmd) == BGPU_OK);
+    /* 0.16：没有挂起 resolve 的后端 / 目标上，resolve_target 是 no-op（OK）。
+     * NULL 后端没有多采样，天然"无事可做"，这条钉的是"不会因此报错"。 */
+    CHECK(bingpu_cmd_resolve_target(cmd, rt) == BGPU_OK);
+    CHECK(bingpu_cmd_resolve_target(BGPU_INVALID, rt) == BGPU_ERR_INVALID_HANDLE);
+    CHECK(bingpu_cmd_resolve_target(cmd, BGPU_INVALID) == BGPU_ERR_INVALID_HANDLE);
     /* frame 里还在 render 就 frame_end */
     CHECK(bingpu_cmd_begin_render(cmd, &rb) == BGPU_OK);
     CHECK(bingpu_frame_end(sc, cmd) == BGPU_ERR_STATE);

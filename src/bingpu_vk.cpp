@@ -210,6 +210,7 @@ struct VkFns {
     BGPU_VK_FN(vkCmdCopyBufferToImage);
     BGPU_VK_FN(vkCmdCopyImageToBuffer);
     BGPU_VK_FN(vkCmdBlitImage);
+    BGPU_VK_FN(vkCmdResolveImage);
     BGPU_VK_FN(vkCmdPipelineBarrier);
     BGPU_VK_FN(vkQueueSubmit);
     BGPU_VK_FN(vkCreateFence);
@@ -344,6 +345,7 @@ bool loadVulkan() {
     BGPU_LOAD(vkCmdCopyBufferToImage);
     BGPU_LOAD(vkCmdCopyImageToBuffer);
     BGPU_LOAD(vkCmdBlitImage);
+    BGPU_LOAD(vkCmdResolveImage);
     BGPU_LOAD(vkCmdPipelineBarrier);
     BGPU_LOAD(vkQueueSubmit);
     BGPU_LOAD(vkCreateFence);
@@ -467,6 +469,26 @@ inline bool trace2() {
     return on;
 }
 
+/* 每帧"1×→4× LOAD 预置 blit / pass 末 resolve"的次数与吞吐（0.16 的分账工具）。
+ * 打开后只在 frame_end 打**一行**，不掺进逐笔日志。 */
+inline bool traceResolve() {
+    static const bool on = std::getenv("BINGPU_TRACE_RESOLVE") != nullptr;
+    return on;
+}
+
+/* 0.16 的自动延迟策略（只对整窗尺寸的目标、一帧里第 2 趟起 defer）可以用环境变量
+ * 关掉：量 A/B 时要一个"和 0.15.1 的 resolve 时机完全一样"的对照命令流。
+ * 它不是质量开关 —— 只影响 resolve 的**时机**，两种设置的像素应当逐位相同。 */
+inline bool noAutoDefer() {
+    static const bool on = std::getenv("BINGPU_NO_AUTO_DEFER") != nullptr;
+    return on;
+}
+/* 逐 pass 一行（尺寸 + CLEAR/LOAD + 采样数），用来核实"每帧几个整窗往返"。 */
+inline bool tracePasses() {
+    static const bool on = std::getenv("BINGPU_TRACE_PASSES") != nullptr;
+    return on;
+}
+
 /* 直通 → 预乘（上传时做，raster_rules §9） */
 void premultiply(uint8_t* px, size_t count) {
     for (size_t i = 0; i < count; i++) {
@@ -559,6 +581,13 @@ struct VkDeviceObj final : Device {
     std::vector<Retired> retired;
     std::vector<RetiredBuffer> retired_buffers;
     uint32_t recording_cbs = 0;   /* 正在录制的命令缓冲数（>0 时销毁要推迟） */
+    /* 0.16 分账：一帧里的 LOAD 预置 blit / resolve 次数与像素量（BINGPU_TRACE_RESOLVE） */
+    uint32_t frame_blits = 0;
+    uint32_t frame_resolves = 0;
+    uint64_t frame_blit_px = 0;
+    uint64_t frame_resolve_px = 0;
+    uint32_t frame_blits_big = 0;     /* 其中"整窗尺寸"（画布 / 贴屏目标）的次数 */
+    uint32_t frame_resolves_big = 0;
     void retire(VkImage image, VkImageView view, VkDeviceMemory mem) {
         retired.push_back(Retired{image, view, mem});
     }
@@ -601,6 +630,18 @@ struct VkTextureObj final : Texture {
     uint32_t msaa_samples = 0;    /* companion 的采样数；0 = 还没建 */
     uint32_t msaa_w = 0, msaa_h = 0;
     VkFormat msaa_fmt = VK_FORMAT_UNDEFINED;
+    /* 0.16 延迟 resolve 的两条状态（ABI 6）：
+     *   msaa_valid      —— 4× companion 里的内容就是这张图的最新内容（LOAD 时不必再从
+     *                      1× image 回灌）；只有 image 被外部写（上传 / 换交换链图）才失效。
+     *   resolve_pending —— 1× image 落后于 companion（DEFER_RESOLVE 结束的 pass），
+     *                      谁要采样它就得先 resolve。 */
+    bool msaa_valid = false;
+    bool resolve_pending = false;
+    /* 一帧里这张目标被 begin_render 了几次（0.16 自动延迟策略用）：
+     * 第 2 趟起才 defer —— 只进出一次的目标 defer 不省任何东西（结束时终究要 resolve），
+     * 反而把 resolve 推迟到采样那一趟、多一次状态切换。 */
+    uint32_t pass_frame_stamp = 0xFFFFFFFFu;
+    uint32_t pass_count = 0;
     /* 交换链借出的目标是**别人的** image/view：析构时绝不能销毁（第一版就是
      * 把交换链的 image 当自己的销毁，窗口烟测直接崩）。 */
     bool own_image = true;
@@ -723,6 +764,8 @@ struct VkCmdObj final : Cmd {
     VkFormat depth_fmt = VK_FORMAT_UNDEFINED;
     /* 当前 pass 的采样数（1 或设备的 msaa 档）：管线缓存键必须带上它。 */
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    /* 当前 pass 结束时会不会 resolve（begin_render 定；DEFER_RESOLVE 时是 false）。 */
+    bool pass_resolves = false;
 
     /* 顶点流：每帧重置、按需增长；draw_quads 追加后一次 draw_indexed 画出 */
     VkBuffer vbuf = VK_NULL_HANDLE;
@@ -848,6 +891,7 @@ public:
     BgpuResult beginRender(Cmd& cmd, Texture& target, Texture* depth,
                            const BgpuRenderBeginDesc& desc) override;
     BgpuResult endRender(Cmd& cmd) override;
+    BgpuResult resolveTarget(Cmd& cmd, Texture& target) override;
 
 protected:
     BgpuResult rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t quad_count) override;
@@ -869,6 +913,13 @@ private:
     /* 懒建 / 复用 MSAA 颜色 companion（失败返回 false）。 */
     bool ensureMsaa(VkTextureObj& t, VkDeviceObj& d);
     void transitionMsaa(VkCmdObj& c, VkTextureObj& t, VkImageLayout want);
+    /* 0.16 延迟 resolve：把挂起的 companion→1× resolve 立刻补上（必要时暂停/恢复
+     * 当前渲染实例）。返回 OK 时 t.resolve_pending 一定是 false。 */
+    BgpuResult resolvePending(VkCmdObj& c, VkDeviceObj& d, VkTextureObj& t);
+    /* 把当前渲染实例收起来 / 原样开回去（自愈 resolve 要插在两次 vkCmd*Rendering
+     * 之间）。收起来的 pass 一律用 LOAD 恢复：clear 已经落进附件，内容不能丢。 */
+    void suspendPass(VkCmdObj& c);
+    BgpuResult resumePass(VkCmdObj& c);
     bool createDescPool(VkDeviceObj& d);
     VkDescriptorSet allocDescSet(VkCmdObj& c, VkDeviceObj& d);
     void resetDescSets(VkCmdObj& c, VkDeviceObj& d);
@@ -1410,9 +1461,12 @@ BgpuResult VkBackend::transitionImpl(VkCmdObj& c, VkTextureObj& t, VkImageLayout
             dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
             break;
         case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-            b.srcAccessMask = 0;
+            /* 0.16：resolve 也要走这条（写 1× 镜像）。以前 srcAccess=0 + TOP_OF_PIPE
+             * 是给"新建图第一次上传"用的；对已渲染过的图太弱（WAR 不成立），
+             * 这里收回成"等所有先前的写/读落地"，对上传那条路只是多一次等待。 */
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
+                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
             b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
             dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
             break;
         case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
@@ -1586,7 +1640,13 @@ BgpuResult VkBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
         /* 借一个临时的 Cmd 对象壳，只为复 transition() 里录命令那段 */
         VkCmdObj tmp_cmd(*this, d.self, d);
         tmp_cmd.cb = cb;
-        transition(tmp_cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        /* 0.16：上传要写 1× 镜像。若这张图还挂着"延迟 resolve"，先把 companion 里
+         * 的最新内容落进镜像，再叠上传 —— 否则上传块会被后来的 resolve 覆盖掉。 */
+        if (t.resolve_pending) {
+            const BgpuResult rr = resolvePending(tmp_cmd, d, t);
+            if (rr != BGPU_OK) ok = false;
+        }
+        if (ok) transition(tmp_cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy region{};
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.imageOffset = {static_cast<int32_t>(b.x), static_cast<int32_t>(b.y), 0};
@@ -1640,6 +1700,9 @@ BgpuResult VkBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
     g_vk.vkDestroyBuffer(d.dev, staging, nullptr);
     g_vk.vkFreeMemory(d.dev, staging_mem, nullptr);
     if (!ok) return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "上传提交失败");
+    /* 镜像被外部写过：4× companion 不再是"最新内容"，下一趟 LOAD 必须重新回灌。 */
+    t.msaa_valid = false;
+    t.resolve_pending = false;
     d.bytes_uploaded += bytes;
     return BGPU_OK;
 }
@@ -1694,21 +1757,27 @@ bool VkBackend::copyTextureToHost(VkDeviceObj& dev, VkTextureObj& t, void* dst,
         g_vk.vkBeginCommandBuffer(cb, &bi);
         VkCmdObj tmp_cmd(*this, dev.self, dev);
         tmp_cmd.cb = cb;
-        transition(tmp_cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        VkBufferImageCopy region{};
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent = {t.w, t.h, 1};
-        g_vk.vkCmdCopyImageToBuffer(cb, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1,
-                                    &region);
-        transition(tmp_cmd, t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        /* 0.16：回读要的是 1× 内容 —— 挂起的 resolve 先补上。 */
+        if (t.resolve_pending && resolvePending(tmp_cmd, dev, t) != BGPU_OK) ok = false;
+        if (ok) {
+            transition(tmp_cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {t.w, t.h, 1};
+            g_vk.vkCmdCopyImageToBuffer(cb, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1,
+                                        &region);
+            transition(tmp_cmd, t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
         g_vk.vkEndCommandBuffer(cb);
-        g_vk.vkResetFences(dev.dev, 1, &dev.fence);
-        VkSubmitInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cb;
-        ok = g_vk.vkQueueSubmit(dev.queue, 1, &si, dev.fence) == VK_SUCCESS &&
-             g_vk.vkWaitForFences(dev.dev, 1, &dev.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        if (ok) {
+            g_vk.vkResetFences(dev.dev, 1, &dev.fence);
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cb;
+            ok = g_vk.vkQueueSubmit(dev.queue, 1, &si, dev.fence) == VK_SUCCESS &&
+                 g_vk.vkWaitForFences(dev.dev, 1, &dev.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        }
         g_vk.vkFreeCommandBuffers(dev.dev, dev.cmd_pool, 1, &cb);
     }
     if (ok) {
@@ -2202,6 +2271,8 @@ bool VkBackend::ensureSwapchain(Swapchain& sc_, uint32_t w, uint32_t h) {
         sc.borrow->vfmt = ot->vfmt;
         sc.borrow->tex_flags = BGPU_TEXTURE_RENDER_TARGET;
         sc.borrow->is_depth = false;
+        sc.borrow->msaa_valid = false;
+        sc.borrow->resolve_pending = false;
         return true;
     }
 
@@ -2322,6 +2393,8 @@ bool VkBackend::ensureSwapchain(Swapchain& sc_, uint32_t w, uint32_t h) {
     sc.borrow->tex_flags = BGPU_TEXTURE_RENDER_TARGET;
     sc.borrow->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     sc.borrow->is_depth = false;
+    sc.borrow->msaa_valid = false;
+    sc.borrow->resolve_pending = false;
     return true;
 }
 
@@ -2493,11 +2566,23 @@ BgpuResult VkBackend::frameBegin(Swapchain& sc_, Cmd& cmd, BgpuTexture* out) {
     sc.borrow->image = sc.images[index];
     sc.borrow->view = sc.views[index];
     sc.borrow->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    /* 每帧借到的图像可能换了一张（窗口模式）：companion 里是**上一张图**的内容，
+     * 不能再当成"这张图的最新内容"；挂起的 resolve 也一并作废（镜像内容未定义）。 */
+    sc.borrow->msaa_valid = false;
+    sc.borrow->resolve_pending = false;
     sc.borrow->w = sc.extent.width;
     sc.borrow->h = sc.extent.height;
 
     c.inFrame = true;
     c.frame = &sc_;
+    if (traceResolve()) {
+        d.frame_blits = 0;
+        d.frame_resolves = 0;
+        d.frame_blit_px = 0;
+        d.frame_resolve_px = 0;
+        d.frame_blits_big = 0;
+        d.frame_resolves_big = 0;
+    }
     if (!beginRecording(c, d)) {
         c.inFrame = false;
         c.frame = nullptr;
@@ -2534,12 +2619,30 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
         c.depth_fmt = dt.vfmt;
         depth_view = dt.view;
     }
+    /* 0.16：这一趟的 1× 结果要不要。
+     *   · 显式 DEFER_RESOLVE：调用方说了不要（任何尺寸都听）；
+     *   · 自动策略：只对**整窗尺寸**的目标、且是这一帧里第 2 趟起 defer。
+     *     为什么是整窗尺寸：bin2D 的层/blur 目标按元素尺寸分配（0.22.8），它们刚画完
+     *     就立刻被父级合成采样 —— defer 一定紧接着自愈，白拆一次 pass；真正被
+     *     "离开再回来"反复进出的是画布/贴屏目标（整窗），那个 4×→1× 才是纯浪费。
+     *     正确性由 resolvePending 的自愈兜住（被采样前一定已经 resolve 过）。 */
+    const uint32_t pass_no = (t.pass_frame_stamp == d.frame_index) ? t.pass_count + 1u : 1u;
+    t.pass_frame_stamp = d.frame_index;
+    t.pass_count = pass_no;
+    const bool full_surface = static_cast<uint64_t>(t.w) * t.h >=
+                              static_cast<uint64_t>(d.w) * d.h;
+    const bool defer_resolve =
+        use_msaa && ((desc.flags & BGPU_RENDER_DEFER_RESOLVE) != 0 ||
+                     (c.inFrame && pass_no >= 2u && full_surface && !noAutoDefer()));
     if (use_msaa) {
         /* LOAD 的 pass 必须先从**单采样镜像**把已有内容搬进多采样附件 —— 上一趟
          * 结束时内容已经 resolve 到单采样镜像里，多采样附件本身不保留它。
          * （没有 CLEAR 又没有历史内容的帧这里搬的是未定义数据，与不用 MSAA 时
-         *  loadOp=LOAD 的语义一致。） */
-        if (!(desc.flags & BGPU_RENDER_CLEAR_COLOR)) {
+         *  loadOp=LOAD 的语义一致。）
+         *
+         * 0.16：companion 里**本来就是这张图的最新内容**时（上一趟刚画完 / 刚 resolve），
+         * 这次回灌是纯多余的全窗往返 —— 直接跳过，接着在 companion 上画。 */
+        if (!(desc.flags & BGPU_RENDER_CLEAR_COLOR) && !t.msaa_valid) {
             if (transitionImpl(c, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, /*force=*/false) !=
                 BGPU_OK) {
                 cmd.inRender = false;
@@ -2553,6 +2656,10 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
             blit.dstOffsets[1] = {static_cast<int32_t>(t.w), static_cast<int32_t>(t.h), 1};
             g_vk.vkCmdBlitImage(c.cb, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.msaa_image,
                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+            d.frame_blits++;
+            d.frame_blit_px += static_cast<uint64_t>(t.w) * t.h;
+            if (static_cast<uint64_t>(t.w) * t.h >= static_cast<uint64_t>(d.w) * d.h)
+                d.frame_blits_big++;
         }
         if (transitionImpl(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, /*force=*/true) !=
             BGPU_OK) {
@@ -2561,6 +2668,8 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
         }
         transitionMsaa(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         c.samples = toVkSamples(d.msaa);
+        t.msaa_valid = true;        /* 从这一刻起 companion 是"最新内容"的持有者 */
+        t.resolve_pending = false;  /* 这一趟开始前 1× 上没有挂着的 resolve */
     } else {
         if (transitionImpl(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, /*force=*/true) !=
             BGPU_OK) {
@@ -2577,13 +2686,15 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
     color_att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     color_att.imageView = use_msaa ? t.msaa_view : t.view;
     color_att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    if (use_msaa) {
+    /* 0.16：这一趟不需要 1× 结果时不落 1×（DEFER_RESOLVE / 自动策略）。 */
+    if (use_msaa && !defer_resolve) {
         /* 动态渲染的 resolve：vkCmdEndRendering 时自动把 N 个样本平均进单采样镜像。
          * 之后 frame_read / 采样 / 下一次 LOAD 看到的都是单采样结果。 */
         color_att.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
         color_att.resolveImageView = t.view;
         color_att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     }
+    c.pass_resolves = use_msaa && !defer_resolve;
     color_att.loadOp = (desc.flags & BGPU_RENDER_CLEAR_COLOR) ? VK_ATTACHMENT_LOAD_OP_CLEAR
                                                               : VK_ATTACHMENT_LOAD_OP_LOAD;
     color_att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2636,6 +2747,10 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
     VkRect2D scissor{{0, 0}, {t.w, t.h}};
     g_vk.vkCmdSetScissor(c.cb, 0, 1, &scissor);
     c.have_state = false;
+    if (tracePasses())
+        std::fprintf(stderr, "[vk][pass] %ux%u %s msaa=%u\n", t.w, t.h,
+                     (desc.flags & BGPU_RENDER_CLEAR_COLOR) ? "CLEAR" : "LOAD",
+                     use_msaa ? d.msaa : 1u);
     return BGPU_OK;
 }
 
@@ -2649,15 +2764,167 @@ BgpuResult VkBackend::endRender(Cmd& cmd) {
         c.rendering = false;
     }
     VkTextureObj* t = c.target ? static_cast<VkTextureObj*>(c.target) : nullptr;
+    /* 0.16：这一趟按 DEFER 结束 ⇒ 1× image 落后（挂起），companion 仍是权威内容。
+     * 谁要采样 / 回读它，谁就得先把这次 resolve 补上（见 resolvePending）。 */
+    if (t && c.samples != VK_SAMPLE_COUNT_1_BIT) {
+        if (c.pass_resolves) {
+            VkDeviceObj& dd = static_cast<VkDeviceObj&>(*lookupObject(cmd.device, kObjDevice));
+            dd.frame_resolves++;
+            dd.frame_resolve_px += static_cast<uint64_t>(t->w) * t->h;
+            if (static_cast<uint64_t>(t->w) * t->h >= static_cast<uint64_t>(dd.w) * dd.h)
+                dd.frame_resolves_big++;
+            t->resolve_pending = false;
+        } else {
+            t->resolve_pending = true;
+        }
+    }
     BgpuResult r = BackendBase::endRender(cmd);
     if (r != BGPU_OK) return r;
 
     if (!c.inFrame) {
-        /* 离屏：这一段自己提交并等完成，之后纹理可采样/可回读 */
+        /* 离屏：这一段自己提交并等完成，之后纹理可采样/可回读。
+         * 0.16：挂了 resolve 的时候不转到 SHADER_READ_ONLY —— 1× 还是旧的，
+         * 转布局没有意义；真正被采样/回读时由 resolvePending 补完再转。 */
         VkDeviceObj& d = static_cast<VkDeviceObj&>(*lookupObject(cmd.device, kObjDevice));
-        if (t) transition(c, *t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (t && !t->resolve_pending) transition(c, *t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         if (!submitNow(d, c)) {
             return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "离屏提交失败");
+        }
+    }
+    return BGPU_OK;
+}
+
+/* ---------------------------------------------------------------
+ * 0.16：延迟 resolve 的自愈
+ *
+ * 不变量：`resolve_pending == true` 的目标，1× 镜像落后于 4× companion。
+ * 谁要读那张 1×（采样 / texture_read / frame_read / 显式 resolve），就先把这次
+ * resolve 补上 —— 上层**不需要**记住哪一趟 defer 了哪一张。
+ *
+ * 难点只有一个：采样发生在渲染实例**内部**（rasterQuads 里绑 sampler），而
+ * vkCmdResolveImage 不能在渲染实例里录。所以这里把当前实例收起来（endRendering
+ * 会把 4× 附件存回去）、resolve 完再原样开回去（LOAD）。这条路径只在"被 defer 的
+ * 目标真的要被采样"时走一次，正常帧里每个目标至多一次。
+ * --------------------------------------------------------------- */
+void VkBackend::suspendPass(VkCmdObj& c) {
+    if (!c.rendering) return;
+    g_vk.vkCmdEndRendering(c.cb);
+    c.rendering = false;
+}
+
+BgpuResult VkBackend::resumePass(VkCmdObj& c) {
+    /* 目标/深度从 cmd 的**当前状态**取（不是另存指针）：帧中途销毁时
+     * Cmd::onPeerDestroyed 会把它们清成 nullptr，这里就不会去碰悬垂对象。 */
+    VkTextureObj* t = c.target ? static_cast<VkTextureObj*>(c.target) : nullptr;
+    if (!t) return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "没有可恢复的渲染实例");
+    VkTextureObj* dt = c.depth ? static_cast<VkTextureObj*>(c.depth) : nullptr;
+    const bool msaa = c.samples != VK_SAMPLE_COUNT_1_BIT;
+    VkRenderingAttachmentInfo color_att{};
+    color_att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_att.imageView = msaa ? t->msaa_view : t->view;
+    color_att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    /* resolve 策略跟着原 pass：defer 的 pass 恢复后仍然 defer。 */
+    if (msaa && c.pass_resolves) {
+        color_att.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        color_att.resolveImageView = t->view;
+        color_att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    /* 原 pass 的 clear 已经落进附件了，恢复一律用 LOAD（不能重清）。 */
+    color_att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color_att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingAttachmentInfo depth_att{};
+    depth_att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depth_att.imageView = dt ? dt->view : VK_NULL_HANDLE;
+    depth_att.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depth_att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth_att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo ri{};
+    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    ri.renderArea = {{0, 0}, {t->w, t->h}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &color_att;
+    ri.pDepthAttachment = dt ? &depth_att : nullptr;
+    g_vk.vkCmdBeginRendering(c.cb, &ri);
+    c.rendering = true;
+
+    VkViewport vp{};
+    vp.width = static_cast<float>(t->w);
+    vp.height = static_cast<float>(t->h);
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    g_vk.vkCmdSetViewport(c.cb, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {t->w, t->h}};
+    g_vk.vkCmdSetScissor(c.cb, 0, 1, &scissor);
+    /* 实例边界会打断"上一笔的状态"：管线/深度状态重新下发。 */
+    c.have_state = false;
+    c.last_pipe = VK_NULL_HANDLE;
+    return BGPU_OK;
+}
+
+BgpuResult VkBackend::resolvePending(VkCmdObj& c, VkDeviceObj& d, VkTextureObj& t) {
+    if (!t.resolve_pending) return BGPU_OK;
+    if (t.msaa_image == VK_NULL_HANDLE || t.msaa_samples < 2) {
+        t.resolve_pending = false;
+        return BGPU_OK;
+    }
+    bool suspended = false;
+    if (c.rendering) {
+        if (c.target == &t) {
+            /* 采样自己正在画的目标 = 反馈回路，本来就是非法用法；拆 pass 也救不了它。 */
+            if (traceResolve())
+                std::fprintf(stderr, "[vk][resolve] 跳过：%ux%u 是当前 pass 的目标（反馈回路）\n",
+                             t.w, t.h);
+            return BGPU_OK;
+        }
+        suspendPass(c);
+        suspended = true;
+    }
+    BgpuResult r = transitionImpl(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, /*force=*/false);
+    if (r == BGPU_OK) {
+        transitionMsaa(c, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkImageResolve rr{};
+        rr.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        rr.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        rr.extent = {t.w, t.h, 1};
+        g_vk.vkCmdResolveImage(c.cb, t.msaa_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rr);
+        /* 回到附件布局：后续 transition（SHADER_READ_ONLY / TRANSFER_SRC）都按
+         * "源是颜色附件"写访问掩码。 */
+        r = transitionImpl(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, /*force=*/false);
+    }
+    if (r != BGPU_OK) {
+        if (suspended) (void)resumePass(c);
+        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "延迟 resolve 失败");
+    }
+    t.resolve_pending = false;
+    t.msaa_valid = true;
+    d.frame_resolves++;
+    d.frame_resolve_px += static_cast<uint64_t>(t.w) * t.h;
+    if (static_cast<uint64_t>(t.w) * t.h >= static_cast<uint64_t>(d.w) * d.h)
+        d.frame_resolves_big++;
+    if (traceResolve())
+        std::fprintf(stderr, "[vk][resolve] self-heal %ux%u（采样/回读前补一次）\n", t.w, t.h);
+    if (suspended) return resumePass(c);
+    return BGPU_OK;
+}
+
+BgpuResult VkBackend::resolveTarget(Cmd& cmd, Texture& target) {
+    VkCmdObj& c = static_cast<VkCmdObj&>(cmd);
+    VkTextureObj& t = static_cast<VkTextureObj&>(target);
+    if (!t.resolve_pending) return BGPU_OK;   /* 没挂起的：no-op */
+    VkDeviceObj& d = static_cast<VkDeviceObj&>(*lookupObject(target.device, kObjDevice));
+    if (!beginRecording(c, d)) {
+        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "命令缓冲开始记录失败");
+    }
+    const BgpuResult r = resolvePending(c, d, t);
+    if (r != BGPU_OK) return r;
+    if (!c.inFrame) {
+        transition(c, t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (!submitNow(d, c)) {
+            return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "resolve_target 提交失败");
         }
     }
     return BGPU_OK;
@@ -2683,6 +2950,11 @@ BgpuResult VkBackend::frameEnd(Swapchain& sc_, Cmd& cmd) {
         VkCmdObj& cc = c;
         if (!cc.recording && !beginRecording(cc, d)) {
             return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "帧尾命令缓冲开始失败");
+        }
+        /* 0.16：贴屏目标被 DEFER 过的话，回读/呈现之前先落一次 1×。 */
+        {
+            const BgpuResult rr = resolvePending(cc, d, t);
+            if (rr != BGPU_OK) return rr;
         }
         transition(cc, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy region{};
@@ -2714,6 +2986,19 @@ BgpuResult VkBackend::frameEnd(Swapchain& sc_, Cmd& cmd) {
         sc.frames++;
         sc.dev->frames_presented++;
         sc.dev->frame_index++;
+    }
+
+    if (traceResolve()) {
+        /* 每帧一行：LOAD 预置 blit 的次数/像素、pass 末 resolve 的次数/像素。
+         * 4× 的采样数是 resolve 的写入量 = 1× 像素 × 4；读同为 4× —— 带宽估算用。 */
+        const double mb = 1.0 / (1024.0 * 1024.0);
+        std::fprintf(stderr,
+                     "[vk][resolve] frame=%u blits=%u/%u_big (%.2f Mpx, 1x->4x %.2f MB+%.2f MB) "
+                     "resolves=%u/%u_big (%.2f Mpx, 4x->1x %.2f MB+%.2f MB)\n",
+                     sc.dev->frame_index, d.frame_blits, d.frame_blits_big,
+                     d.frame_blit_px / 1e6, d.frame_blit_px * 4.0 * mb, d.frame_blit_px * 16.0 * mb,
+                     d.frame_resolves, d.frame_resolves_big, d.frame_resolve_px / 1e6,
+                     d.frame_resolve_px * 16.0 * mb, d.frame_resolve_px * 4.0 * mb);
     }
 
     return BGPU_OK;
@@ -2815,10 +3100,6 @@ BgpuResult VkBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
     if (pipe == VK_NULL_HANDLE) {
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "管线创建失败");
     }
-    if (pipe != c.last_pipe) {
-        g_vk.vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        c.last_pipe = pipe;
-    }
 
     /* 纹理：没开 TEXTURED 或没绑纹理 → 1×1 预乘白（raster_rules §6） */
     VkTextureObj* tex = d.white;
@@ -2830,7 +3111,17 @@ BgpuResult VkBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
     /* 采样前必须把它转到 SHADER_READ_ONLY：目标刚渲染完（布局是 COLOR_ATTACHMENT）
      * 就要在这里转回来 —— 这个"来回横跳"是 end_render 之后**必须**补的那一步，
      * 因为离屏 pass 在帧内不会自动转（帧内的 end_render 只结束渲染实例）。
-     * transition 自己会在布局已经对的时候跳过，不会白插 barrier。 */
+     * transition 自己会在布局已经对的时候跳过，不会白插 barrier。
+     * 0.16：这张图如果挂着"延迟 resolve"，1× 还是旧的 —— 先补一次再采样。
+     * 自愈会拆/合当前渲染实例，所以管线绑定放在它**后面**（resumePass 会清 last_pipe）。 */
+    if (tex != &target && tex->resolve_pending) {
+        const BgpuResult rr = resolvePending(c, d, *tex);
+        if (rr != BGPU_OK) return rr;
+    }
+    if (pipe != c.last_pipe) {
+        g_vk.vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        c.last_pipe = pipe;
+    }
     transition(c, *tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     {
         const VkDescriptorSet set = allocDescSet(c, d);
@@ -2978,10 +3269,6 @@ BgpuResult VkBackend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset
     if (pipe == VK_NULL_HANDLE) {
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "管线创建失败");
     }
-    if (pipe != c.last_pipe) {
-        g_vk.vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        c.last_pipe = pipe;
-    }
     VkTextureObj* tex = d.white;
     VkSamplerObj* samp = nullptr;
     if ((p.pipe_flags & BGPU_PIPE_TEXTURED) && c.tex) {
@@ -2989,7 +3276,17 @@ BgpuResult VkBackend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset
         samp = c.samp ? static_cast<VkSamplerObj*>(c.samp) : nullptr;
     }
     /* 同 rasterQuads：采样前一定把布局转回 SHADER_READ_ONLY，并**逐笔**拿一个新的
-     * descriptor set（set 内容是执行期读的，跨笔共用会串）。 */
+     * descriptor set（set 内容是执行期读的，跨笔共用会串）。
+     * 0.16：挂着延迟 resolve 的采样源先补一次（见 resolvePending）；管线绑定放在
+     * 自愈之后（resumePass 会清 last_pipe）。 */
+    if (tex != &target && tex->resolve_pending) {
+        const BgpuResult rr = resolvePending(c, d, *tex);
+        if (rr != BGPU_OK) return rr;
+    }
+    if (pipe != c.last_pipe) {
+        g_vk.vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        c.last_pipe = pipe;
+    }
     transition(c, *tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     {
         const VkDescriptorSet set = allocDescSet(c, d);

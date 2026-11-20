@@ -170,7 +170,29 @@ while (bingpu_poll(dev, &ev) == BGPU_OK && ev.kind != BGPU_EVENT_NONE) { ... }
 | ABI | 版本区间 | 变了什么 | 对调用方的影响 |
 |---|---|---|---|
 | 1 | 0.1.0 – 0.3.0 | 定稿。0.2.0 只把实现语言从 C 换成 C++17，头文件功能面一个字未动 | — |
-| 2 | 0.4.0 – 现在 | 枚举 `BgpuBackendKind` **追加** `BGPU_BACKEND_D3D11 = 6`（0.5.0 落 GL 后端时**一个字节都没动** —— GL 的枚举值 0.1.0 就在） | 只有"要指名 D3D11 后端"的代码需要重新生成绑定；既有枚举值、结构体布局、函数签名全部不变，旧的二进制调用方仍然正确 |
+| 2 | 0.4.0 – 0.5.0 | 枚举 `BgpuBackendKind` **追加** `BGPU_BACKEND_D3D11 = 6`（0.5.0 落 GL 后端时**一个字节都没动** —— GL 的枚举值 0.1.0 就在） | 只有"要指名 D3D11 后端"的代码需要重新生成绑定；既有枚举值、结构体布局、函数签名全部不变，旧的二进制调用方仍然正确 |
+| 3 | 0.6.0 – 0.11.x | `BgpuMeshVertex` **加 `float w`**（32 → 40 字节，透视校正）；新增 `BgpuLight`（36 字节）+ `bingpu_cmd_set_light` + 两个 cap 位 | 2D 路径（`BgpuVertex` / `draw_quads`）一个字节没动，只有"自己构造 `BgpuMeshVertex` 数组"的绑主要重编（尺寸断言在头里） |
+| 4 | 0.12.0 – 0.13.x | 新增 `BGPU_VERTEX_SHAPE` 枚举值 + `BgpuShapeVertex`（36 字节）+ `BGPU_PIPE_SHAPE` + `BGPU_CAP_SHAPE` + `bingpu_cmd_draw_shapes` | 纯追加；既有结构体 / 枚举值 / 签名不变 |
+| 5 | 0.14.0 – 0.15.x | 新增 `BGPU_CAP_MSAA` / `BGPU_CAP_MIPMAPS` 两个 cap 位；`BgpuCaps.msaa_samples` 语义从"实际生效值"改成"能力上限"（实际值看 `BgpuSwapchainInfo.msaa_samples`） | 纯追加；默认档仍是 1×/1 级，老调用方的像素不变 |
+| 6 | 0.16.0 – 现在 | 新增 `BGPU_RENDER_DEFER_RESOLVE = 1<<2`（`BgpuRenderBeginDesc.flags` 的一个位值）+ `bingpu_cmd_resolve_target` 签名 | **结构体布局一个字节没动**；不设这一位的调用方命令流与 0.15.1 等价（只多了一次自动 resolve 时机调整，像素逐位相同）。要用延迟 resolve 的绑主要多生成一个函数 |
 
-怎么判断"要不要跟着升"：只看**你代码里出现过的枚举常量与结构体字段**。ABI 2 没有删除也
-没有重排任何东西，所以是一个纯追加的版本 —— 升级的收益是能显式选 `d3d11` 后端。
+怎么判断"要不要跟着升"：只看**你代码里出现过的枚举常量与结构体字段**。ABI 2–6 都没有删除也
+没有重排任何东西，所以都是纯追加的版本。
+
+## 9. 延迟 resolve（ABI 6）：`BGPU_RENDER_DEFER_RESOLVE` 与 `resolve_target`
+
+开了 MSAA 时，`end_render` 默认会把多采样附件 resolve 回目标的单采样镜像（一次全目标
+4×→1× 读+写）。在"同一个目标一帧被反复进出"的形状里（bin2D 的画布：进/出图层各一次），
+这一趟完全没用 —— 下一趟 LOAD 回来还要再 1×→4× 回灌一遍。
+
+- `desc.flags |= BGPU_RENDER_DEFER_RESOLVE`：这一趟只画进 4× 附件，**不落 1×**。
+- 后端会在"真的有人要那张 1×"的边界上自动补一次 resolve：`set_texture` 之后的第一笔
+  采样、`texture_read`、`frame_read`/`frame_end`、`texture_upload` 之前。**不要求调用方
+  记住**哪一趟 defer 了哪张图；漏了最多是"晚一次"，不会采到旧内容。
+- `bingpu_cmd_resolve_target(cmd, target)`：显式收尾。target 没有挂起的 resolve 时是
+  no-op；要求 cmd 不在 `begin_render`/`end_render` 之间（否则 `BGPU_ERR_STATE`）。
+  没有多采样 companion 的后端（CPU / NULL / D3D11、msaa=1）直接 `BGPU_OK`。
+- 没开 MSAA 时这一位没有任何效果；不设它的调用方命令流与 0.15.1 等价。
+- 后端还会自己用一套**自动策略**（整窗尺寸目标、一帧第 2 趟起 defer）把上层最常见的
+  那个形状兜住；`BINGPU_NO_AUTO_DEFER=1` 可关掉做 A/B（只改 resolve 时机，不改像素）。
+

@@ -46,7 +46,7 @@ src/                  C++17 实现
 src/vk_shaders/       quad.vert / quad.frag（固定功能的两个着色器；.spv 由 NDK glslc 生成）
 src/d3d11_shaders/    quad.hlsl（同一对固定功能着色器的 HLSL 版；.cso 由 fxc 生成）
 tests/
-  test_abi.c           ABI 契约测试（246 断言）
+  test_abi.c           ABI 契约测试（257 断言）
   test_cpu_render.c    像素级测试（334 断言）
   test_vk_render.c     Vulkan vs CPU 逐像素（用例表在 gpu_parity.h）
   test_d3d11_render.c  D3D11 vs CPU 逐像素（同一份用例表）
@@ -117,7 +117,7 @@ viewport / affine / 双线性 / 最近+重复 / 局部上传 / 深度 / 网格�
 
 | 能力 | 状态 |
 |---|---|
-| C ABI（句柄 / `struct_size` / 线程本地错误 / 无回调） | ✅ 0.1.0 定稿；0.2.0 只换实现语言（ABI 1），0.4.0 追加一个后端枚举（ABI 2），0.6.0 网格顶点加 w + 光照（ABI 3），0.12.0 解析圆角顶点布局 + 能力位（ABI 4） |
+| C ABI（句柄 / `struct_size` / 线程本地错误 / 无回调） | ✅ 0.1.0 定稿；0.2.0 只换实现语言（ABI 1），0.4.0 追加一个后端枚举（ABI 2），0.6.0 网格顶点加 w + 光照（ABI 3），0.12.0 解析圆角顶点布局 + 能力位（ABI 4），0.14.0 MSAA/mip 能力位（ABI 5），0.16.0 延迟 resolve 标志 + `bingpu_cmd_resolve_target`（ABI 6；结构体布局一直没动） |
 | 设备 / 交换链 / 帧模型 / 命令状态机 | ✅ CPU + NULL + VK + D3D11 |
 | 纹理上传回读 / 缓冲 / 采样器 / 管线 / 仿射 / 网格 | ✅ CPU / VK / D3D11 |
 | 离屏目标 + 深度（LESS） | ✅ CPU / VK / D3D11 |
@@ -127,7 +127,7 @@ viewport / affine / 双线性 / 最近+重复 / 局部上传 / 深度 / 网格�
 | **四角带色圆角矩形（`bingpu_cmd_draw_rounded_rect_grad`）** | ✅ **0.11.0**：九宫格 + 四角直通色。线性渐变在屏幕空间是仿射函数，仿射函数被四边形上的线性插值精确复现 ⇒ 圆角底渐变也是精确解（实测 1064 像素最大通道差 1），不要条带、不要 stencil、不要第二次 pass |
 | **解析圆角（`bingpu_cmd_draw_shapes`，AA 在片元里）** | ✅ **0.12.0 / ABI 4**：圆角的抗锯齿**数学**从 CPU 搬进像素着色器 —— 每个片元自己求有符号距离场，`cov = clamp(0.5 - d, 0, 1)`（轴对齐 1:1 下 `\|grad d\| ≡ 1`，所以是精确解析值，**不需要 `fwidth`**）。CPU 参考 + GL + VK + D3D11 **四端全部实现**，端间最大通道差 1；精度优于上一版的 8 子采样扫描线模板（最大差 10~13 vs 16~40）。无 `BGPU_CAP_SHAPE` 时调用方退回覆盖率模板 |
 | **帧节拍器（`bingpu_pace_*`）** | ✅ **0.9.0**：`standard`/`unlimited`/`240`/`120`/`90`/`60`/`30`，规则是「下一拍 = max(本拍开始 + 目标周期, 本拍结束)」；纯状态机、时间由调用方注入，所以能离线单测（`tests/test_pace.c`）。上层实测：VK `unlimited` 2116–2207 fps、`standard` 114 fps |
-| **MSAA / 真 mip（下一版，默认不变）** | ✅ **VK + GL**：`BgpuDeviceDesc.msaa_samples = 4/8` → 画布与所有颜色目标走多采样、pass 末 resolve 到单采样（`frame_read` / 采样拿到的仍是单采样图）；`BGPU_TEXTURE_MIPMAPS` → 完整 mip 链（VK 逐级 blit / GL `glGenerateMipmap`），采样器按 LOD 取级。默认仍是 1×/1 级，与 CPU 逐像素合同一个字没动。能力查 `BGPU_CAP_MSAA` / `BGPU_CAP_MIPMAPS` 与 `caps.msaa_samples`。⛔ D3D11 这一版明确不做（原因见 [docs/backends.md](docs/backends.md) 的质量档一节）；用户着色器 / 网格光照仍未做 |
+| **MSAA / 真 mip / 延迟 resolve** | ✅ **VK + GL**：`BgpuDeviceDesc.msaa_samples = 4/8` → 画布与所有颜色目标走多采样、pass 末 resolve 到单采样（`frame_read` / 采样拿到的仍是单采样图）；`BGPU_TEXTURE_MIPMAPS` → 完整 mip 链（VK 逐级 blit / GL `glGenerateMipmap`），采样器按 LOD 取级。**0.16.0 / ABI 6**：`BGPU_RENDER_DEFER_RESOLVE` 让"被反复进出的目标"不落 1×，LOAD 回灌与 resolve 都省掉，被采样/回读前自愈（binUI `svg-filter` 660×470：3.3~3.4 → 2.7 ms）。默认仍是 1×/1 级，与 CPU 逐像素合同一个字没动。能力查 `BGPU_CAP_MSAA` / `BGPU_CAP_MIPMAPS` 与 `caps.msaa_samples`。⛔ D3D11 这一版明确不做（原因见 [docs/backends.md](docs/backends.md) 的质量档一节）；用户着色器 / 网格光照仍未做 |
 | **Vulkan 后端** | ✅ **0.3.0**：设备/交换链/present、纹理/缓冲/采样器、五种混合、离屏+深度、网格、仿射；与 CPU 参考后端逐像素 0 差（`tests/test_vk_render.c` 12 个用例） |
 | **D3D11 后端** | ✅ **0.4.0**：同上，走**即时上下文**（无命令缓冲）；同一份用例表逐像素 0 差（`tests/test_d3d11_render.c`） |
 | **OpenGL 后端** | ✅ **0.5.0**：WGL + OpenGL 3.3 core，全局状态映射；同一份用例表逐像素 0 差（`tests/test_gl_render.c`），窗口路径与 VK/D3D11 输出逐字节相同 |
@@ -138,8 +138,8 @@ viewport / affine / 双线性 / 最近+重复 / 局部上传 / 深度 / 网格�
 
 ## 版本
 
-- 语义化版本 `0.13.0`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档、0.3.0 = **Vulkan 后端**、0.4.0 = **D3D11 后端**、0.5.0 = **OpenGL 后端**、0.5.1 = 交换链回读的两个 bug、0.5.2 = D3D11 上传路径 + `wait_idle` 真的等 GPU、0.6.0/0.6.1 = 光照 + 透视校正、0.7.0/0.8.0 = `bingpu_render_plan` 决策面、**0.9.0 = 帧节拍器 `bingpu_pace_*` + GL 的 `wglSwapIntervalEXT` 装载修复**、0.10.0 = 圆角矩形九宫格图元、0.11.0 = 四角带色圆角矩形、0.11.1 = CPU 参考后端共享边 1px 空洞、**0.12.0 = 解析圆角：AA 数学搬进片元着色器（四端）、0.12.1 = 交错绘制时 VK 顶点流截断 + GL 程序没还原、0.13.0 = VK 一帧内多目标来回切（顶点流扩容销毁已录 buffer / 共享 descriptor set / 目标缺依赖 + mip 改降级）**）。
-- **二进制 ABI 号 4**：0.12.0 追加 `BGPU_VERTEX_SHAPE` 布局 + `BgpuShapeVertex`（36 字节）+ `BGPU_PIPE_SHAPE` / `BGPU_CAP_SHAPE` + `bingpu_cmd_draw_shapes()`，既有结构体与枚举值一个字节没动。ABI 3 = 0.6.0 给 `BgpuMeshVertex` 加 `float w`（透视校正）并新增光照状态；ABI 2 = 0.4.0 新增 `BGPU_BACKEND_D3D11`；ABI 1 的 0.1.0–0.3.0 未动过。
+- 语义化版本 `0.16.0`（0.2.0 = 实现改 C++17、0.2.1 = CPU 性能轮、0.2.2 = 分层设计文档、0.3.0 = **Vulkan 后端**、0.4.0 = **D3D11 后端**、0.5.0 = **OpenGL 后端**、0.5.1 = 交换链回读的两个 bug、0.5.2 = D3D11 上传路径 + `wait_idle` 真的等 GPU、0.6.0/0.6.1 = 光照 + 透视校正、0.7.0/0.8.0 = `bingpu_render_plan` 决策面、**0.9.0 = 帧节拍器 `bingpu_pace_*` + GL 的 `wglSwapIntervalEXT` 装载修复**、0.10.0 = 圆角矩形九宫格图元、0.11.0 = 四角带色圆角矩形、0.11.1 = CPU 参考后端共享边 1px 空洞、**0.12.0 = 解析圆角：AA 数学搬进片元着色器（四端）、0.12.1 = 交错绘制时 VK 顶点流截断 + GL 程序没还原、0.13.0 = VK 一帧内多目标来回切（顶点流扩容销毁已录 buffer / 共享 descriptor set / 目标缺依赖 + mip 改降级）**、0.14.0 = MSAA 与真 mip 质量档（VK/GL）、0.14.1 = 记下 MSAA 多目标欠账、0.15.0 = 帧中途销毁目标改退役表（修 `VK_ERROR_DEVICE_LOST`）、0.15.1 = MSAA 档位收进 `render_plan`、**0.16.0 = 延迟 resolve：消掉每进出一次目标的 1×↔4× 往返（ABI 6）**）。
+- **二进制 ABI 号 6**：0.16.0 追加 `BGPU_RENDER_DEFER_RESOLVE`（`BgpuRenderBeginDesc.flags` 的一个位值）与 `bingpu_cmd_resolve_target()`，结构体布局一个字节没动。ABI 5 = 0.14.0 的 MSAA/mip 能力位；ABI 4 = 0.12.0 的 `BGPU_VERTEX_SHAPE` + `BgpuShapeVertex`（36 字节）+ `BGPU_PIPE_SHAPE` / `BGPU_CAP_SHAPE` + `bingpu_cmd_draw_shapes()`；ABI 3 = 0.6.0 给 `BgpuMeshVertex` 加 `float w`；ABI 2 = 0.4.0 新增 `BGPU_BACKEND_D3D11`；ABI 1 的 0.1.0–0.3.0 未动过。
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可

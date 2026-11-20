@@ -303,6 +303,11 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
     —— 这样"在 pass 之外改过这张图"（`texture_upload`、`clear_color`、上一帧的 resolve）
     的内容也能被 LOAD 接上；多采样附件本身是 `storeOp = STORE` 的，上一趟的样本也还在，
     两条路给的结果一致。companion 因此必须带 `TRANSFER_DST`（它会被当 blit 目标）。
+    > 0.16（ABI 6）：companion 里**已经是这张图的最新内容**时（`VkTextureObj::msaa_valid`，
+    > 上一趟刚画完 / 刚 resolve）这次回灌**直接跳过**，接着在 companion 上画；只有
+    > "pass 之外改过 1×"（`texture_upload` / 换交换链图 / 刚建的 companion）才回灌。
+    > 这是纯多余的全窗往返，实测在本机 svg-filter 页占 0.4~0.5 ms/帧（见下面的
+    > "延迟 resolve"）。
     > 规范上 `vkCmdBlitImage` 写"多采样目标"是比较敏感的一条（原来的 companion 连
     > `TRANSFER_DST` 都没有）。本机没装 Vulkan SDK / 验证层，没法用 VUID 复核；实测
     > 在 4060 Ti / 610.88 上两趟 LOAD 与"帧中多目标"用例都正确。若要更保守，可以改成
@@ -339,7 +344,57 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
   mipmap min filter 的采样器配 1 级纹理会不完整（采出来全黑）。所以 `createSampler`
   为每个采样器建两个 GL 对象（plain / mipmap），`bindTexture` 按目标纹理有没有链选一个；
   默认采样器同理（`def_samp` / `def_samp_mip`）。
+- **延迟 resolve（0.16.0 / ABI 6，与 VK 同一套语义）**：GL 的 msaa FBO 内容在 pass
+  之间**天然保留**，所以没有 VK 那条 1×→4× 回灌；能推迟的只有 pass 末那次
+  `glBlitFramebuffer`。DEFER 的 pass（或自动策略：整窗目标、一帧第 2 趟起）只把
+  `GlTextureObj::msaa_pending` 置上，等被采样（`ensureSampleResolved`）、回读
+  （`texture_read` / `frame_read`）、呈现（`presentFrame`）或显式
+  `bingpu_cmd_resolve_target` 时再 blit（GL 是即时执行，补完把 FBO 绑回当前目标即可）。
+  **注意**：GL 的 4× **窗口**路径仍受欠账 12 限制（`render_plan` 对 GL 只给 1×），
+  这条延迟机制只是让"显式要 4× 的调用方"也拿到同样的语义，不改变欠账 12 的判断。
 - 代价与 VK 同量级；默认档走的是原来的单采样 FBO / 单级 `glTexImage2D`，没有额外对象。
+
+### 延迟 resolve（0.16.0 / ABI 6）：消掉"每进出一次目标就 1×→4× blit + resolve"的往返
+
+**症状**：binUI 的 `svg-filter` 页（660×470 窗口，14 个图层 + 模糊链）在 4× 下
+3.3~3.4 ms。命令流里**同一个整窗目标**（bin2D 的画布）一帧被 begin_render 了
+**33 趟**：每离开一次（进图层）pass 末 resolve 一次 4×→1×，每回来一次（LOAD）又
+要 1×→4× 回灌一次。两趟都是全窗读+写，而"中间那几趟图层绘制根本不采画布"。
+
+**做法**（`BGPU_RENDER_DEFER_RESOLVE` + 自动策略 + 自愈）：
+
+- 标了 DEFER 的 pass（或自动策略命中的 pass）在 `vkCmdEndRendering` 上**不带**
+  `resolveMode`：只画进 4× companion、1× 镜像暂时落后（`resolve_pending`）。
+- 下一趟 LOAD 回到同一个目标：companion 本来就有最新内容 ⇒ **不回灌**（`msaa_valid`），
+  接着画。
+- **自愈**：谁要那张 1×，谁在边界上补一次 resolve —— 采样（`rasterQuads` /
+  `rasterIndexed`，必要时把当前渲染实例 endRendering → resolve → 原样 LOAD 开回去）、
+  `texture_read`、`frame_read`/`frame_end`、`texture_upload`（先 resolve 再叠上传）、
+  以及显式 `bingpu_cmd_resolve_target`。上层**不需要**记住哪趟 defer 了哪张图；
+  忘了也只是"晚一次"，不会采到旧内容。
+- **自动策略**：只对**整窗尺寸**的目标、且是这一帧里第 2 趟起 defer。层 / blur 目标
+  按元素尺寸分配（bin2D 0.22.8），它们刚画完就立刻被父级合成采样 —— defer 一定紧接
+  自愈，白拆一次 pass；把策略一直开到这些目标上实测**净收益为 0**（自愈的
+  suspend/resume 抵消了省下的 resolve）。`BINGPU_NO_AUTO_DEFER=1` 可关掉自动策略做 A/B。
+- **诊断**：`BINGPU_TRACE_RESOLVE=1` 每帧打一行 `blits=…… resolves=……`（次数 + 像素量
+  + 带宽估算），自愈时另打 `self-heal WxH`；`BINGPU_TRACE_PASSES=1` 逐 pass 打
+  `WxH CLEAR/LOAD msaa=N`（用来核实"一帧到底有几个整窗往返"）。
+
+**实测（本机 4060 Ti / 610.88，`svg-filter` 660×470 窗口，`probe_frame` 100 帧中位）**：
+
+| 版本 | 每帧整窗 LOAD（回灌） | 每帧 resolve（整窗/全部） | 帧时 |
+|---|---|---|---|
+| 0.15.1（blit + 每趟 resolve） | 32 | 33 / 99 | 3.30~3.42 ms |
+| 只跳过 LOAD 回灌 | 0（`msaa_valid` 命中后） | 33 / 99 | 2.93~2.97 ms |
+| 0.16.0（回灌 + 延迟 resolve） | 0 | 1 / 69 | **2.69~2.71 ms** |
+
+A/B 分账（同一份代码、只关其中一项）：LOAD 回灌 ≈ **0.50 ms/帧**、全部 resolve
+≈ **0.53 ms/帧**、两样都关 ≈ **0.94 ms/帧**（那是不可达上限：层/blur 目标必须
+resolve 才能被合成采样）。4× 剩下的 ~0.6 ms 是 4× 的 store/load 与填充率，不在
+这条链上 —— 所以"把往返消干净"的上限是 3.35 → 2.5 ms 左右，而不是 1×（1.88 ms）。
+像素不变：`pixels-bin2d-gpu` 18 页数字与改动前**逐页相同**（`svg-filter` 0.000% / max 6，
+`grad-angle` 0.028% / max 21，`texture` 页 0/1 ...），`pixels-bin2d`（0 容差）与
+binGPU 的 `test` / `abi-check` / `smoke` 全绿。
 
 ### 测试用什么钉（`tests/gpu_parity.h`，只在能力可达时跑）
 
@@ -469,4 +524,9 @@ present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` �
     multisample FBO / `glBlitFramebuffer` resolve 这条链自己的问题（多目标 + 窗口默认
     帧缓冲的组合）。修它要先补一条**窗口路径**的 GL 用例（现在的 headless 用例覆盖不到），
     再按 VK 的同一份判据验收。
+13. **D3D11 的延迟 resolve**：这一版**明确不做**。D3D11 没有 MSAA（欠账 3），
+    `BGPU_RENDER_DEFER_RESOLVE` 对它是 no-op，`bingpu_cmd_resolve_target` 走
+    `Backend::resolveTarget` 的默认实现（直接 `BGPU_OK`）—— "没有多采样就没有挂起的
+    resolve"，语义上不是漏做。等补 MSAA 时按 VK 的同一套边界（`endRender` 不 resolve、
+    采样/回读/上传/frame_end 前自愈）一起补，验收判据也用同一份。
 

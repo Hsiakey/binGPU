@@ -1,6 +1,6 @@
 #pragma once
 /* ============================================================
- * bingpu.h —— binGPU 公共 C ABI（v0.2.1，ABI 1）
+ * bingpu.h —— binGPU 公共 C ABI（v0.16.0，ABI 6）
  *
  * binGPU 是"设备 / 交换链 / 资源 / 管线 / 命令 / 呈现"这一层：把同一件事
  * （建窗口面、上传纹理、切混合状态、离屏、present）从每个渲染器里抽出来，
@@ -63,6 +63,11 @@
  *     访问被释放的显存（VK 后端为此把释放推迟到本帧提交并等完 fence 之后）。
  *     录制中的命令缓冲**不会**因此拿到被销毁对象的内容：那种用法仍然是错的（会退化成
  *     "没有这个纹理"的 STATE 错误），只是不再炸驱动。
+ *   · **延迟 resolve**（0.16.0 / ABI 6）：MSAA 的 pass 可以不在 end_render 时 resolve
+ *     到 1×（`BGPU_RENDER_DEFER_RESOLVE`）。后端在"真的有人要那张 1×"的边界上自动
+ *     补一次（采样 / texture_read / frame_read / 上传前），也可用
+ *     `bingpu_cmd_resolve_target` 显式收尾 —— **正确性不要求调用方记住**。
+ *     不设这一位时命令流与 0.15.1 等价（后端只自己跳过多余的 LOAD 回灌），像素不变。
  *
  * 帧模型（三条，违反其中一条三端必然不一致）：
  *   ① 一帧 = frame_begin → cmd_begin_render(target) → 记录 → cmd_end_render
@@ -87,9 +92,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 15
-#define BINGPU_VERSION_PATCH 1
-#define BINGPU_VERSION_STRING "0.15.1"
+#define BINGPU_VERSION_MINOR 16
+#define BINGPU_VERSION_PATCH 0
+#define BINGPU_VERSION_STRING "0.16.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -107,8 +112,12 @@ extern "C" {
  *          但 0.12.0 加 BGPU_CAP_SHAPE 时也升了 ABI，这次照同一套。）
  *          **语义变化**：BgpuCaps.msaa_samples 从"实际生效值"改成"能力上限"，
  *          实际生效值看 BgpuSwapchainInfo.msaa_samples —— 只看 caps 的老代码
- *          不会因此变大，因为默认档仍是 1。 */
-#define BINGPU_ABI_VERSION 5u
+ *          不会因此变大，因为默认档仍是 1。
+ *   ABI 6：0.16.0（新增 BGPU_RENDER_DEFER_RESOLVE 枚举值 + bingpu_cmd_resolve_target
+ *          签名。结构体布局一个字节没动：flags 是既有字段，只是多了一个位值。）
+ *          语义：MSAA 的 pass 可以不在 end_render 时 resolve 到 1×，由后端在
+ *          "真的有人要采样 1×"那条边界自愈（详见 docs/backends.md 质量档一节）。 */
+#define BINGPU_ABI_VERSION 6u
 
 /* 句柄都是 uint64_t；0 = 无效 */
 #define BGPU_INVALID 0ull
@@ -648,10 +657,22 @@ BgpuResult bingpu_cmd_create(BgpuDevice device, BgpuCmd* out_cmd);
 void       bingpu_cmd_destroy(BgpuDevice device, BgpuCmd cmd);
 
 /* 渲染目标可以是布局渲染目标纹理，也可以是 frame_begin 借来的交换链目标。
- * 深度：目标的 BgpuRenderBeginDesc 里 depth_texture 非 0 时才有深度附件。 */
+ * 深度：目标的 BgpuRenderBeginDesc 里 depth_texture 非 0 时才有深度附件。
+ *
+ * 延迟 resolve（ABI 6，0.16.0）：
+ *   开了 MSAA 时，pass 结束默认会把多采样附件 resolve 回目标的单采样镜像 ——
+ *   那个 **4× → 1× 的全目标读+写**在"同一个目标在一帧里被反复进出"（图层/画布/
+ *   贴屏）时是纯带宽开销：下一趟 LOAD 进来又要 1× → 4× 回灌一遍。
+ *   DEFER_RESOLVE 让这一趟只画进 4×附件、**不落 1×**；等到真的有人要那张 1×
+ *   （被 set_texture 采样、texture_read、frame_read、或显式
+ *   bingpu_cmd_resolve_target）时后端自动补一次 resolve。
+ *   正确性不靠调用方记：漏了也只是"晚一次"，不会采样到旧内容（后端自愈）。
+ *   没开 MSAA 的后端/档位上这一位是 no-op。 */
 typedef enum BgpuRenderFlag {
     BGPU_RENDER_CLEAR_COLOR = 1u << 0,
-    BGPU_RENDER_CLEAR_DEPTH = 1u << 1
+    BGPU_RENDER_CLEAR_DEPTH = 1u << 1,
+    /* ABI 6：这一趟的 1× 结果暂时不要（延迟到第一次被采样时再 resolve） */
+    BGPU_RENDER_DEFER_RESOLVE = 1u << 2
 } BgpuRenderFlag;
 
 typedef struct BgpuRenderBeginDesc {
@@ -665,6 +686,13 @@ typedef struct BgpuRenderBeginDesc {
 
 BgpuResult bingpu_cmd_begin_render(BgpuCmd cmd, const BgpuRenderBeginDesc* desc);
 BgpuResult bingpu_cmd_end_render(BgpuCmd cmd);
+
+/* 延迟 resolve 的显式收尾（ABI 6）：把 target 的 1× 镜像补到最新。
+ * 场景：调用方知道"至少在某个时刻之后没人再画这张目标了"，主动落一次 1×，
+ * 免得它一直挂到被采样/回读时才 resolve。target 没有挂起的 resolve 时是 no-op。
+ * 要求 cmd **不在** begin_render/end_render 之间（STATE 错误）。
+ * 没有多采样 companion 的后端（CPU / NULL / D3D11、以及 msaa=1）直接返回 OK。 */
+BgpuResult bingpu_cmd_resolve_target(BgpuCmd cmd, BgpuTexture target);
 
 /* viewport 用**目标像素**坐标：(x, y, w, h)，左上原点，y 向下。
  * 打开 set_affine 之后，顶点位置在这个 viewport 映射**之后**再被仿射矩阵变换

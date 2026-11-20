@@ -909,6 +909,41 @@ static void scene_two_pass(BgpuDevice dev, BgpuCmd cmd, BgpuTexture t) {
     bingpu_cmd_end_render(cmd);
 }
 
+/* 0.16（ABI 6）：显式 `BGPU_RENDER_DEFER_RESOLVE` + `bingpu_cmd_resolve_target`。
+ * 画的东西与 scene_two_pass 一模一样，只是两趟都标了 DEFER、最后显式收尾一次。
+ * 判据：像素必须与 scene_two_pass 逐位相同 —— flag 只改 resolve 的时机，
+ * 不改结果；1× 下这一位是 no-op。 */
+static void scene_defer_explicit(BgpuDevice dev, BgpuCmd cmd, BgpuTexture t) {
+    const BgpuPipeline p = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, 0);
+    BgpuRenderBeginDesc rd;
+    memset(&rd, 0, sizeof(rd));
+    rd.struct_size = (uint32_t)sizeof(rd);
+    rd.target = t;
+    rd.flags = BGPU_RENDER_CLEAR_COLOR | BGPU_RENDER_DEFER_RESOLVE;
+    rd.clear_color = 0xFF000000u;
+    if (bingpu_cmd_begin_render(cmd, &rd) != BGPU_OK) {
+        printf("  begin_render(defer) 失败：%s\n", bingpu_last_error());
+    }
+    bingpu_cmd_set_pipeline(cmd, p);
+    quad(cmd, 8, 8, 24, 24, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+
+    memset(&rd, 0, sizeof(rd));
+    rd.struct_size = (uint32_t)sizeof(rd);
+    rd.target = t;
+    rd.flags = BGPU_RENDER_DEFER_RESOLVE;
+    if (bingpu_cmd_begin_render(cmd, &rd) != BGPU_OK) {
+        printf("  begin_render(load/defer) 失败：%s\n", bingpu_last_error());
+    }
+    bingpu_cmd_set_pipeline(cmd, p);
+    quad(cmd, 40, 40, 56, 56, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+
+    if (bingpu_cmd_resolve_target(cmd, t) != BGPU_OK) {
+        printf("  cmd_resolve_target 失败：%s\n", bingpu_last_error());
+    }
+}
+
 static int region_is_white(const uint8_t* px, uint32_t w, uint32_t x0, uint32_t y0, uint32_t x1,
                            uint32_t y1) {
     for (uint32_t y = y0; y < y1; y++) {
@@ -1185,6 +1220,22 @@ static void run_msaa_case(BgpuBackendKind kind) {
     } else {
         g_fail++;
         printf("  FAIL msaa: 两趟 LOAD 渲染失败\n");
+    }
+    /* 0.16（ABI 6）：显式 DEFER_RESOLVE + resolve_target 必须与"每趟立即 resolve"
+     * 逐位相同（flag 只改时机）。两条都在 4× 下跑。 */
+    {
+        uint8_t* e = (uint8_t*)malloc(64 * 64 * 4);
+        if (e && render_msaa(kind, 4, scene_defer_explicit, 64, 64, e)) {
+            int maxdiff = 0;
+            const size_t ndiff = pixel_diff(d, e, 64 * 64, &maxdiff);
+            printf("  msaa=4 显式 DEFER + resolve_target：差异像素 %zu/4096，最大通道差 %d\n",
+                   ndiff, maxdiff);
+            CHECK(ndiff == 0, "DEFER_RESOLVE 只改 resolve 时机，像素必须与立即 resolve 相同");
+        } else {
+            g_fail++;
+            printf("  FAIL msaa: DEFER_RESOLVE 路径渲染失败\n");
+        }
+        free(e);
     }
     free(d);
 

@@ -4,6 +4,104 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.16.0] - 2026-11-21 【ABI 5 → 6】
+
+**消掉"每进出一次目标就 1×→4× 回灌 + pass 末 resolve"的往返。** 触发场景是 binUI 的
+`svg-filter` 页（660×470 窗口，14 个图层 + 模糊链）：bin2D 的画布一帧被 `begin_render`
+了 **33 趟** —— 每离开一次（进图层）resolve 一次 4×→1×，每回来一次（LOAD）再 1×→4×
+回灌一次；而中间那些图层绘制根本不采画布。两样都是全窗读+写。
+
+### 改了什么
+
+- **ABI 6**：`BgpuRenderBeginDesc.flags` 新增 `BGPU_RENDER_DEFER_RESOLVE = 1<<2`；
+  新增 `bingpu_cmd_resolve_target(cmd, target)`。结构体布局一个字节没动。
+- **VK**：
+  - `msaa_valid`：companion 里已经是这张图最新内容时，LOAD 的 1×→4× 回灌**跳过**；
+    只有 pass 之外改过 1×（上传 / 换交换链图 / 刚建 companion）才回灌。
+  - `resolve_pending`：DEFER 的 pass 不在 `vkCmdEndRendering` 上 resolve，1× 暂落后。
+  - **自愈**：采样（`rasterQuads`/`rasterIndexed`；必要时 endRendering → resolve →
+    原样 LOAD 开回去）、`texture_read`、`frame_end`/`frame_read`、`texture_upload`
+    之前自动补一次 resolve；显式入口是 `bingpu_cmd_resolve_target`。
+  - **自动策略**：整窗尺寸的目标、一帧第 2 趟起自动 defer（层/blur 目标按元素尺寸分配，
+    对它们 defer 一定紧接自愈，实测净收益 0）。`BINGPU_NO_AUTO_DEFER=1` 关掉做 A/B。
+  - 诊断：`BINGPU_TRACE_RESOLVE=1` 每帧一行 `blits/resolves` 次数 + 像素量 + 带宽估算，
+    自愈时打 `self-heal WxH`；`BINGPU_TRACE_PASSES=1` 逐 pass 打尺寸/LOAD/CLEAR/msaa。
+- **GL**：同一套语义（`msaa_pending` + 采样/回读/呈现前自愈）。GL 的 msaa FBO 天然保留
+  内容，本来就没有回灌那一步；欠账 12（GL 窗口 4× 丢内容）的判断不变。
+- **D3D11**：明确不做（没有 MSAA，就没有"挂起的 resolve"）；`resolve_target` 走默认
+  no-op，flag 无效。写成欠账 13。
+
+### 实测（本机 4060 Ti / 610.88，`svg-filter` 660×470 窗口，`probe_frame` 100 帧中位）
+
+| | 每帧整窗回灌 | resolve（整窗/全部） | 帧时 |
+|---|---|---|---|
+| 0.15.1 | 32 | 33 / 99 | 3.30~3.42 ms |
+| 0.16.0 | 0 | 1 / 69 | **2.69~2.71 ms** |
+
+A/B 分账：回灌 ≈0.50 ms/帧、全部 resolve ≈0.53 ms/帧、两样都关 ≈0.94 ms/帧
+（不可达上限：层/blur 目标必须 resolve）。4× 剩下的 ~0.6 ms 是 store/load 与填充率，
+不在这条链上 —— 所以"消干净往返"的上限是 ~2.5 ms，到不了 1×（1.88 ms）。
+`buttonshow` 0.80~0.82 ms、`appshow` 1.11~1.14 ms 不变（同机交错对照）。
+
+### 像素与门禁
+
+- binUI `pixels-bin2d-gpu` 18 页对 `docs/pixels` **逐页数字与改动前相同**
+  （`svg-filter` 0.000% / max 6、`grad-angle` 0.028% / max 21、`shadow` 0/7、
+  `texture` 诸页 0/1）；`pixels-bin2d`（0 容差）与 `make partial` 全绿。
+- binGPU `make test`（含 VK/GL 的 MSAA 多目标 / 两趟 LOAD / 帧中销毁 / mip 用例）、
+  `make abi-check`、`make smoke` 全绿。
+
+## [0.16.0] - 2026-11-21 【ABI 6】
+
+**延迟 resolve：这一趟不需要 1× 图时，就不落 1×。** 上层带图层的页面每进出一次图层，
+旧版都要对 4× 画布做一次"1×→4× 回灌（LOAD 预置）+ pass 末 resolve"。现在这种往返可以推迟：
+渲染只画进 4× 附件，等到**真的有人要那张 1×**（采样它、`texture_read`、`frame_read`、显式入口）
+时才解析一次。
+
+### 先给归因（这次的实测又把预估推翻了一次）
+
+| 项 | 估的 | 实测 |
+|---|---|---|
+| 往返成本 | ~1.55 ms | **0.94 ms**（只关回灌 0.45~0.50、只关 resolve 0.53） |
+| 每帧次数 | 14 次整窗往返 | **32 次整窗 LOAD 回灌 + 33 次整窗 resolve**（另有 66 次元素尺寸的层/模糊 pass） |
+
+分账：MSAA 总成本 ~1.55~1.58（1× 时 1.87~1.90），其中只有 0.94 在往返链上，剩下 ~0.6 是
+4× 的 store/load 与填充率。所以"把往返消干净"的**理论下限是 ~2.5 ms**，`≤2.2` 到不了 ——
+这是这一版最重要的一句实话。
+
+### 新增的接口（ABI 5 → 6）
+
+- `BGPU_RENDER_DEFER_RESOLVE = 1u << 2`（`BgpuRenderBeginDesc.flags`，结构体布局零变化）
+- `bingpu_cmd_resolve_target(cmd, target)`：显式解析一次；在 `begin/end_render` 之间调用返回 `STATE`。
+- **自愈**：后端在"真的有人要那张 1×"的所有边界（采样、`texture_read`、`texture_upload`、
+  `frame_end`）上自动补一次 resolve，所以上层**不需要**记住这件设备层的事。宁可多解析一次，
+  不允许漏。用 `BINGPU_TRACE_RESOLVE=1` / `BINGPU_TRACE_PASSES=1` 可以看次数。
+- 自动策略：整窗目标从"一帧第 2 趟起"延迟；**层 / blur 目标不延迟**（实测对它们延迟净收益 0，
+  而且它们必须 resolve 才能被合成采样）。`BINGPU_NO_AUTO_DEFER=1` 可整体关掉。
+- GL 后端同一套语义（GL 没有回灌这一步，只省 resolve）；**D3D11 明确不做**（它没有 MSAA，
+  也就没有挂起的 resolve），flag 是 no-op，记成欠账 13。
+
+### 数字
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| `svg-filter` 660×470 窗口（VK 4×） | 3.30~3.42 ms | **2.69~2.76 ms**（−19%，p95 3.64~3.72 → 3.08~3.16） |
+| `buttonshow` 1020×684 | 0.80~0.82 | 0.81~0.82 |
+| `appshow` 1280×800 | 1.11~1.14 | 1.10~1.13 |
+
+像素：`pixels-bin2d-gpu` 18 页**逐页数字与改动前相同**（`svg-filter` 0.000%/6、
+`grad-angle` 0.028%/21、`shadow` 0/7，`KNOWN` 只剩 `text-shadow-multi`）；`pixels-bin2d`
+0 容差全绿；`make partial` 4/4 绿；binGPU `make test`（257+378+72+32+23+35+16，0 失败）/
+`abi-check`（0.16.0 / ABI 6）/ `smoke`（vk / d3d11 / gl）全绿。
+
+新用例：`显式 DEFER + resolve_target` 与"立即 resolve"逐位相同（VK 与 GL 都 0/4096）。
+
+### 教训（写给下一个估这块的人）
+
+今天有三次归因被实测推翻：以为"整窗层目标清屏贵"（实际 0.03 ms）、以为"采样到未 resolve 的图"
+（实际是帧中销毁被引用的目标炸驱动）、以为"往返值 1.55 ms"（实际 0.94，且次数是 32+33 而不是 14）。
+**每次真相都在次数上，不在单次成本上。下次先数次数，再算单价。**
+
 ## [0.15.1] - 2026-11-20 【ABI 5 不变】
 
 **"用不用 MSAA"从调用方各写一份判断，收回设备层。** `bingpu_render_plan` 原来无条件给

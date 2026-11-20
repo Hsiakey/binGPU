@@ -177,6 +177,14 @@ public:
     virtual BgpuResult beginRender(Cmd& cmd, Texture& target, Texture* depth,
                                    const BgpuRenderBeginDesc& desc) = 0;
     virtual BgpuResult endRender(Cmd& cmd) = 0;
+    /* ABI 6：把一张"延迟 resolve"的渲染目标立刻落成 1×（不采样也能主动收尾）。
+     * 默认是 **no-op**：没有多采样 companion 的后端（CPU/NULL/D3D11、以及 msaa=1 的
+     * VK/GL）根本不存在"挂起的 resolve"，这个调用天然无事可做。 */
+    virtual BgpuResult resolveTarget(Cmd& cmd, Texture& target) {
+        (void)cmd;
+        (void)target;
+        return BGPU_OK;
+    }
     virtual BgpuResult setViewport(Cmd& cmd, float x, float y, float w, float h) = 0;
     virtual BgpuResult setScissor(Cmd& cmd, int32_t x, int32_t y, int32_t w, int32_t h) = 0;
     virtual BgpuResult setPipeline(Cmd& cmd, Pipeline& pipe) = 0;

@@ -721,6 +721,13 @@ struct GlTextureObj final : Texture {
     GLuint msaa_depth_rb = 0;
     uint32_t msaa_w = 0, msaa_h = 0;
     uint32_t msaa_count = 0;
+    /* 0.16：延迟 resolve（ABI 6）。GL 的 msaa FBO **本来就保留内容**，所以这里没有
+     * VK 那条"1× → 4× 回灌"的翻倍；能省的只有 pass 末那次 glBlitFramebuffer。
+     * 挂起之后，任何一次"拿它当采样源 / 回读"都会先补 blit（见 resolvePending）。
+     * 一帧里第几趟当目标（自动延迟策略用，与 VK 同一套口径）。 */
+    bool msaa_pending = false;
+    uint32_t pass_frame_stamp = 0xFFFFFFFFu;
+    uint32_t pass_count = 0;
     /* 底层资源的真实尺寸：深度附件挂在**目标**上，所以这里记录的是目标尺寸 */
     uint32_t res_w = 0, res_h = 0;
     /* 交换链借出的**窗口后台缓冲**没有 GL 纹理对象（fbo 恒 0 = 默认帧缓冲） */
@@ -786,6 +793,8 @@ struct GlCmdObj final : Cmd {
     bool have_scissor = false;
     int32_t last_sc[4] = {0, 0, 0, 0};
     bool uniforms_dirty = true;
+    /* 0.16：这一趟结束时要不要 resolve（DEFER_RESOLVE / 自动策略时 false）。 */
+    bool pass_resolves = false;
 
     GlCmdObj(Backend& b, BgpuDevice owner, Device& d) : Cmd(b, owner, d) {}
     ~GlCmdObj() override;
@@ -875,6 +884,7 @@ public:
     BgpuResult beginRender(Cmd& cmd, Texture& target, Texture* depth,
                            const BgpuRenderBeginDesc& desc) override;
     BgpuResult endRender(Cmd& cmd) override;
+    BgpuResult resolveTarget(Cmd& cmd, Texture& target) override;
 
 protected:
     BgpuResult rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t quad_count) override;
@@ -897,6 +907,12 @@ private:
     BgpuResult bindState(GlCmdObj& c, GlDeviceObj& d, GlTextureObj& target, Pipeline& pipe,
                          bool has_depth);
     BgpuResult bindTexture(GlCmdObj& c, GlDeviceObj& d, Pipeline& pipe);
+    /* 0.16：把延迟的 MSAA resolve（多采样 FBO → 单采样目标）立刻补上。 */
+    BgpuResult resolvePending(GlTextureObj& t, GlDeviceObj& d);
+    /* 补完 resolve 之后把 FBO 绑回当前目标（blit 会改 READ/DRAW 绑定）。 */
+    void rebindTargetFbo(GlCmdObj& c, GlDeviceObj& d);
+    /* 画之前确认采样源不是"挂了 resolve 的 1×"（是就先补 blit 再绑回目标）。 */
+    BgpuResult ensureSampleResolved(GlCmdObj& c, GlDeviceObj& d);
     bool applyScissor(GlCmdObj& c, GlTextureObj& target);
     void updateUniforms(GlCmdObj& c, GlDeviceObj& d, GlTextureObj& target);
     bool ensureQuadBuffers(GlCmdObj& c, GlDeviceObj& d, uint32_t quads);
@@ -1523,6 +1539,8 @@ BgpuResult GlBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
         }
     }
     d.bytes_uploaded += static_cast<uint64_t>(b.w) * b.h * bpp;
+    /* 0.16：镜像被外部改写 —— 挂着的 resolve 不能再来覆盖它。 */
+    t.msaa_pending = false;
     return BGPU_OK;
 }
 
@@ -1536,6 +1554,11 @@ BgpuResult GlBackend::textureRead(Texture& tex, void* dst, size_t dst_size,
     if (!t.tex) return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "纹理没有 GL 名字");
     GlDeviceObj& d = gdevOf(tex.device);
     if (!activate(d)) return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "上下文不可用");
+    /* 0.16：回读要的是 1× —— 挂着延迟 resolve 的先补。 */
+    {
+        const BgpuResult rr = resolvePending(t, d);
+        if (rr != BGPU_OK) return rr;
+    }
     const uint32_t bpp = bingpu_format_bytes(t.fmt);
     const uint32_t row = t.w * bpp;
     if (dst_size < static_cast<size_t>(row) * t.h) {
@@ -1868,8 +1891,54 @@ BgpuResult GlBackend::bindTexture(GlCmdObj& c, GlDeviceObj& d, Pipeline& pipe) {
     return BGPU_OK;
 }
 
-bool GlBackend::applyScissor(GlCmdObj& c, GlTextureObj& target) {
-    int32_t sx = 0, sy = 0;
+/* ---------------------------------------------------------------
+ * 0.16：延迟 resolve（ABI 6）—— GL 侧的"自愈"
+ *
+ * GL 的 msaa FBO 内容在 pass 之间天然保留，所以不需要 VK 那条 1× → 4× 回灌；
+ * 能推迟的只有 pass 末尾那次 glBlitFramebuffer。挂起的 resolve 在"被采样 / 回读 /
+ * 呈现"之前补上即可。GL 是即时执行，没有 VK 的"不能在渲染实例里录传输命令"问题，
+ * 所以这里比 VK 简单：直接 blit 完把 FBO 绑回当前目标。
+ * --------------------------------------------------------------- */
+BgpuResult GlBackend::resolvePending(GlTextureObj& t, GlDeviceObj& d) {
+    if (!t.msaa_pending) return BGPU_OK;
+    if (!t.msaa_fbo || d.msaa < 2) {
+        t.msaa_pending = false;
+        return BGPU_OK;
+    }
+    g_gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, t.msaa_fbo);
+    g_gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, t.window_target ? 0 : t.fbo);
+    g_gl.glBlitFramebuffer(0, 0, static_cast<GLint>(t.res_w), static_cast<GLint>(t.res_h), 0, 0,
+                           static_cast<GLint>(t.res_w), static_cast<GLint>(t.res_h),
+                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    t.msaa_pending = false;
+    if (glFail("msaa resolve(deferred)") != BGPU_OK) {
+        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "延迟 resolve 失败");
+    }
+    return BGPU_OK;
+}
+
+void GlBackend::rebindTargetFbo(GlCmdObj& c, GlDeviceObj& d) {
+    GlTextureObj* t = c.target ? static_cast<GlTextureObj*>(c.target) : nullptr;
+    if (!t) return;
+    g_gl.glBindFramebuffer(
+        GL_FRAMEBUFFER,
+        (d.msaa >= 2 && t->msaa_fbo) ? t->msaa_fbo : (t->window_target ? 0 : t->fbo));
+}
+
+BgpuResult GlBackend::ensureSampleResolved(GlCmdObj& c, GlDeviceObj& d) {
+    if (!c.tex || !c.pipe) return BGPU_OK;
+    Pipeline& p = *c.pipe;
+    if (!(p.pipe_flags & BGPU_PIPE_TEXTURED)) return BGPU_OK;
+    GlTextureObj* src = static_cast<GlTextureObj*>(c.tex);
+    GlTextureObj* tgt = c.target ? static_cast<GlTextureObj*>(c.target) : nullptr;
+    if (!src || !src->msaa_pending || src == tgt) return BGPU_OK;
+    const BgpuResult r = resolvePending(*src, d);
+    if (r != BGPU_OK) return r;
+    rebindTargetFbo(c, d);
+    return BGPU_OK;
+}
+
+bool GlBackend::applyScissor(GlCmdObj& c, GlTextureObj& target) {    int32_t sx = 0, sy = 0;
     int32_t sr = static_cast<int32_t>(target.res_w);
     int32_t sb = static_cast<int32_t>(target.res_h);
     if (c.scissorOn) {
@@ -2089,6 +2158,8 @@ void GlBackend::presentFrame(Swapchain& sc_) {
     GlSwapchainObj& sc = static_cast<GlSwapchainObj&>(sc_);
     GlDeviceObj& d = *sc.gldev;
     if (!activate(d)) return;
+    /* 0.16：贴屏目标如果挂着延迟 resolve，先落进 1×（窗口模式是默认帧缓冲）再读/换。 */
+    if (sc.borrow) (void)resolvePending(*sc.borrow, d);
     if (!sc.is_window) {
         g_gl.glFinish();   /* 离屏：没有"呈现"，但要让 GL 把活干完再返回 */
         return;
@@ -2122,6 +2193,11 @@ BgpuResult GlBackend::frameRead(Swapchain& sc_, void* dst, size_t dst_size,
     } else {
         if (!sc.borrow || !sc.borrow->fbo) {
             return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "交换链没有可回读的帧");
+        }
+        /* 0.16：延迟 resolve 先补上（离屏交换链的目标就是这张 fbo）。 */
+        {
+            const BgpuResult rr = resolvePending(*sc.borrow, d);
+            if (rr != BGPU_OK) return rr;
         }
         /* FBO 这条路**不翻行**：渲染到 FBO 时 uFlip=0（s.y=0 → NDC -1 → 窗口 y=0），
          * 而 glReadPixels 正是从窗口 y=0 开始往上吐 —— 第一条就是图像顶行。
@@ -2226,12 +2302,23 @@ BgpuResult GlBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "目标的 FBO 创建失败");
     }
     /* 0.14：开了 MSAA 就画进多采样 FBO，end_render 时 blit resolve 回目标。
-     * 默认档（d.msaa == 1）下面的绑定与 0.13.0 完全相同。 */
+     * 默认档（d.msaa == 1）下面的绑定与 0.13.0 完全相同。
+     * 0.16：与 VK 同一套延迟策略（显式 DEFER_RESOLVE，或整窗目标一帧第 2 趟起），
+     * pass 末不 blit，等被采样/回读时自愈。 */
     const bool use_msaa = d.msaa >= 2;
     if (use_msaa && !ensureMsaa(t, d)) {
         cmd.inRender = false;
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "MSAA FBO 创建失败");
     }
+    const uint32_t pass_no = (t.pass_frame_stamp == d.frame_index) ? t.pass_count + 1u : 1u;
+    t.pass_frame_stamp = d.frame_index;
+    t.pass_count = pass_no;
+    const bool full_surface = static_cast<uint64_t>(t.res_w) * t.res_h >=
+                              static_cast<uint64_t>(d.w) * d.h;
+    const bool defer_resolve =
+        use_msaa && ((desc.flags & BGPU_RENDER_DEFER_RESOLVE) != 0 ||
+                     (c.inFrame && pass_no >= 2u && full_surface && !std::getenv("BINGPU_NO_AUTO_DEFER")));
+    c.pass_resolves = use_msaa && !defer_resolve;
     g_gl.glBindFramebuffer(GL_FRAMEBUFFER,
                            use_msaa ? t.msaa_fbo : (t.window_target ? 0 : t.fbo));
     g_gl.glViewport(0, 0, static_cast<GLsizei>(t.res_w), static_cast<GLsizei>(t.res_h));
@@ -2281,19 +2368,35 @@ BgpuResult GlBackend::endRender(Cmd& cmd) {
     BgpuResult r = BackendBase::endRender(cmd);
     if (r != BGPU_OK) return r;
     /* MSAA：把多采样 FBO resolve 回单采样目标（窗口 = 默认帧缓冲，离屏 = t->fbo）。
-     * 两个 FBO 的坐标系都是 GL 窗口坐标（左下原点），所以 rect 一对一，不翻 y。 */
+     * 两个 FBO 的坐标系都是 GL 窗口坐标（左下原点），所以 rect 一对一，不翻 y。
+     * 0.16：DEFER 的 pass 只记"挂起"，等采样/回读/呈现前再补（resolvePending）。 */
     if (t && d.msaa >= 2 && t->msaa_fbo) {
-        g_gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, t->msaa_fbo);
-        g_gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, t->window_target ? 0 : t->fbo);
-        g_gl.glBlitFramebuffer(0, 0, static_cast<GLint>(t->res_w), static_cast<GLint>(t->res_h), 0,
-                               0, static_cast<GLint>(t->res_w), static_cast<GLint>(t->res_h),
-                               GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        if (glFail("msaa resolve") != BGPU_OK) {
-            return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "MSAA resolve 失败");
+        if (c.pass_resolves) {
+            g_gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, t->msaa_fbo);
+            g_gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, t->window_target ? 0 : t->fbo);
+            g_gl.glBlitFramebuffer(0, 0, static_cast<GLint>(t->res_w), static_cast<GLint>(t->res_h),
+                                   0, 0, static_cast<GLint>(t->res_w),
+                                   static_cast<GLint>(t->res_h), GL_COLOR_BUFFER_BIT,
+                                   GL_NEAREST);
+            g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            t->msaa_pending = false;
+            if (glFail("msaa resolve") != BGPU_OK) {
+                return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "MSAA resolve 失败");
+            }
+        } else {
+            t->msaa_pending = true;
         }
     }
     return BGPU_OK;
+}
+
+BgpuResult GlBackend::resolveTarget(Cmd& cmd, Texture& target) {
+    (void)cmd;
+    GlTextureObj& t = static_cast<GlTextureObj&>(target);
+    if (!t.msaa_pending) return BGPU_OK;
+    GlDeviceObj& d = gdevOf(target.device);
+    if (!activate(d)) return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "上下文不可用");
+    return resolvePending(t, d);
 }
 
 /* ---------------------------------------------------------------
@@ -2306,7 +2409,9 @@ BgpuResult GlBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
     GlTextureObj& target = static_cast<GlTextureObj&>(*c.target);
     if (!activate(d)) return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "上下文不可用");
 
-    BgpuResult r = bindState(c, d, target, *c.pipe, c.depth != nullptr);
+    BgpuResult r = ensureSampleResolved(c, d);
+    if (r != BGPU_OK) return r;
+    r = bindState(c, d, target, *c.pipe, c.depth != nullptr);
     if (r != BGPU_OK) return r;
     r = bindTexture(c, d, *c.pipe);
     if (r != BGPU_OK) return r;
@@ -2435,7 +2540,9 @@ BgpuResult GlBackend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset
     GlTextureObj& target = static_cast<GlTextureObj&>(*c.target);
     if (!activate(d)) return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "上下文不可用");
 
-    BgpuResult r = bindState(c, d, target, *c.pipe, c.depth != nullptr);
+    BgpuResult r = ensureSampleResolved(c, d);
+    if (r != BGPU_OK) return r;
+    r = bindState(c, d, target, *c.pipe, c.depth != nullptr);
     if (r != BGPU_OK) return r;
     r = bindTexture(c, d, *c.pipe);
     if (r != BGPU_OK) return r;

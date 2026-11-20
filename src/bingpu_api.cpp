@@ -678,6 +678,26 @@ BgpuResult bingpu_cmd_end_render(BgpuCmd cmd) {
     BGPU_API_CATCH_RESULT()
 }
 
+BgpuResult bingpu_cmd_resolve_target(BgpuCmd cmd, BgpuTexture target) {
+    ApiScope scope("bingpu_cmd_resolve_target");
+    const unsigned s0 = errorSeq();
+    BGPU_API_TRY
+    Cmd* c = static_cast<Cmd*>(take(cmd, kObjCmd, "cmd", __FILE__, __LINE__));
+    if (!c) return BGPU_ERR_INVALID_HANDLE;
+    Texture* t = static_cast<Texture*>(
+        take(target, kObjTexture, "target", __FILE__, __LINE__));
+    if (!t) return BGPU_ERR_INVALID_HANDLE;
+    if (!sameDevice(t, c->device)) {
+        return fail(BGPU_ERR_INVALID_HANDLE, __FILE__, __LINE__, "target 纹理不属于当前设备");
+    }
+    if (c->inRender) {
+        return fail(BGPU_ERR_STATE, __FILE__, __LINE__,
+                    "resolve_target 要在 end_render 之后（不能在渲染实例里 resolve）");
+    }
+    return settle(c->be->resolveTarget(*c, *t), __FILE__, __LINE__, s0);
+    BGPU_API_CATCH_RESULT()
+}
+
 BgpuResult bingpu_cmd_set_viewport(BgpuCmd cmd, float x, float y, float w, float h) {
     ApiScope scope("bingpu_cmd_set_viewport");
     const unsigned s0 = errorSeq();
