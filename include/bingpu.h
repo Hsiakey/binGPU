@@ -58,6 +58,11 @@
  *   · 高档设置**不承诺**与 CPU 参考后端逐像素相同：CPU 参考后端永远是 1×/1 级
  *     （它是"同档"裁判，不是"高质量"实现）。合同改为**"同档设置下与 CPU 参考
  *     逐像素相同；高档设置是显式质量档，不做逐像素承诺"**。
+ *   · **对象生命周期**（0.15.0 写清）：`bingpu_texture_destroy` / `bingpu_buffer_destroy`
+ *     可以在帧中途调用 —— 后端必须保证"已经录进命令缓冲、还没提交"的那些命令不再
+ *     访问被释放的显存（VK 后端为此把释放推迟到本帧提交并等完 fence 之后）。
+ *     录制中的命令缓冲**不会**因此拿到被销毁对象的内容：那种用法仍然是错的（会退化成
+ *     "没有这个纹理"的 STATE 错误），只是不再炸驱动。
  *
  * 帧模型（三条，违反其中一条三端必然不一致）：
  *   ① 一帧 = frame_begin → cmd_begin_render(target) → 记录 → cmd_end_render
@@ -82,9 +87,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 14
-#define BINGPU_VERSION_PATCH 1
-#define BINGPU_VERSION_STRING "0.14.1"
+#define BINGPU_VERSION_MINOR 15
+#define BINGPU_VERSION_PATCH 0
+#define BINGPU_VERSION_STRING "0.15.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -356,7 +361,12 @@ typedef struct BgpuDeviceDesc {
      * 4/8 = 显式要 4×/8×。后端不支持时**降级**（要 8 而设备只到 4 时给 4；
      * 完全不支持则退回 1）。开了之后画布与所有颜色渲染目标都走多采样，
      * 每个 render pass 结束时 resolve 到单采样镜像 —— frame_read 与"把该纹理
-     * 当采样源"拿到的仍是单采样结果。实际生效值见 BgpuSwapchainInfo.msaa_samples。 */
+     * 当采样源"拿到的仍是单采样结果。实际生效值见 BgpuSwapchainInfo.msaa_samples。
+     *
+     * 多目标 / 图层（一帧里多次换渲染目标、把刚画过的目标当采样源、帧中途销毁目标）
+     * 由 tests/gpu_parity.h 的三条 MSAA 用例钉住（0.15.0 起）：VK 与 GL 在 headless
+     * 下逐像素一致。**已知缺口**：GL 后端的**窗口**路径在 4× 下还会丢内容
+     * （docs/backends.md 欠账 12），窗口场景要用 4× 就先在目标后端上自己验一遍。 */
     uint32_t msaa_samples;
 } BgpuDeviceDesc;
 

@@ -919,6 +919,217 @@ static int region_is_white(const uint8_t* px, uint32_t w, uint32_t x0, uint32_t 
     return 1;
 }
 
+/* ---------------------------------------------------------------
+ * MSAA × 多目标：「帧中把刚渲染过的目标当采样源」
+ *
+ * 这是 binUI `svg-filter` 页（图层 + 毛玻璃 + 合成）的形状，也是 0.14.0 漏掉的那条：
+ * 0.14.0 的 MSAA 用例只有"单目标、画完就 texture_read"，一帧里多目标来回切的
+ * 命令流一个都没跑过。
+ *
+ * 判据：同一串命令流在 msaa=1 与 msaa=4 下必须**逐像素相同**（用例里所有四边形都
+ * 落在整数像素边界上，全采样覆盖 ⇒ resolve 就是恒等；任何差异都是缺陷）。
+ * --------------------------------------------------------------- */
+
+/* 两个缓冲逐像素比。返回差异像素数，*maxdiff 给最大通道差。 */
+static size_t pixel_diff(const uint8_t* a, const uint8_t* b, size_t px, int* maxdiff) {
+    size_t n = 0;
+    int m = 0;
+    for (size_t i = 0; i < px; i++) {
+        int d = 0;
+        for (int k = 0; k < 4; k++) {
+            const int v = (int)a[i * 4 + k] - (int)b[i * 4 + k];
+            const int av = v < 0 ? -v : v;
+            if (av > d) d = av;
+        }
+        if (d > 0) n++;
+        if (d > m) m = d;
+    }
+    if (maxdiff) *maxdiff = m;
+    return n;
+}
+
+static int pixel_is(const uint8_t* px, uint32_t w, uint32_t x, uint32_t y, uint8_t r, uint8_t g,
+                    uint8_t b, int tol) {
+    const uint8_t* p = px + ((size_t)y * w + x) * 4;
+    return (int)p[0] - (int)r <= tol && (int)r - (int)p[0] <= tol &&
+           (int)p[1] - (int)g <= tol && (int)g - (int)p[1] <= tol &&
+           (int)p[2] - (int)b <= tol && (int)b - (int)p[2] <= tol;
+}
+
+/* 场景一（照 binUI `blurLayerContent` 的顺序改写，纯 binGPU）：
+ *   ① 画布（= binUI 的 canvas）：清底色 + 两块实心色（"内容"）；
+ *   ② A（128×128 离屏）：清空，**把画布当纹理**抓进右上象限（"抓当前画布当背景"）；
+ *   ③ A：LOAD 再画一块蓝（"图层里再画一笔"，第二趟不带 CLEAR）；
+ *   ④ 画布：LOAD，**把 A 当纹理**贴回右上象限（"把模糊结果合成回整页"）；
+ * 抓空白 ⇒ ④ 把空白盖回画布 ⇒ 整页空白，正是 svg-filter 在 4× 下的样子。 */
+static void scene_capture_mid_frame(BgpuDevice dev, BgpuCmd cmd, BgpuTexture canvas) {
+    const BgpuPipeline solid = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, 0);
+    const BgpuPipeline textured =
+        make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, BGPU_PIPE_TEXTURED);
+    const BgpuSampler samp = make_sampler(dev, BGPU_FILTER_NEAREST, BGPU_WRAP_CLAMP);
+    const BgpuTexture a =
+        make_tex(dev, 128, 128, BGPU_FORMAT_RGBA8, BGPU_TEXTURE_RENDER_TARGET);
+
+    begin(cmd, canvas, 0xFF202020u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, solid);
+    quad(cmd, 136, 8, 184, 56, 0xFFFF0000u);
+    quad(cmd, 144, 72, 176, 104, 0xFF00C000u);
+    bingpu_cmd_end_render(cmd);
+
+    /* ② 画布刚渲染完就是采样源；A = 画布的右半（x 128..256，y 全高），1:1 + NEAREST */
+    begin(cmd, a, 0xFF000000u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, textured);
+    bingpu_cmd_set_texture(cmd, canvas, samp);
+    const BgpuVertex cap[4] = {{0, 0, 0, 0.5f, 0, 0xFFFFFFFFu},
+                               {128, 0, 0, 1.0f, 0, 0xFFFFFFFFu},
+                               {0, 128, 0, 0.5f, 1.0f, 0xFFFFFFFFu},
+                               {128, 128, 0, 1.0f, 1.0f, 0xFFFFFFFFu}};
+    bingpu_cmd_draw_quads(cmd, cap, 1);
+    bingpu_cmd_end_render(cmd);
+
+    /* ③ 同一个目标第二趟（LOAD）：上一趟的内容必须还在 */
+    begin_load(cmd, a);
+    bingpu_cmd_set_pipeline(cmd, solid);
+    quad(cmd, 72, 72, 120, 120, 0xFF0000FFu);
+    bingpu_cmd_end_render(cmd);
+
+    /* ④ 把 A 合成回画布右上象限（1:1） */
+    begin_load(cmd, canvas);
+    bingpu_cmd_set_pipeline(cmd, textured);
+    bingpu_cmd_set_texture(cmd, a, samp);
+    quad(cmd, 128, 0, 256, 128, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+    /* 这里**不**销毁纹理/管线：命令缓冲是先录后执行，帧尾才提交（见
+     * scene_multipass 的文件头），录完就毁对象等于拿悬垂句柄去提交。 */
+}
+
+/* 场景二（更狠一拍）：A 上两趟（第二趟 LOAD），**中途**把 A 当采样源一次。
+ *   ① A：清空 + 红块；② B（64×64 离屏）：采样 A；③ A：LOAD + 绿块；
+ *   ④ 画布：清空，左半采样 B、右半采样 A。
+ * 判据：B 里必须有红（说明①的 resolve 在第一趟结束就完成了）；A 的右半必须有
+ * 红**和**绿（说明③之后采样到的是最新内容，两趟都得在）。 */
+static void scene_capture_between_passes(BgpuDevice dev, BgpuCmd cmd, BgpuTexture canvas) {
+    const BgpuPipeline solid = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, 0);
+    const BgpuPipeline textured =
+        make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, BGPU_PIPE_TEXTURED);
+    const BgpuSampler samp = make_sampler(dev, BGPU_FILTER_NEAREST, BGPU_WRAP_CLAMP);
+    const BgpuTexture a =
+        make_tex(dev, 64, 64, BGPU_FORMAT_RGBA8, BGPU_TEXTURE_RENDER_TARGET);
+    const BgpuTexture b =
+        make_tex(dev, 64, 64, BGPU_FORMAT_RGBA8, BGPU_TEXTURE_RENDER_TARGET);
+
+    begin(cmd, a, 0xFF000000u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, solid);
+    quad(cmd, 8, 8, 40, 40, 0xFFFF0000u);
+    bingpu_cmd_end_render(cmd);
+
+    /* 中途采样：A 是"刚渲染完的目标" */
+    begin(cmd, b, 0xFF000000u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, textured);
+    bingpu_cmd_set_texture(cmd, a, samp);
+    quad(cmd, 0, 0, 64, 64, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+
+    begin_load(cmd, a);
+    bingpu_cmd_set_pipeline(cmd, solid);
+    quad(cmd, 40, 40, 56, 56, 0xFF00FF00u);
+    bingpu_cmd_end_render(cmd);
+
+    begin(cmd, canvas, 0xFF202020u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, textured);
+    bingpu_cmd_set_texture(cmd, b, samp);
+    quad(cmd, 0, 0, 64, 64, 0xFFFFFFFFu);
+    bingpu_cmd_set_texture(cmd, a, samp);
+    quad(cmd, 64, 0, 128, 64, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+}
+
+/* 帧中途销毁"还在命令缓冲里的目标"—— binUI 的模糊链换尺寸时就是这么干的
+ * （`ensureBlurLevel` 里 freeTex(旧 level7) 紧接着建同尺寸的新图）。
+ *
+ * 命令缓冲是**先录后执行**：录进去的 draw / barrier 引用的是那张图的显存。销毁
+ * 那一刻就把显存还给驱动 == 让还没执行的命令去读一块已经被下一次分配复用的内存。
+ * 1× 时复用的还是同尺寸的新图，读出来"是错的但有效"，看不出大问题；0.15.0 之前
+ * 4× 时被释放的还有 MSAA companion，GPU 当场页错误 → 驱动报 VK_ERROR_DEVICE_LOST
+ * → 整帧命令全丢（binUI 的 svg-filter 页在 4× 下整页黑）。
+ *
+ * 判据：销毁版与不销毁版的像素必须逐位相同（同一个 msaa 档内比）。
+ * g_destroy_mid 控制销毁那一步，两遍跑的是同一条命令流。 */
+static int g_destroy_mid = 0;
+
+static void scene_mid_destroy(BgpuDevice dev, BgpuCmd cmd, BgpuTexture canvas) {
+    const BgpuPipeline solid = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, 0);
+    const BgpuPipeline textured =
+        make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, BGPU_PIPE_TEXTURED);
+    const BgpuSampler samp = make_sampler(dev, BGPU_FILTER_NEAREST, BGPU_WRAP_CLAMP);
+    BgpuTexture last = BGPU_INVALID;
+
+    begin(cmd, canvas, 0xFF202020u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, solid);
+    quad(cmd, 8, 8, 232, 232, 0xFFFF0000u);
+    bingpu_cmd_end_render(cmd);
+
+    /* 一轮 = 建一张离屏 → 画 → 帧中途销毁（它还被刚录进去的 draw 引用着）
+     *        → 立刻建一张同尺寸的（驱动多半复用刚还回去的显存）→ 画 → 合成回画布。
+     * 与 binUI 模糊链"换尺寸就把旧 level 释放掉"的命令顺序一致。 */
+    for (int i = 0; i < 12; i++) {
+        BgpuTexture a = make_tex(dev, 226, 151, BGPU_FORMAT_RGBA8, BGPU_TEXTURE_RENDER_TARGET);
+        begin(cmd, a, 0xFF000000u, 0, 0);
+        bingpu_cmd_set_pipeline(cmd, solid);
+        quad(cmd, 4, 4, 222, 147, 0xFF00C000u);
+        quad(cmd, 40, 20, 180, 130, 0xFF3366CCu);
+        bingpu_cmd_end_render(cmd);
+        if (g_destroy_mid) bingpu_texture_destroy(dev, a);
+
+        const BgpuTexture b = make_tex(dev, 226, 151, BGPU_FORMAT_RGBA8,
+                                       BGPU_TEXTURE_RENDER_TARGET);
+        begin(cmd, b, 0xFF000080u, 0, 0);
+        bingpu_cmd_set_pipeline(cmd, textured);
+        bingpu_cmd_set_texture(cmd, canvas, samp);
+        quad(cmd, 0, 0, 226, 151, 0xFFFFFFFFu);
+        bingpu_cmd_end_render(cmd);
+        last = b;
+
+        /* 合成回画布（半透明，叠着画，别盖住左边那块红） */
+        begin_load(cmd, canvas);
+        bingpu_cmd_set_pipeline(cmd, textured);
+        bingpu_cmd_set_texture(cmd, last, samp);
+        quad(cmd, 232, 4, 458, 155, 0x80FFFFFFu);
+        bingpu_cmd_end_render(cmd);
+    }
+}
+
+/* 同一条场景在 msaa=1 与 msaa=4 下各跑一遍（都走 frame_read），逐像素比。 */
+static void run_msaa_capture(BgpuBackendKind kind, const char* name, SceneFn fn, uint32_t w,
+                             uint32_t h) {
+    const size_t bytes = (size_t)w * h * 4;
+    uint8_t* one = (uint8_t*)malloc(bytes);
+    uint8_t* four = (uint8_t*)malloc(bytes);
+    printf("[msaa 帧中多目标：%s]\n", name);
+    if (!one || !four) {
+        printf("  [skip] 分配失败\n");
+        free(one);
+        free(four);
+        return;
+    }
+    const int ok1 = render_swapchain_msaa(kind, 1, fn, w, h, one);
+    const int ok4 = render_swapchain_msaa(kind, 4, fn, w, h, four);
+    if (!ok1 || !ok4) {
+        g_fail++;
+        printf("  FAIL %s: 渲染失败\n", name);
+        free(one);
+        free(four);
+        return;
+    }
+    int maxdiff = 0;
+    const size_t ndiff = pixel_diff(one, four, (size_t)w * h, &maxdiff);
+    printf("  msaa=1 vs msaa=4：差异像素 %zu/%zu（%.2f%%），最大通道差 %d\n", ndiff,
+           (size_t)w * h, 100.0 * (double)ndiff / (double)((size_t)w * h), maxdiff);
+    CHECK(ndiff == 0, "同一串命令流在 msaa=1 / msaa=4 下必须逐像素相同（帧中多目标）");
+    free(one);
+    free(four);
+}
+
 static void run_msaa_case(BgpuBackendKind kind) {
     int has_cap = 0;
     const uint32_t maxs = caps_msaa_max(kind, &has_cap);
@@ -976,6 +1187,60 @@ static void run_msaa_case(BgpuBackendKind kind) {
         printf("  FAIL msaa: 两趟 LOAD 渲染失败\n");
     }
     free(d);
+
+    /* 帧中多目标 / 多趟：msaa=1 与 msaa=4 必须逐像素相同。
+     * 0.14.0 的 MSAA 用例全是"单目标、画完就读"，这条命令流一帧里换了四次目标、
+     * 而且把"刚画过的目标"当采样源 —— binUI 的毛玻璃就是它。 */
+    run_msaa_capture(kind, "画布 → 离屏抓取 → 合成回画布", scene_capture_mid_frame, 256, 128);
+    run_msaa_capture(kind, "同一目标两趟 + 中途当采样源", scene_capture_between_passes, 128, 64);
+
+    /* 帧中销毁仍在命令缓冲里的目标：1× / 4× 都必须与"不销毁"逐位相同。
+     * 这条钉的是 0.15.0 的根因（立即 vkFreeMemory ⇒ 4× 下设备丢），而 0.14.x 的
+     * "单目标、画完就读"用例一个都碰不到它。 */
+    {
+        const uint32_t w = 256, h = 128;
+        uint8_t* keep = (uint8_t*)malloc((size_t)w * h * 4);
+        uint8_t* gone = (uint8_t*)malloc((size_t)w * h * 4);
+        printf("[msaa 帧中销毁目标]\n");
+        for (int ms = 0; ms < 2; ms++) {
+            const uint32_t samples = ms ? 4 : 1;
+            g_destroy_mid = 0;
+            const int k1 = render_swapchain_msaa(kind, samples, scene_mid_destroy, w, h, keep);
+            g_destroy_mid = 1;
+            const int k2 = render_swapchain_msaa(kind, samples, scene_mid_destroy, w, h, gone);
+            if (!k1 || !k2) {
+                g_fail++;
+                printf("  FAIL msaa=%u：帧中销毁目标的场景渲染失败（设备丢了？）\n", samples);
+                continue;
+            }
+            int maxdiff = 0;
+            const size_t ndiff = pixel_diff(keep, gone, (size_t)w * h, &maxdiff);
+            printf("  msaa=%u 销毁版 vs 不销毁版：差异像素 %zu/%zu，最大通道差 %d\n", samples,
+                   ndiff, (size_t)w * h, maxdiff);
+            CHECK(ndiff == 0, "帧中销毁仍在缓冲里的目标不能影响本帧像素（1×/4× 都要）");
+        }
+        g_destroy_mid = 0;
+        free(keep);
+        free(gone);
+    }
+
+    /* 语义检查：4× 下抓取/合成真的搬到了内容（不只是"两边一样地坏"） */
+    uint8_t* cap = (uint8_t*)malloc(256 * 128 * 4);
+    if (cap && render_swapchain_msaa(kind, 4, scene_capture_mid_frame, 256, 128, cap)) {
+        const int red_kept = pixel_is(cap, 256, 150, 20, 255, 0, 0, 8);
+        const int green_kept = pixel_is(cap, 256, 155, 85, 0, 192, 0, 8);
+        const int blue_new = pixel_is(cap, 256, 210, 90, 0, 0, 255, 8);
+        const int bg_kept = pixel_is(cap, 256, 8, 8, 32, 32, 32, 8);
+        printf("  4× 帧中抓取：红=%d 绿=%d 第二趟蓝=%d 画布左半背景=%d\n", red_kept, green_kept,
+               blue_new, bg_kept);
+        CHECK(red_kept && green_kept, "4×：抓到的画布内容必须回到画布上（不能是空白）");
+        CHECK(blue_new, "4×：LOAD 的第二趟内容也必须一起搬回来");
+        CHECK(bg_kept, "4×：抓取/合成之外的画布内容必须原样保留");
+    } else {
+        g_fail++;
+        printf("  FAIL msaa: 帧中多目标渲染失败\n");
+    }
+    free(cap);
 
     /* 深度附件也必须按同一采样数建：MSAA 下 depth(LESS) 仍要让近处红色胜出 */
     uint8_t* z = (uint8_t*)malloc(64 * 64 * 4);

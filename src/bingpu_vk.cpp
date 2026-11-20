@@ -532,6 +532,51 @@ struct VkDeviceObj final : Device {
     uint32_t msaa_max = 1;
     uint32_t msaa = 1;
 
+    /* 帧中销毁的纹理/缓冲：**不能立即释放**。
+     *
+     * 命令缓冲是"先录后执行"（docs/backends.md 的 0.13.0 那条：录的时候只是记命令，
+     * 帧尾才真正提交）。录进去的 draw / barrier / 附件引用的是 VkImage / VkBuffer
+     * 句柄，而调用方完全可以在帧中途 destroy 一张纹理（binUI 的模糊链换尺寸时就是
+     * 这么干的）—— 那一刻立即 vkDestroyImage + vkFreeMemory，等于让还在命令缓冲里的
+     * 命令去读一块已经还给驱动、并且很可能已经被下一次分配复用的显存。
+     *
+     * 实测（0.15.0 定位）：1× 时这块内存被同尺寸的新图复用，读出的是"错的但有效的"
+     * 数据，画面看不太出来；4× 时被释放的还有 MSAA companion，GPU 当场页错误，
+     * 驱动报 VK_ERROR_DEVICE_LOST，整帧命令全丢（binUI 的 svg-filter 页整页黑）。
+     *
+     * 所以录制期间只把句柄挂进这张"退役表"，等本帧提交完（submitNow 内部等 fence）
+     * 再真正释放 —— 与 0.13.0 处理"顶点流扩容时旧 buffer 不能当场销毁"是同一条规矩。 */
+    struct Retired {
+        VkImage image = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+    };
+    struct RetiredBuffer {
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+    };
+    std::vector<Retired> retired;
+    std::vector<RetiredBuffer> retired_buffers;
+    uint32_t recording_cbs = 0;   /* 正在录制的命令缓冲数（>0 时销毁要推迟） */
+    void retire(VkImage image, VkImageView view, VkDeviceMemory mem) {
+        retired.push_back(Retired{image, view, mem});
+    }
+    /* 真正释放退役表里的东西。只在"提交且等完"之后调用。 */
+    void drainRetired() {
+        for (const Retired& r : retired) {
+            if (r.view) g_vk.vkDestroyImageView(dev, r.view, nullptr);
+            if (r.image) g_vk.vkDestroyImage(dev, r.image, nullptr);
+            if (r.mem) g_vk.vkFreeMemory(dev, r.mem, nullptr);
+        }
+        retired.clear();
+        for (const RetiredBuffer& b : retired_buffers) {
+            if (b.buf) g_vk.vkDestroyBuffer(dev, b.buf, nullptr);
+            if (b.mem) g_vk.vkFreeMemory(dev, b.mem, nullptr);
+        }
+        retired_buffers.clear();
+    }
+
     VkDeviceObj(Backend& b, uint32_t flags, uint32_t w, uint32_t h)
         : Device(b, BGPU_INVALID, flags, w, h) {}
     ~VkDeviceObj() override;
@@ -564,15 +609,27 @@ struct VkTextureObj final : Texture {
     VkTextureObj(Backend& b, BgpuDevice owner) : Texture(b, owner) {}
     ~VkTextureObj() override {
         if (!dev) return;
-        /* companion 是**我们自己**的，无论底层 image 是否借用都要销毁 */
-        if (msaa_view) g_vk.vkDestroyImageView(dev, msaa_view, nullptr);
-        if (msaa_image) g_vk.vkDestroyImage(dev, msaa_image, nullptr);
-        if (msaa_mem) g_vk.vkFreeMemory(dev, msaa_mem, nullptr);
-        if (own_image) {
-            if (view) g_vk.vkDestroyImageView(dev, view, nullptr);
-            if (image) g_vk.vkDestroyImage(dev, image, nullptr);
-            if (mem) g_vk.vkFreeMemory(dev, mem, nullptr);
+        /* 帧中途销毁（见 VkDeviceObj::retired）：改成挂进退役表，等提交完再放。
+         * 1× 下靠"同尺寸复用"侥幸不炸，4× 下 MSAA companion 被释放后 GPU 直接
+         * 页错误（VK_ERROR_DEVICE_LOST），所以这一条对两个档都要成立。 */
+        VkDeviceObj* owner = nullptr;
+        if (device != BGPU_INVALID) {
+            owner = static_cast<VkDeviceObj*>(lookupObject(device, kObjDevice));
         }
+        const bool defer = owner && owner->recording_cbs > 0;
+        auto release = [&](VkImage im, VkImageView vw, VkDeviceMemory mm) {
+            if (!im && !vw && !mm) return;
+            if (defer) {
+                owner->retire(im, vw, mm);
+            } else {
+                if (vw) g_vk.vkDestroyImageView(dev, vw, nullptr);
+                if (im) g_vk.vkDestroyImage(dev, im, nullptr);
+                if (mm) g_vk.vkFreeMemory(dev, mm, nullptr);
+            }
+        };
+        /* companion 是**我们自己**的，无论底层 image 是否借用都要销毁 */
+        release(msaa_image, msaa_view, msaa_mem);
+        if (own_image) release(image, view, mem);
     }
 };
 
@@ -585,6 +642,18 @@ struct VkBufferObj final : Buffer {
     VkBufferObj(Backend& b, BgpuDevice owner) : Buffer(b, owner) {}
     ~VkBufferObj() override {
         if (!dev) return;
+        /* 帧中途销毁：与纹理同一条规矩（见 VkDeviceObj::retired）。顶点流扩容
+         * 那条路 0.13.0 是用"抄进新 buffer"解决的，这里兜住调用方自己 destroy。 */
+        VkDeviceObj* owner = nullptr;
+        if (device != BGPU_INVALID) {
+            owner = static_cast<VkDeviceObj*>(lookupObject(device, kObjDevice));
+        }
+        if (owner && owner->recording_cbs > 0) {
+            /* 缓冲不进图片退役表（那张表是 image/view/mem 三元组），单独排队 */
+            owner->retired_buffers.push_back(VkDeviceObj::RetiredBuffer{buf, mem, mapped});
+            if (mapped) g_vk.vkUnmapMemory(dev, mem);   /* 映射可以立刻撤 */
+            return;
+        }
         if (mapped) g_vk.vkUnmapMemory(dev, mem);
         if (buf) g_vk.vkDestroyBuffer(dev, buf, nullptr);
         if (mem) g_vk.vkFreeMemory(dev, mem, nullptr);
@@ -707,6 +776,7 @@ VkDeviceObj::~VkDeviceObj() {
     if (trace2()) std::fprintf(stderr, "[vk] ~VkDeviceObj dev=%p\n", (void*)dev);
     if (dev) {
         g_vk.vkDeviceWaitIdle(dev);
+        drainRetired();   /* 退役表里剩下的（帧中途销毁、之后再没提交过）在这里放掉 */
         if (fence) g_vk.vkDestroyFence(dev, fence, nullptr);
         if (default_sampler) g_vk.vkDestroySampler(dev, default_sampler, nullptr);
         if (vert) g_vk.vkDestroyShaderModule(dev, vert, nullptr);
@@ -1946,6 +2016,9 @@ VkPipeline VkBackend::pipelineFor(VkPipelineObj& p, VkDeviceObj& dev, VkFormat c
  * --------------------------------------------------------------- */
 bool VkBackend::beginRecording(VkCmdObj& c, VkDeviceObj& dev) {
     if (c.recording) return true;
+    /* 上一趟已经 fence 等完（frame_end / 离屏 end_render 都会等），退役表可以清了。
+     * 只有"没有别的命令缓冲在录"时才动它 —— 见 VkDeviceObj::retired 的注释。 */
+    if (dev.recording_cbs == 0) dev.drainRetired();
     if (!c.cb) {
         VkCommandBufferAllocateInfo cbi{};
         cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1959,6 +2032,7 @@ bool VkBackend::beginRecording(VkCmdObj& c, VkDeviceObj& dev) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (g_vk.vkBeginCommandBuffer(c.cb, &bi) != VK_SUCCESS) return false;
     c.recording = true;
+    ++dev.recording_cbs;
     c.vused = 0;
     c.have_state = false;
     c.last_pipe = VK_NULL_HANDLE;
@@ -2033,13 +2107,19 @@ bool VkBackend::submitNow(VkDeviceObj& dev, VkCmdObj& c) {
     if (!c.recording) return false;
     g_vk.vkEndCommandBuffer(c.cb);
     c.recording = false;
+    if (dev.recording_cbs) --dev.recording_cbs;
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &c.cb;
     g_vk.vkResetFences(dev.dev, 1, &dev.fence);
     if (g_vk.vkQueueSubmit(dev.queue, 1, &si, dev.fence) != VK_SUCCESS) return false;
-    return g_vk.vkWaitForFences(dev.dev, 1, &dev.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    const VkResult wr = g_vk.vkWaitForFences(dev.dev, 1, &dev.fence, VK_TRUE, UINT64_MAX);
+    if (wr != VK_SUCCESS && std::getenv("BINGPU_VK_TRACE"))
+        std::fprintf(stderr, "[vk] submitNow: wait=%d\n", (int)wr);
+    /* 这一趟已经等完：退役表里的纹理/缓冲现在真的没人用了，可以释放 */
+    if (dev.recording_cbs == 0) dev.drainRetired();
+    return wr == VK_SUCCESS;
 }
 
 BgpuResult VkBackend::createCmd(Device& dev, BgpuCmd* out) {
@@ -2323,7 +2403,8 @@ bool VkBackend::ensureMsaa(VkTextureObj& t, VkDeviceObj& d) {
     ici.arrayLayers = 1;
     ici.samples = toVkSamples(d.msaa);
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (g_vk.vkCreateImage(d.dev, &ici, nullptr, &t.msaa_image) != VK_SUCCESS) {
         if (trace2()) std::fprintf(stderr, "[vk] MSAA companion 建图失败 %ux%u\n", t.w, t.h);

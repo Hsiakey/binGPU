@@ -4,6 +4,61 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.15.0] - 2026-11-20 【ABI 5 不变】
+
+**修 0.14.1 记下的那条 MSAA 欠账 —— 而根因与当初的两条猜测都不一样**：不是"采样到未
+resolve 的单采样图"，也不是"resolve 落到错图"，而是**调用方在帧中途销毁了一张还被命令
+缓冲引用着的渲染目标**。VK 后端旧版当场 `vkDestroyImage` + `vkFreeMemory`，4× 下连
+MSAA companion 一起还回去，GPU 页错误 ⇒ `VK_ERROR_DEVICE_LOST` ⇒ 驱动把整帧命令丢掉
+⇒ 整页黑。
+
+### 证据链（记下来，免得下次又往 resolve 时序上猜）
+
+- `svg-filter` 4× 整页黑（全像素 0），`vkDeviceWaitIdle` 返回 `-4 = VK_ERROR_DEVICE_LOST`，
+  Windows 事件日志每跑一次一条 `nvlddmkm` 153；而**帧尾的 fence 等待是成功的** ——
+  丢的是帧内命令。
+- 逐 pass 二分：≤23 趟正常、第 24 趟起丢设备；第 24 趟**单独提交**时正常 ⇒ 不是某条
+  命令非法，是"一帧里累积到某个点"。
+- 每趟单独提交后 `svg-filter` **0 差异** ⇒ 像素逻辑本身是对的，问题在资源生命周期。
+- 关掉 LOAD 的 blit、关掉 resolve 仍然丢设备 ⇒ 排除两条时序猜测。
+- 给纹理析构打点：帧内只有两次销毁（75×68、113×75，都带 companion），来自 binUI
+  `ensureBlurLevel` 换尺寸时先拆旧 level 再建同尺寸新图。**让析构不真释放 → 不再丢设备、
+  `svg-filter` 0.000%**。定案。
+
+### 修法
+
+`VkDeviceObj` 加**退役表**（image / view / mem 与 buffer 两条队列 + `recording_cbs` +
+`drainRetired()`）：`VkTextureObj` / `VkBufferObj` 析构时，只要设备还有命令缓冲在录制，
+就只挂表、不释放；`beginRecording`（无别的 cb 在录时）、`submitNow`（fence 等完之后）、
+`~VkDeviceObj` 三处排空。另外给 MSAA companion 补 `TRANSFER_SRC|TRANSFER_DST` 用途位
+（LOAD 的 blit 拿它当 dst，原来缺这属于用法不合法）。
+
+这条与 0.13.0（顶点流扩容 retire-then-free）、以及 bin2D 0.22.3（贴图缓存淘汰时销毁了
+命令流还在引用的纹理）是**同一类错误的第三次**：**释放"命令流还在引用"的东西**。
+`include/bingpu.h` 的质量档合同里因此加了一条对象生命周期承诺：帧中途 destroy 不许炸驱动。
+
+### 验证
+
+新用例（VK 与 GL 数字一致）：`画布→离屏抓取→合成回画布` 0/32768；`同一目标两趟 + 中途
+当采样源` 0/8192；`帧中销毁目标` 1× 与 4× 都是 0/32768。原有 MSAA/mip 用例不变
+（中间色 0→72、frame_read 72、mip 偏差 74.11→0.00）。
+
+上层实测（binUI `pixels-gpu`，VK 4×，18 页对 `docs/pixels`）：**18/18 页 0 像素差异**，
+最大通道差 ≤ 7 —— 其中三页是多年旧账一起清掉：`grad-angle` 0.667%/17 → 0/1、
+`image-round` 0.217%/120 → 0/1、`image-mip` 0.118%/64 → 0/0；`svg-filter` 从"4× 整页黑"
+到 0/6。
+
+代价：`binui_gpu`（VK）0.65/0.71 → 0.93/1.11 ms（+43%/+56%）；bin2d 执行体那条不在这
+一版受益（它自己还没申请质量档，见下）。
+
+### 已知缺口（新记）
+
+**GL 窗口路径的 4× 仍然丢内容**（`circle` 94.6% / max 255、`shadow` 95.9%、`svg-filter`
+9.1%，同页 1× 都是 0）；把 VK 的延迟释放照搬过去**无改善**，所以不是同一根因，是 GL
+multisample FBO / `glBlitFramebuffer` resolve 自己那条链的问题（headless 用例覆盖不到
+窗口路径）。binUI 侧因此**按后端解除钉子**：VK 开 4×、GL 仍 1×。这条记在
+`docs/backends.md` 欠账 12。
+
 ## [0.14.1] - 2026-11-20 【ABI 5 不变】
 
 **把 0.14.0 的 MSAA 欠账记清楚**：接上层的实测，MSAA 在"一帧里多目标 / 图层"的场景会

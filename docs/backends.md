@@ -283,8 +283,18 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
   - 管线缓存键加上了采样数（`VkPipelineMultisampleStateCreateInfo.rasterizationSamples`
     必须等于附件采样数）。
   - `begin_render` 不带 `CLEAR_COLOR`（LOAD）时，先把单采样 image blit 回多采样附件
-    —— 上一趟结束时内容已经在单采样镜像里，多采样附件本身不保留它。这条是 MSAA 下
-    "一帧多趟"正确性的关键，`tests/gpu_parity.h` 的 MSAA 用例里有一趟专门钉它。
+    —— 这样"在 pass 之外改过这张图"（`texture_upload`、`clear_color`、上一帧的 resolve）
+    的内容也能被 LOAD 接上；多采样附件本身是 `storeOp = STORE` 的，上一趟的样本也还在，
+    两条路给的结果一致。companion 因此必须带 `TRANSFER_DST`（它会被当 blit 目标）。
+    > 规范上 `vkCmdBlitImage` 写"多采样目标"是比较敏感的一条（原来的 companion 连
+    > `TRANSFER_DST` 都没有）。本机没装 Vulkan SDK / 验证层，没法用 VUID 复核；实测
+    > 在 4060 Ti / 610.88 上两趟 LOAD 与"帧中多目标"用例都正确。若要更保守，可以改成
+    > 用一笔覆盖整屏的 draw 预置多采样附件（多一次 pass），但那要额外一张临时图。
+  - **帧中途销毁目标**：命令缓冲是先录后执行，`destroy_texture` / `destroy_buffer` 在
+    "还有命令缓冲在录制"时只把句柄挂进设备的退役表，`submitNow` 等完 fence 之后才真正
+    `vkDestroyImage` / `vkFreeMemory`。不这么做的话，录进去的 draw/barrier 会去读一块
+    已经还给驱动的显存 —— 1× 时靠同尺寸复用侥幸不炸，4× 时连 companion 一起还回去，
+    驱动直接 `VK_ERROR_DEVICE_LOST`（0.15.0 修的正是这条，见欠账 11）。
 - **mip**：`BGPU_TEXTURE_MIPMAPS` → `mipLevels = floor(log2(max(w,h)))+1`（上限 16），
   image/view 的 `levelCount` 同步；上传 level 0 之后用 `vkCmdBlitImage`
   （`VK_FILTER_LINEAR`）逐级降采样到 1×1，每一级单独换布局（整张图的 barrier 表达不了
@@ -319,7 +329,12 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
 | 用例 | 判据（本机实测） |
 |---|---|
 | `msaa(斜边覆盖率)` | 一条斜边：1× 的 `0<v<255` 中间色像素 **0** 个，4× **72** 个；`frame_read` 路径同样 **72**；两趟 LOAD 的第一趟内容保留=1；MSAA 下 `depth(LESS)` 中心仍 R=255/B=0 |
+| `msaa 帧中多目标：画布 → 离屏抓取 → 合成回画布` | 照 binUI `blurLayerContent` 的命令顺序：画布 → 离屏抓 A（抓背景）→ A 第二趟 LOAD → 合成回画布。1× 与 4× **逐像素 0 差异**；4× 下红/绿（抓到的内容）与蓝（第二趟）都在（VK/GL 都是 0/32768） |
+| `msaa 帧中多目标：同一目标两趟 + 中途当采样源` | A 上两趟（第二趟 LOAD），中途把 A 当采样源一次；1× vs 4× **0 差异**（0/8192） |
+| `msaa 帧中销毁目标` | 一帧里 12 轮"建目标 → 画 → **帧中途销毁**（它还被缓冲引用着）→ 建同尺寸新目标 → 合成"：销毁版 vs 不销毁版 **0 差异**（1× 与 4× 都要）。钉的是欠账 11 那条根因的**合同**（销毁不得影响本帧像素）。注意：headless 下这条在没修的 0.14.1 上也过 —— 驱动在这个尺寸上没炸；真正炸的是 binUI 的 660×470 窗口帧，所以现场判据还是 `make pixels-gpu` 的 `svg-filter` |
 | `mip(缩小的棋盘格)` | 256×256 / 2px 棋盘缩小到 60×60：1×（`mip_levels=1`）均值 127.46、**平均绝对偏差 74.11**（摩尔纹）；mip（`mip_levels=9`）均值 127.00、**偏差 0.00**（纯灰） |
+
+前四条 VK 与 GL 给出**同一组数字**（帧中多目标那三条都是 0 差异）。
 
 拿不到能力时两条都打印 `[skip] ...` 并返回，不 fail（D3D11 / CPU / NULL 上就是这样）。
 
@@ -406,13 +421,35 @@ present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` �
    不是"建不出来" —— 这条仍然成立：上层问 `BGPU_CAP_MIPMAPS` 就能分流，不需要 try/except。
 10. **一个 HWND 只能绑一个 GL 设备**：WGL 的上下文绑在 DC 上，`contracts.md` §4 本来就规定
    "一个 native_window 同一时刻只能绑一个呈现后端"。binUI 的多面板要共用一个设备，不是多个。
-11. **MSAA 在"多目标 / 图层"路径上还会丢内容**（0.14.1 记录，未修）：单目标用例（斜边、
-   两趟 LOAD、depth）都过，但 binUI 的 `svg-filter` 页（图层 + 模糊 + 多次换渲染目标 + 合成）
-   在 4× 下**整页空白** —— 对着基线是 100% 差异、最大通道差 255，同一页 1× 下是 0 差异。
-   也就是"每次换目标都新建/解析一张多采样 companion"这条链上还有一处没接对（最可能是
-   主画布的 resolve 没有落到被 present 采样的那张单采样 image 上）。在修好之前：
-   binGPU 照常报 `BGPU_CAP_MSAA`（能力是真的），但**调用方别在"一帧里多目标"的场景默认开
-   高档** —— 已知唯一受害者 binUI 的 `binui_gpu` 已显式钉 1×（见 binUI 0.37.1 的 CHANGELOG）。
-   修好之后 `image-round`（旋转边）与 `image-mip` 两页的旧账会一起清掉（实测 4× 下两页都是
-   0 差异）。
+11. ~~**MSAA 在"多目标 / 图层"路径上还会丢内容**（0.14.1 记录）~~ → **0.15.0 已修**。
+    症状：binUI 的 `svg-filter` 页（图层 + 毛玻璃 + 多次换渲染目标 + 合成）在 4× 下
+    **整页黑** —— 对基线 100% 差异、最大通道差 255；同一页 1× 下 0 差异。VK 的
+    `vkDeviceWaitIdle` 返回 `VK_ERROR_DEVICE_LOST`（Windows 事件日志里有对应的
+    `nvlddmkm` 153），也就是**整帧命令被驱动丢掉了**，不是"画错了"。
+    **根因不在 resolve，也不在采样目标**（当初的记录猜错了两处，一并记下来免得以后
+    再往那个方向找）：调用方在**帧中途销毁了一张还在命令缓冲里的渲染目标**
+    （binUI `ensureBlurLevel` 换尺寸时 `freeTex(旧 level7)` → 立刻建同尺寸新图）。
+    命令缓冲是先录后执行，录进去的 `vkCmdBeginRendering` / barrier 引用的是那张图的
+    `VkImage` 及其 MSAA companion；旧版析构里直接 `vkDestroyImage` + `vkFreeMemory`，
+    1× 时那块显存被同尺寸新图复用（读到"错的但有效"的数据，画面看不太出来），4× 时
+    companion 也一起还回去，GPU 当场页错误，整帧全丢 ⇒ 整页黑。
+    **修法**（与 0.13.0 "顶点流扩容时旧 buffer 不能当场销毁"同一条规矩）：`VkTextureObj`
+    / `VkBufferObj` 析构时若设备还有命令缓冲在录制（`recording_cbs > 0`），只把
+    image/view/memory 句柄挂进设备的"退役表"，等本帧 `vkCmdEndCommandBuffer` + 提交 +
+    等完 fence（`submitNow`）之后再真正释放。同时给 MSAA companion 补上
+    `TRANSFER_SRC | TRANSFER_DST` 用途位（它本来就会被当 blit 目标用）。
+    实测（`make pixels-gpu`，18 页对 `docs/pixels` 基线、0.5% 容差）：VK **18 页全部
+    0 像素差异**（最大通道差 ≤7；`svg-filter` 从 100% → 0、`image-round` 0.217% → 0、
+    `image-mip` 0.118% → 0）。帧时（`probe_cost`，窗口路径、60 帧中位）：1× 与 4× 都在
+    1.06–1.16 ms/帧，差在噪声内。
+    **GL 后端还有同一形状的欠账**（记在下面第 12 条），所以 binUI 的 `binui_gpu` 只对
+    VK 放开 4×，GL 继续钉 1×。
+12. **GL 后端的 MSAA 在窗口路径上还会丢内容**（0.15.0 记录，未修）：`binGPU` 的 headless
+    用例（`tests/gpu_parity.h`，含帧中多目标 / 两趟 + 中途采样 / 帧中销毁目标）在 GL 上
+    与 VK 逐像素一致（0 差异），但 binUI 的窗口路径在 4× 下与基线还对不上 ——
+    `circle` 94.6%、`shadow` 95.9%、`svg-filter` 9.1%（同一页 1× 是 0）。
+    VK 已修的"帧中途销毁"在 GL 上做同样处理（延迟删除）**没有改善**，说明是 GL
+    multisample FBO / `glBlitFramebuffer` resolve 这条链自己的问题（多目标 + 窗口默认
+    帧缓冲的组合）。修它要先补一条**窗口路径**的 GL 用例（现在的 headless 用例覆盖不到），
+    再按 VK 的同一份判据验收。
 
