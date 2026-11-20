@@ -127,7 +127,7 @@ viewport / affine / 双线性 / 最近+重复 / 局部上传 / 深度 / 网格�
 | **四角带色圆角矩形（`bingpu_cmd_draw_rounded_rect_grad`）** | ✅ **0.11.0**：九宫格 + 四角直通色。线性渐变在屏幕空间是仿射函数，仿射函数被四边形上的线性插值精确复现 ⇒ 圆角底渐变也是精确解（实测 1064 像素最大通道差 1），不要条带、不要 stencil、不要第二次 pass |
 | **解析圆角（`bingpu_cmd_draw_shapes`，AA 在片元里）** | ✅ **0.12.0 / ABI 4**：圆角的抗锯齿**数学**从 CPU 搬进像素着色器 —— 每个片元自己求有符号距离场，`cov = clamp(0.5 - d, 0, 1)`（轴对齐 1:1 下 `\|grad d\| ≡ 1`，所以是精确解析值，**不需要 `fwidth`**）。CPU 参考 + GL + VK + D3D11 **四端全部实现**，端间最大通道差 1；精度优于上一版的 8 子采样扫描线模板（最大差 10~13 vs 16~40）。无 `BGPU_CAP_SHAPE` 时调用方退回覆盖率模板 |
 | **帧节拍器（`bingpu_pace_*`）** | ✅ **0.9.0**：`standard`/`unlimited`/`240`/`120`/`90`/`60`/`30`，规则是「下一拍 = max(本拍开始 + 目标周期, 本拍结束)」；纯状态机、时间由调用方注入，所以能离线单测（`tests/test_pace.c`）。上层实测：VK `unlimited` 2116–2207 fps、`standard` 114 fps |
-| MSAA / mip 采样 / 用户着色器 / 网格光照 | ⛔ 未做，见 [docs/backends.md](docs/backends.md) 的欠账 |
+| **MSAA / 真 mip（下一版，默认不变）** | ✅ **VK + GL**：`BgpuDeviceDesc.msaa_samples = 4/8` → 画布与所有颜色目标走多采样、pass 末 resolve 到单采样（`frame_read` / 采样拿到的仍是单采样图）；`BGPU_TEXTURE_MIPMAPS` → 完整 mip 链（VK 逐级 blit / GL `glGenerateMipmap`），采样器按 LOD 取级。默认仍是 1×/1 级，与 CPU 逐像素合同一个字没动。能力查 `BGPU_CAP_MSAA` / `BGPU_CAP_MIPMAPS` 与 `caps.msaa_samples`。⛔ D3D11 这一版明确不做（原因见 [docs/backends.md](docs/backends.md) 的质量档一节）；用户着色器 / 网格光照仍未做 |
 | **Vulkan 后端** | ✅ **0.3.0**：设备/交换链/present、纹理/缓冲/采样器、五种混合、离屏+深度、网格、仿射；与 CPU 参考后端逐像素 0 差（`tests/test_vk_render.c` 12 个用例） |
 | **D3D11 后端** | ✅ **0.4.0**：同上，走**即时上下文**（无命令缓冲）；同一份用例表逐像素 0 差（`tests/test_d3d11_render.c`） |
 | **OpenGL 后端** | ✅ **0.5.0**：WGL + OpenGL 3.3 core，全局状态映射；同一份用例表逐像素 0 差（`tests/test_gl_render.c`），窗口路径与 VK/D3D11 输出逐字节相同 |

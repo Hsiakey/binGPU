@@ -48,6 +48,17 @@
  *   纹理上传的像素同样是直通 RGBA8；采样后先乘顶点色、再预乘。
  *   帧缓冲不用 sRGB 视图。
  *
+ * 质量档合同（下一版起，0.13.x 的默认路径一个字没变）：
+ *   · **默认仍是 1× MSAA / 1 级 mip** —— 不显式要的时候，四端的像素、跨端 parity、
+ *     与 CPU 参考后端的逐像素对照全部照旧（那是"同档设置下"的合同）。
+ *   · MSAA 与 mip 是**显式选择的质量档**：`BgpuDeviceDesc.msaa_samples = 4/8`、
+ *     `BgpuTextureDesc.flags & BGPU_TEXTURE_MIPMAPS`。能力是否可达先问
+ *     `bingpu_device_caps()`（`BGPU_CAP_MSAA` / `BGPU_CAP_MIPMAPS` 与
+ *     `caps.msaa_samples`），拿不到就退回默认档。
+ *   · 高档设置**不承诺**与 CPU 参考后端逐像素相同：CPU 参考后端永远是 1×/1 级
+ *     （它是"同档"裁判，不是"高质量"实现）。合同改为**"同档设置下与 CPU 参考
+ *     逐像素相同；高档设置是显式质量档，不做逐像素承诺"**。
+ *
  * 帧模型（三条，违反其中一条三端必然不一致）：
  *   ① 一帧 = frame_begin → cmd_begin_render(target) → 记录 → cmd_end_render
  *      → frame_end。frame_begin 拿到的目标纹理是**借用**的（不许销毁）。
@@ -71,9 +82,9 @@ extern "C" {
 #endif
 
 #define BINGPU_VERSION_MAJOR 0
-#define BINGPU_VERSION_MINOR 13
+#define BINGPU_VERSION_MINOR 14
 #define BINGPU_VERSION_PATCH 0
-#define BINGPU_VERSION_STRING "0.13.0"
+#define BINGPU_VERSION_STRING "0.14.0"
 
 /* 二进制 ABI 号：结构体布局 / 函数签名 / 枚举值一变就 +1
  *   ABI 1：0.1.0 - 0.3.0（初始 ABI；0.2.0 只换了实现语言，ABI 未动）
@@ -85,8 +96,14 @@ extern "C" {
  *   ABI 4：0.12.0（新增 BGPU_VERTEX_SHAPE 枚举值 + BgpuShapeVertex +
  *          BGPU_PIPE_SHAPE + BGPU_CAP_SHAPE + bingpu_cmd_draw_shapes；
  *          既有结构体、枚举值、签名全部不变）
- *   0.13.0 是**纯 VK 后端实现**的修复（布局/依赖/顶点流），ABI 仍是 4 —— 一个字节没动。 */
-#define BINGPU_ABI_VERSION 4u
+ *   0.13.0 是**纯 VK 后端实现**的修复（布局/依赖/顶点流），ABI 仍是 4 —— 一个字节没动。
+ *   ABI 5：0.14.0（新增 BGPU_CAP_MSAA / BGPU_CAP_MIPMAPS 两个 cap 位。
+ *          按本项目的老规矩"枚举值一变就 +1"：结构体布局与函数签名仍然不变，
+ *          但 0.12.0 加 BGPU_CAP_SHAPE 时也升了 ABI，这次照同一套。）
+ *          **语义变化**：BgpuCaps.msaa_samples 从"实际生效值"改成"能力上限"，
+ *          实际生效值看 BgpuSwapchainInfo.msaa_samples —— 只看 caps 的老代码
+ *          不会因此变大，因为默认档仍是 1。 */
+#define BINGPU_ABI_VERSION 5u
 
 /* 句柄都是 uint64_t；0 = 无效 */
 #define BGPU_INVALID 0ull
@@ -335,7 +352,12 @@ typedef struct BgpuDeviceDesc {
     uint32_t width;
     uint32_t height;
     uint32_t flags;         /* BgpuDeviceFlag 位或 */
-    uint32_t msaa_samples;  /* 1 = 不开 MSAA；4 = 4x（后端不支时自动降到 1） */
+    /* 质量档：0/1 = 不开 MSAA（默认，与 CPU 参考后端逐像素对齐）；
+     * 4/8 = 显式要 4×/8×。后端不支持时**降级**（要 8 而设备只到 4 时给 4；
+     * 完全不支持则退回 1）。开了之后画布与所有颜色渲染目标都走多采样，
+     * 每个 render pass 结束时 resolve 到单采样镜像 —— frame_read 与"把该纹理
+     * 当采样源"拿到的仍是单采样结果。实际生效值见 BgpuSwapchainInfo.msaa_samples。 */
+    uint32_t msaa_samples;
 } BgpuDeviceDesc;
 
 typedef struct BgpuDeviceInfo {
@@ -361,7 +383,12 @@ typedef enum BgpuCapFlag {
     /* ABI 3：追加在末尾，旧枚举值一个都没动 */
     BGPU_CAP_LIGHTING = 1u << 10,       /* 固定功能 Lambert（BGPU_PIPE_LIGHTING 可用） */
     BGPU_CAP_PERSPECTIVE = 1u << 11,    /* 网格顶点带 w、属性按 1/w 透视校正插值 */
-    BGPU_CAP_SHAPE = 1u << 12           /* 解析圆角（BGPU_PIPE_SHAPE + draw_shapes） */
+    BGPU_CAP_SHAPE = 1u << 12,          /* 解析圆角（BGPU_PIPE_SHAPE + draw_shapes） */
+    /* 下一版（ABI 仍是 4：只加枚举值，结构体布局不动）：真 mip 链。
+     * 置位 = 该后端会把 BGPU_TEXTURE_MIPMAPS 纹理建成完整链并在缩小时按 LOD 采样；
+     * 链长 = floor(log2(max(w,h))) + 1，上限 16（可用 bingpu_texture_info 查实际值）。
+     * 没有这一位的后端（CPU / D3D11 / NULL）把 MIPMAPS 接受后降级为 1 级。 */
+    BGPU_CAP_MIPMAPS = 1u << 13
 } BgpuCapFlag;
 
 typedef struct BgpuCaps {
@@ -369,7 +396,11 @@ typedef struct BgpuCaps {
     uint32_t flags;                 /* BgpuCapFlag 位或 */
     uint32_t max_texture_size;
     uint32_t max_frames_in_flight;
-    uint32_t msaa_samples;          /* 实际生效值（设备层面） */
+    /* 这台设备能给的最高 MSAA 档：1 / 4 / 8（1 = 不支持）。
+     * 它是**能力上限**，不是"已经开了" —— 实际是否开由 BgpuDeviceDesc.msaa_samples
+     * 决定，每个交换链的实际生效值见 BgpuSwapchainInfo.msaa_samples。
+     * （CPU 参考后端恒为 1；拿不到 BGPU_CAP_MSAA 时也应视为 1。） */
+    uint32_t msaa_samples;
     uint32_t max_quads_per_draw;
 } BgpuCaps;
 
@@ -428,7 +459,7 @@ typedef struct BgpuSwapchainInfo {
     uint32_t height;
     BgpuFormat format;
     uint32_t image_count;
-    uint32_t msaa_samples;
+    uint32_t msaa_samples;          /* 本交换链实际生效的 MSAA 档（1 = 没开） */
     uint32_t present_paces_frames;  /* 1 = present 自己掐拍，外壳别再节流 */
 } BgpuSwapchainInfo;
 
@@ -454,7 +485,7 @@ typedef enum BgpuTextureFlag {
     BGPU_TEXTURE_RENDER_TARGET = 1u << 0, /* 可当渲染目标（离屏图层 / 视口 / 出图） */
     BGPU_TEXTURE_CPU_READ = 1u << 1,      /* 允许 texture_read 回读 */
     BGPU_TEXTURE_DYNAMIC = 1u << 2,       /* 每帧 upload 覆盖（视频帧 / 动态位图） */
-    BGPU_TEXTURE_MIPMAPS = 1u << 3,       /* 生成 mip 链（缩小时不闪） */
+    BGPU_TEXTURE_MIPMAPS = 1u << 3,       /* 生成完整 mip 链（缩小时不闪） */
     /* 上传的数据**已经是预乘**的：后端跳过 straight→premul 这一步，原样存进去。
      * 给"上游本来就是预乘"的场景用（bin2D 的 Surface 就是预乘，每帧整张直传），
      * 省掉一次反预乘 + 再预乘的往返 —— 那趟往返每帧要多分配一块同尺寸的直通缓冲、
@@ -469,7 +500,10 @@ typedef struct BgpuTextureDesc {
     uint32_t height;
     BgpuFormat format;
     uint32_t flags;         /* BgpuTextureFlag 位或 */
-    uint32_t mip_levels;    /* 0 = 1；MIPMAPS 时后端自动补全 */
+    /* 0 = 1；带 BGPU_TEXTURE_MIPMAPS 时后端自动补全成整条链
+     * （floor(log2(max(w,h)))+1，上限 16），这里给的值只是下限。
+     * 不带 MIPMAPS 且为 0/1 时**恒为 1 级**：这是默认路径，像素与以前逐位相同。 */
+    uint32_t mip_levels;
 } BgpuTextureDesc;
 
 typedef struct BgpuTextureInfo {
@@ -478,7 +512,7 @@ typedef struct BgpuTextureInfo {
     uint32_t height;
     BgpuFormat format;
     uint32_t flags;
-    uint32_t mip_levels;
+    uint32_t mip_levels;   /* 实际建成的级数；1 = 没有 mip 链 */
 } BgpuTextureInfo;
 
 /* 上传/回读的区域；传 NULL 表示整张 */

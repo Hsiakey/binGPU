@@ -86,8 +86,10 @@ is_top_left(u, v) = (v.y == u.y && v.x > u.x) || (v.y < u.y)
 `tests/test_cpu_render.c` 的 `seam_top_left` 用例就是钉这个的。
 
 CPU 后端**没有 MSAA**（`caps.msaa_samples == 1`），所以边缘没有覆盖率渐变：一个像素要么
-整块被画，要么完全不画。将来 GPU 后端的 4x MSAA 与 CPU 的逐像素比对，必须在
-"几何边界完全落在像素中心之外"的用例上做（或者接受边界像素的差异）。
+整块被画，要么完全不画。GPU 后端的 MSAA 是**显式质量档**（`desc.msaa_samples = 4/8`）：
+默认档仍是 1×，与 CPU 的逐像素合同在**同档设置**下成立；开了 4× 之后边缘是覆盖率渐变，
+不再承诺与 CPU 逐像素相同（见 `backends.md` 的质量档一节）。所以跨端 parity 用例只在
+默认档上比，MSAA 单独用"中间色像素个数"这类画质指标验收。
 
 ## 4. 属性插值
 

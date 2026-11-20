@@ -8,11 +8,11 @@
 | 后端 | 状态（类） | 能做什么 | 不能做什么 |
 |---|---|---|---|
 | `NULL` | **已实现**：`NullBackend` | 完整状态机、参数/句柄校验、绘制计数 | 不产生像素；回读返回 `UNSUPPORTED` |
-| `CPU` | **已实现**：`CpuBackend` | 参考像素实现；离屏目标；深度；采样器；仿射；网格；回读 | 不能开窗口（`UNSUPPORTED`）；无 MSAA；无 mip 采样 |
-| `VULKAN` | **已实现（0.3.0）**：`VkBackend` | 设备 / 交换链 / present / 纹理上传回读 / 缓冲 / 采样器 / 五种混合 / 离屏 + 深度 / 网格（`draw_indexed`）/ 仿射 | 无 MSAA（与 CPU 一致，`msaa_samples == 1`）；无 mip；无透明窗口；单帧飞行；要求 Vulkan 1.3（动态渲染） |
-| `D3D11` | **已实现（0.4.0）**：`D3d11Backend` | 同上，走**即时上下文**（无命令缓冲 / 无 PSO） | 无 MSAA；无 mip；无透明窗口；单帧飞行；无 Deferred Context（不需要） |
+| `CPU` | **已实现**：`CpuBackend` | 参考像素实现；离屏目标；深度；采样器；仿射；网格；回读 | 不能开窗口（`UNSUPPORTED`）；**恒为 1× MSAA / 1 级 mip**（它是"同档裁判"，不参与高档） |
+| `VULKAN` | **已实现（0.3.0）**：`VkBackend` | 设备 / 交换链 / present / 纹理上传回读 / 缓冲 / 采样器 / 五种混合 / 离屏 + 深度 / 网格（`draw_indexed`）/ 仿射 / **MSAA 4×/8×（resolve）+ 真 mip 链** | 默认仍是 1×/1 级；无透明窗口；单帧飞行；要求 Vulkan 1.3（动态渲染） |
+| `D3D11` | **已实现（0.4.0）**：`D3d11Backend` | 同上，走**即时上下文**（无命令缓冲 / 无 PSO） | **无 MSAA、无 mip（这一版明确不做，见"质量档"一节）**；无透明窗口；单帧飞行；无 Deferred Context（不需要） |
 | `D3D12` | 登记，未实现 | — | 同上 |
-| `GL` | **已实现（0.5.0）**：`GlBackend` | 同上，WGL + OpenGL 3.3 core（全局绑定点状态） | 无 MSAA；无 mip；无透明窗口；单帧飞行；一个 HWND 只能一个 GL 设备 |
+| `GL` | **已实现（0.5.0）**：`GlBackend` | 同上，WGL + OpenGL 3.3 core（全局绑定点状态）；**MSAA 4×/8×（multisample FBO + blit resolve）+ 真 mip 链** | 默认仍是 1×/1 级；无透明窗口；单帧飞行；一个 HWND 只能一个 GL 设备 |
 
 `AUTO` 的挑选顺序（注册表的遍历顺序，实现在 `src/bingpu_error.cpp`）：
 
@@ -103,8 +103,8 @@ CPU 后端的定位不是"没有 GPU 时的降级"，而是**像素定义的权�
 | 取舍 | 说明 |
 |---|---|
 | 单线程、立即执行 | `draw_quads` 当场光栅化；没有命令队列，`frame_end` 就是 `memcpy` |
-| 无 MSAA | `caps.msaa_samples == 1`；`desc.msaa_samples` 接受 4/8 但**降级为 1**（info 上报真实值） |
-| 无 mip 采样 | 固定管线没有 LOD 输入，采样永远取第 0 级；`mip_levels` 接受后降级为 1 |
+| 无 MSAA | CPU 参考后端恒为 1（`caps.msaa_samples == 1`）；即使 `desc.msaa_samples = 4/8` 也**降级为 1**，它只能当"同档裁判" |
+| 无 mip 采样 | 固定管线没有 LOD 输入，采样永远取第 0 级；`mip_levels` 接受后降级为 1。真要 mip 用 VK / GL |
 | 无窗口 | CPU 不碰 HWND/DPI/合成器（那些是"不可复现"的来源）；窗口呈现交给 VK / D3D11 |
 | 无设备丢失 | `bingpu_device_lost()` 恒 0；`poll()` 永远 `NONE` |
 | 法线不参与 | 网格按"顶点色 × 纹理"着色（没有光源状态，见欠账） |
@@ -198,6 +198,12 @@ VK 里是命令缓冲，在这里退化成**一个状态结构体 + 立即提交
 `swapchain_info`。想低分辨率渲染再放大，就把离屏目标当画布（`contracts.md` §2 已经禁止
 交换链局部重绘，那条路本来也不该走）。
 
+D3D11 这一版**没有 MSAA / mip**（这一版明确不做，见"质量档：MSAA 与真 mip"一节的
+D3D11 段）：`caps.msaa_samples` 报 1、没有 `BGPU_CAP_MSAA` / `BGPU_CAP_MIPMAPS`，
+`desc.msaa_samples = 4/8` 与 `BGPU_TEXTURE_MIPMAPS` 都按 0.13.0 的行为降级。
+原因不是技术不可行，而是"这一版先保证默认路径零风险"：D3D11 要补的正是交换链
+resolve 那条最容易出窗口级 bug 的路，且本机 VK/GL 已经能提供这两档。
+
 ## OpenGL：第三个真后端，异族里最极端的那个 —— **已落地（0.5.0）**
 
 GL 没有命令缓冲、没有 PSO、资源是**绑定点上的全局状态**，深度附件甚至不是对象而是
@@ -229,6 +235,109 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
    的隐藏窗口 —— 不每趟 `glScissor(0,0,w,h)` 的话 `glClear` 只清左上角 8×8。
 2. **窗口原点在左下**：FBO 上"存储行 0 = 图像顶行"所以顶点着色器不翻、读回也不翻；
    默认帧缓冲上要翻顶点（`uFlip=1`）且读回翻行、裁剪矩形镜像成 `h - y - hh`。
+
+## 质量档：MSAA 与真 mip（下一版；默认路径一个字没变）
+
+> 对应代码：`include/bingpu.h` 的 `BGPU_CAP_MIPMAPS` / `caps.msaa_samples` /
+> `BgpuDeviceDesc.msaa_samples`；VK 在 `src/bingpu_vk.cpp`，GL 在 `src/bingpu_gl.cpp`。
+> 版本号与 ABI 都没动（ABI 仍是 4）：这一版只用了既有字段 + `caps.flags` 的新位。
+
+### 合同怎么改（唯一的措辞变化）
+
+以前是"四端与 CPU 参考后端逐像素相同"。CPU 永远只有 1×/1 级，所以一旦开了 MSAA / mip，
+那句话就不再是同一个命题。**新合同**：
+
+> **同档设置下与 CPU 参考后端逐像素相同；高档设置（MSAA > 1、mip 链）是显式选择的
+> 质量档，不做逐像素承诺。**
+
+默认档（`msaa_samples` 为 0/1、纹理不带 `BGPU_TEXTURE_MIPMAPS`）**一个像素都没变**：
+`tests/` 的 16 条跨端 parity 用例在改动前后逐位相同（含唯一带容差的
+`texture(linear/clamp)`：498 个像素 / 最大通道差 1）。高档的设置是**增量能力**，不是
+默认路径的重写。
+
+### 能力怎么问（不要靠猜）
+
+| 问题 | 答案 |
+|---|---|
+| 这台设备最高能给几×？ | `BGPU_CAP_MSAA` 位 + `caps.msaa_samples`（1/4/8；1 = 不支持） |
+| 这个交换链实际开了几×？ | `bingpu_swapchain_info().msaa_samples` |
+| 这张纹理实际有几级 mip？ | `bingpu_texture_info().mip_levels` |
+| 这个后端支持真 mip 吗？ | `BGPU_CAP_MIPMAPS` 位（没有这一位的后端把 `MIPMAPS` 接受后降级为 1 级） |
+
+本机（RTX 4060 Ti / 驱动 610.x）实测：**VK 与 GL 的 `caps.msaa_samples` 都是 8**，
+两个后端都带 `MSAA` + `MIPMAPS` 位；D3D11 / CPU / NULL 仍是 1、没有这两个位。
+
+### VK：多采样附件 + pass 末 resolve；mip 逐级 blit
+
+- **MSAA**：设备档 `d.msaa`（按 `desc.msaa_samples` 与
+  `framebufferColorSampleCounts & framebufferDepthSampleCounts` 取交集降级）。所有**颜色
+  渲染目标**（画布、图层、离屏）在第一次当目标时懒建一个同尺寸/同格式的 N 采样
+  `VkImage` companion；`vkCmdBeginRendering` 的颜色附件指向它，
+  `resolveMode = AVERAGE`、`resolveImageView = 目标的单采样 image`，`vkCmdEndRendering`
+  时自动 resolve。于是：
+  - `bingpu_frame_read` / `bingpu_texture_read` / 把该纹理当采样源，拿到的**永远是
+    单采样结果**（resolve 之后的 image）；
+  - 多个颜色目标（bin2d 的 layer / blur 那些 secondary target）**同样走这条路**，不存在
+    "只有画布有 MSAA、别的目标没有"的半截状态；
+  - 深度图在 `prepareDepth` 里按**同一个采样数**建（附件采样数不一致会被验证层/驱动拒）；
+  - 管线缓存键加上了采样数（`VkPipelineMultisampleStateCreateInfo.rasterizationSamples`
+    必须等于附件采样数）。
+  - `begin_render` 不带 `CLEAR_COLOR`（LOAD）时，先把单采样 image blit 回多采样附件
+    —— 上一趟结束时内容已经在单采样镜像里，多采样附件本身不保留它。这条是 MSAA 下
+    "一帧多趟"正确性的关键，`tests/gpu_parity.h` 的 MSAA 用例里有一趟专门钉它。
+- **mip**：`BGPU_TEXTURE_MIPMAPS` → `mipLevels = floor(log2(max(w,h)))+1`（上限 16），
+  image/view 的 `levelCount` 同步；上传 level 0 之后用 `vkCmdBlitImage`
+  （`VK_FILTER_LINEAR`）逐级降采样到 1×1，每一级单独换布局（整张图的 barrier 表达不了
+  "0 级已 TRANSFER_SRC、末级仍 TRANSFER_DST"）。采样器 `mipmapMode = LINEAR`
+  （`min_filter = NEAREST` 时是 NEAREST），**`maxLod = VK_LOD_CLAMP_NONE`** ——
+  零初始化的 `VkSamplerCreateInfo.maxLod` 是 0，不显式设就永远只取 0 级。
+- 代价：4× 的颜色附件是单采样的 4 倍显存 + 一次 resolve 带宽；mip 链额外 ~1/3 显存
+  （等比级数 1/4+1/16+…）。默认档这些开销**一项都不发生**。本机 VK 实测
+  （`bingpu_bench --backend vulkan --msaa 1|4`，1024² 离屏 pass）：
+  纯色 / 纹理铺满 **0.070 → 0.150 ms**（约 2.1×，fill-bound）；⑤ 离屏 + 合成（含
+  present 拷贝）0.39 → 0.45 ms（+15%）；⑥ `texture_read` 9.3 → 9.7 ms（噪声级）。
+  也就是说 MSAA 的代价集中在"被覆盖的像素"上，读回与呈现几乎不变。
+
+### GL：multisample renderbuffer + `glBlitFramebuffer` resolve；`glGenerateMipmap`
+
+- **MSAA**：`GL_MAX_SAMPLES` 与两个入口（`glRenderbufferStorageMultisample` /
+  `glBlitFramebuffer`）都在才报 `BGPU_CAP_MSAA`。每个目标懒建
+  `GL_RGBA8` 多采样 renderbuffer + 它自己的 FBO（深度用同样采样数的
+  `GL_DEPTH_COMPONENT24` renderbuffer），`begin_render` 画进去，`end_render` 用
+  `glBlitFramebuffer(COLOR_BUFFER_BIT)` resolve 回目标 FBO（窗口模式 resolve 到默认帧缓冲）。
+  两个 FBO 都是 GL 窗口坐标（左下原点），所以 blit 的 rect 一对一、不翻 y；
+  `uFlip` / scissor 的既有规则不变。
+- **mip**：建纹理时按级 `glTexImage2D`，`GL_TEXTURE_MAX_LEVEL = levels-1`，上传后
+  `glGenerateMipmap`。这里有一个 GL 特有的坑：**纹理完整性是按采样器判的** ——
+  mipmap min filter 的采样器配 1 级纹理会不完整（采出来全黑）。所以 `createSampler`
+  为每个采样器建两个 GL 对象（plain / mipmap），`bindTexture` 按目标纹理有没有链选一个；
+  默认采样器同理（`def_samp` / `def_samp_mip`）。
+- 代价与 VK 同量级；默认档走的是原来的单采样 FBO / 单级 `glTexImage2D`，没有额外对象。
+
+### 测试用什么钉（`tests/gpu_parity.h`，只在能力可达时跑）
+
+| 用例 | 判据（本机实测） |
+|---|---|
+| `msaa(斜边覆盖率)` | 一条斜边：1× 的 `0<v<255` 中间色像素 **0** 个，4× **72** 个；`frame_read` 路径同样 **72**；两趟 LOAD 的第一趟内容保留=1；MSAA 下 `depth(LESS)` 中心仍 R=255/B=0 |
+| `mip(缩小的棋盘格)` | 256×256 / 2px 棋盘缩小到 60×60：1×（`mip_levels=1`）均值 127.46、**平均绝对偏差 74.11**（摩尔纹）；mip（`mip_levels=9`）均值 127.00、**偏差 0.00**（纯灰） |
+
+拿不到能力时两条都打印 `[skip] ...` 并返回，不 fail（D3D11 / CPU / NULL 上就是这样）。
+
+### D3D11：这一版明确不做
+
+判断与代价（不是"忘了"）：
+
+- **MSAA**：要新增每目标的多采样 texture + `ResolveSubresource`，交换链还要单独走
+  "多采样离屏 → resolve 到 back buffer"；`prepareDepth` 的 DSV 采样数、RTV/DSV 绑定、
+  staging 回读全要跟着改。约 250~350 行，且 swapchain resolve 与 present 的交互是
+  最容易出"窗口上一帧黑/一帧旧"的地方，必须开真窗口烟测 + 跨端数值门禁才能收。
+- **mip**：要建完整 `D3D11_SUBRESOURCE_DATA` / `GenerateMips`、SRV 的 `MipLevels`，
+  并把 `D3D11_SAMPLER_DESC.MaxLOD` 从 0 改到 `FLT_MAX`（现在的 0 会让 mip 永远取 0 级）。
+  约 100 行，风险比 MSAA 低。
+- 为什么先不做：这一版的目标是"VK 先行、GL 顺手、默认路径零风险"。D3D11 的
+  `caps.msaa_samples` 继续报 1、没有 `BGPU_CAP_MSAA` / `BGPU_CAP_MIPMAPS`，上层按能力
+  选择时会自动留在默认档；不存在"以为开了其实没开"的谎报。要补的时候按 VK 的同一份
+  判据（MSAA 中间色 / mip 摩尔纹）验收即可，不需要改 ABI。
 
 ## D3D12：`layering.md` 里已排到 VK/D3D11/GL 之后
 
@@ -273,9 +382,9 @@ present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` �
 2. **深度纹理格式**：现在用 `RENDER_TARGET` 纹理当深度目标（后端自己解释，VK 建 D32
    image、D3D11 建 D32 texture + DSV）。建议将来加 `BGPU_TEXTURE_DEPTH` 或
    `BGPU_FORMAT_D32F`。
-3. **MSAA**：`desc.msaa_samples` 已预留，两个真后端都报 1。要让 MSAA 进来，先解决
-   "**MSAA 会让与 CPU 逐像素一致变成边界容差**"这个问题 —— 见 [`layering.md`](layering.md) §2 的 P1。
-   目前的裁决是 (b) 容差表。
+3. **D3D11 的 MSAA**：VK 与 GL 已落地（见"质量档"一节）。D3D11 还欠"每目标多采样
+   texture + `ResolveSubresource` + 交换链 resolve"这一整套，代价与风险写在同一节；
+   这一版**明确不做**，caps 继续报 1，不存在谎报。
 4. **网格光照**：`BgpuMeshVertex` 带法线，但没有光源/材质状态可以喂给它。
    等 bin3d 定义光照模型后再加（那是 ABI 变化）。
 5. **多帧飞行**：`max_frames_in_flight` 恒 1。VK 是"每帧 submit + 等 fence"，D3D11 是
@@ -291,10 +400,10 @@ present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` �
    `Shader4ComponentMapping` 字段）。**两个 GPU 后端之间是一致的**，只是与 CPU 在
    "拿 R8 当彩色纹理采样"时不同 —— 目前没有任何调用方这么用（R8 是遮罩，走的是
    `BGPU_BLEND_KEEP/ERASE` 那条路）。要修就得在 ABI 层支持纹理视图映射，和 9 一起做。
-9. **mip 链**：四个后端都**接受** `BGPU_TEXTURE_MIPMAPS` 但降级为 1 级（`mip_levels` 如实上报
-   1）。0.13.0 之前 VK 是唯一一个直接 `UNSUPPORTED` 的 —— 同一个上层代码（binUI 的贴图）在
-   GL 上能跑、在 VK 上连纹理都建不出来，逼着调用方按后端分支。**设备层的"做不到"必须表现成
-   "降级"，不是"建不出来"**。真要 mip 就得给固定管线加 LOD 输入 —— 那是"再加一个原语"，不划算。
+9. **mip 链**：VK 与 GL 已实现真链（见"质量档"一节）；CPU（参考实现，LOD 恒 0）与
+   D3D11（这一版明确不做）仍**接受 `BGPU_TEXTURE_MIPMAPS` 但降级为 1 级**，
+   `mip_levels` 如实上报 1。设备层的"做不到"必须表现成"降级 + 能力位缺失"，
+   不是"建不出来" —— 这条仍然成立：上层问 `BGPU_CAP_MIPMAPS` 就能分流，不需要 try/except。
 10. **一个 HWND 只能绑一个 GL 设备**：WGL 的上下文绑在 DC 上，`contracts.md` §4 本来就规定
    "一个 native_window 同一时刻只能绑一个呈现后端"。binUI 的多面板要共用一个设备，不是多个。
 

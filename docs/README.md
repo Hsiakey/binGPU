@@ -5,7 +5,7 @@
 | [contracts.md](contracts.md) | **六条硬契约** + 颜色/帧/像素三个模型的关系 | 所有人（先读这篇） |
 | [abi.md](abi.md) | 句柄 / `struct_size` / 错误 / 线程与所有权 / 生命周期 / 为什么没有回调 | 绑定作者、上层作者 |
 | [raster_rules.md](raster_rules.md) | 光栅规则：顶点变换、top-left、插值、采样、混合、深度、回读 | 写后端的、写像素测试的 |
-| [backends.md](backends.md) | 后端现状表、CPU 的取舍、VK/D3D11 已落地的细节、D3D12 与 GL 的排期、欠账 | 规划的人、写新后端的人 |
+| [backends.md](backends.md) | 后端现状表、CPU 的取舍、VK/D3D11 已落地的细节、**质量档（MSAA / 真 mip）**、D3D12 与 GL 的排期、欠账 | 规划的人、写新后端的人 |
 | [perf.md](perf.md) | CPU 后端的吞吐基线、每条优化的收益、未做项与原因、校验和 | 要动内层循环的人 |
 | [layering.md](layering.md) | **这一层在第几层、往上的两条一致性承诺、进出边界判据、四家后端地形与落地顺序、ABI 2 的三处修订、binUI 迁移台账** | 规划的人、做 VK/D3D11/GL/Metal 后端的人 |
 

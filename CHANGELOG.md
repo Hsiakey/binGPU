@@ -4,6 +4,69 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [0.14.0] - 2026-11-20 【ABI 5】
+
+**MSAA 与真正的 mip 采样从"后端吃掉入口"变成"可以显式要的质量档"**。这一版之前，
+`BgpuDeviceDesc.msaa_samples` 与 `BGPU_TEXTURE_MIPMAPS` 两个入口一直存在，但四个后端
+一个都不实现：device caps 硬写 `msaa_samples = 1`，mip 一律"接受但降级为 1 级"。
+现在 VK 与 GL 把它们做成真能力，**默认档一个字节都没变**。
+
+### 为什么这件事重要
+
+上层（binUI 的三份老 GPU 后端）一直提供 GL 4× MSAA 与真 mip，而 binGPU 四端恒 1 ——
+于是"把 UI 的绘制全部交给 binGPU"这件事卡在一个地方：删掉老后端就等于把这两项画质
+一起扔掉（实测代价 `image-mip` 页 37%、`image-round` 页 0.217% / 最大通道差 120 的
+旋转边）。质量档归设备层，是这套分层里最后一块该由 binGPU 决定的东西。
+
+### 合同变了哪一处
+
+- **同档设置下**仍然与 CPU 参考后端逐像素相同（每个后端、每条路径的老用例逐位未变）；
+- MSAA / mip 是**显式选择的质量档**，不承诺与 CPU 参考逐像素相同 —— CPU 参考后端
+  永远是 1×/1 级，它是"同档裁判"，不是"高质量实现"；
+- `BgpuCaps.msaa_samples` 的语义从"实际生效值"改成**"能力上限"**（1/4/8）；实际这
+  条链开了几倍看 `BgpuSwapchainInfo.msaa_samples`。只看 caps 的老代码不会因此变大，
+  因为默认档仍是 1。
+
+ABI 从 4 升到 **5**：结构体布局与函数签名一个字节没动，只是按本项目的老规矩
+（"枚举值一变就 +1"，0.12.0 加 `BGPU_CAP_SHAPE` 时同样升过）给新增的
+`BGPU_CAP_MSAA` / `BGPU_CAP_MIPMAPS` 记一次账。
+
+### 实现（VK 先行，GL 同步）
+
+- **VK**：每张颜色渲染目标（画布 / 图层 / 毛玻璃 / 离屏）懒建 N 采样 companion，
+  动态渲染用 `resolveMode = AVERAGE`，在 `vkCmdEndRendering` 自动 resolve 回单采样
+  image；`LOAD` 的 pass 先把单采样 image blit 回多采样附件（一帧多趟的内容才不丢）；
+  深度按同一采样数建；管线缓存键带采样数。mip 用 `vkCmdBlitImage` 逐级 LINEAR
+  降采样，采样器 `mipmapMode = LINEAR`、`maxLod = VK_LOD_CLAMP_NONE`。
+- **GL**：multisample renderbuffer + 独立 FBO，`end_render` 用 `glBlitFramebuffer`
+  resolve（窗口模式 resolve 到默认帧缓冲）；mip 用 `glGenerateMipmap`，并按 GL
+  "完整性按采样器判"为每个采样器建 plain / mipmap 两个变体。
+- **D3D11 这一版明确不做**：MSAA 要每目标多采样 texture + `ResolveSubresource` +
+  交换链 resolve + DSV/RTV/staging 跟着改（约 250~350 行，窗口 present 风险最高），
+  mip 约 100 行。它如实报 `1`、不置能力位，上层按 cap 分流的代码会留在默认档 ——
+  不存在"以为开了其实没开"。理由与代价写在 `docs/backends.md`。
+- CPU 参考后端继续 1×/1 级（它的职责是裁判，不是画得好看）。
+
+### 验收数字
+
+质量用例（VK 与 GL 相同，D3D11 skip）：
+
+| 用例 | 1× / 1 级 | 高档 |
+|---|---|---|
+| 斜边中间色像素（MSAA） | **0** | **72**（`frame_read` 路径同样 72） |
+| 缩小的 2px 棋盘 256→60（mip） | 平均绝对偏差 **74.11** | **0.00** |
+
+`msaa=4` 下"两趟 LOAD 保留内容"与"depth LESS"都正确；本机 VK / GL 的
+`msaa_max` 都是 8（要 8 就给 8）。
+
+代价（VK 1024²，`bingpu_bench --backend vulkan --msaa 1|4`）：纯色/纹理铺满
+0.070 → 0.150 ms（约 2.1×），离屏+合成 0.390 → 0.447 ms（+15%），读回 9.32 → 9.69 ms
+（噪声级）—— MSAA 的代价集中在被覆盖的像素上。
+
+默认路径无回归：`make all` / `make abi-check`（247 项）/ `make test`（cpu 378、vk 27、
+d3d11 16、gl 27）全绿；改动前后 `tests/gpu_parity.h` 的 16 条用例逐位对比，三端各
+16/16 行完全一致。
+
 ## [0.13.0] - 2026-11-20
 
 **修掉 Vulkan 后端在"一帧里多目标来回切换"时的三处缺陷（外加一处能力对齐）—— 全是

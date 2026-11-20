@@ -16,6 +16,7 @@
 #ifndef BINGPU_GPU_PARITY_H
 #define BINGPU_GPU_PARITY_H
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -768,6 +769,388 @@ static int backend_has_cap(BgpuBackendKind kind, uint32_t cap) {
     return has;
 }
 
+/* ---------------------------------------------------------------
+ * 下一版：质量档（MSAA / mip）—— **只在能力可达时运行**
+ *
+ * 这两条不是 parity：高档设置是显式选择的质量档，合同是"同档与 CPU 相同"，
+ * 而不是"高档也必须和 CPU 逐像素相同"（CPU 参考后端恒为 1×/1 级）。
+ * 所以判据是**可观测的画质指标**：
+ *   · MSAA：斜边的中间色像素个数（0<v<255）必须明显多于 1×；
+ *   · mip ：缩小的棋盘格在 1× 下有摩尔纹（偏离均值的幅度大），mip 后接近纯灰。
+ * 拿不到能力（没有 CAP 位 / caps.msaa_samples < 4）就 skip 并打印原因，不 fail。
+ * --------------------------------------------------------------- */
+static uint32_t caps_msaa_max(BgpuBackendKind kind, int* has_cap) {
+    BgpuDeviceDesc dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.struct_size = (uint32_t)sizeof(dd);
+    dd.backend = kind;
+    dd.width = 8;
+    dd.height = 8;
+    dd.flags = BGPU_DEVICE_HEADLESS;
+    BgpuDevice dev = BGPU_INVALID;
+    if (bingpu_device_create(&dd, &dev) != BGPU_OK) return 1;
+    BgpuCaps caps;
+    memset(&caps, 0, sizeof(caps));
+    caps.struct_size = (uint32_t)sizeof(caps);
+    const int ok = bingpu_device_caps(dev, &caps) == BGPU_OK;
+    bingpu_device_destroy(dev);
+    if (has_cap) *has_cap = ok && (caps.flags & BGPU_CAP_MSAA) != 0;
+    return ok ? caps.msaa_samples : 1;
+}
+
+/* 建带 msaa 档的 headless 设备，录一段场景到离屏目标，再 texture_read 出来。 */
+static int render_msaa(BgpuBackendKind kind, uint32_t msaa, SceneFn fn, uint32_t w, uint32_t h,
+                       uint8_t* out) {
+    BgpuDeviceDesc dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.struct_size = (uint32_t)sizeof(dd);
+    dd.backend = kind;
+    dd.width = w;
+    dd.height = h;
+    dd.flags = BGPU_DEVICE_HEADLESS;
+    dd.msaa_samples = msaa;
+    BgpuDevice dev = BGPU_INVALID;
+    if (bingpu_device_create(&dd, &dev) != BGPU_OK) {
+        printf("  device_create(msaa=%u) 失败：%s\n", msaa, bingpu_last_error());
+        return 0;
+    }
+    BgpuTexture target =
+        make_tex(dev, w, h, BGPU_FORMAT_RGBA8, BGPU_TEXTURE_RENDER_TARGET | BGPU_TEXTURE_CPU_READ);
+    BgpuCmd cmd = BGPU_INVALID;
+    if (bingpu_cmd_create(dev, &cmd) != BGPU_OK) {
+        bingpu_device_destroy(dev);
+        return 0;
+    }
+    fn(dev, cmd, target);
+    uint32_t stride = 0;
+    const int ok = bingpu_texture_read(target, out, (size_t)w * h * 4, &stride) == BGPU_OK;
+    if (!ok) printf("  texture_read(msaa) 失败：%s\n", bingpu_last_error());
+    bingpu_device_destroy(dev);
+    return ok;
+}
+
+/* 交换链路径也要能开 MSAA：frame_read 必须拿到 resolve 之后的单采样结果。 */
+static int render_swapchain_msaa(BgpuBackendKind kind, uint32_t msaa, SceneFn fn, uint32_t w,
+                                 uint32_t h, uint8_t* out) {
+    BgpuDeviceDesc dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.struct_size = (uint32_t)sizeof(dd);
+    dd.backend = kind;
+    dd.width = w;
+    dd.height = h;
+    dd.flags = BGPU_DEVICE_HEADLESS;
+    dd.msaa_samples = msaa;
+    BgpuDevice dev = BGPU_INVALID;
+    if (bingpu_device_create(&dd, &dev) != BGPU_OK) return 0;
+    BgpuSwapchainDesc sd;
+    memset(&sd, 0, sizeof(sd));
+    sd.struct_size = (uint32_t)sizeof(sd);
+    sd.width = w;
+    sd.height = h;
+    sd.format = BGPU_FORMAT_RGBA8;
+    BgpuSwapchain sc = BGPU_INVALID;
+    if (bingpu_swapchain_create(dev, &sd, &sc) != BGPU_OK) {
+        bingpu_device_destroy(dev);
+        return 0;
+    }
+    BgpuCmd cmd = BGPU_INVALID;
+    bingpu_cmd_create(dev, &cmd);
+    BgpuTexture target = BGPU_INVALID;
+    int ok = bingpu_frame_begin(sc, cmd, &target) == BGPU_OK;
+    if (ok) {
+        fn(dev, cmd, target);
+        ok = bingpu_frame_end(sc, cmd) == BGPU_OK;
+    }
+    uint32_t stride = 0;
+    if (ok) ok = bingpu_frame_read(sc, out, (size_t)w * h * 4, &stride) == BGPU_OK;
+    if (!ok) printf("  交换链 MSAA 路径失败：%s\n", bingpu_last_error());
+    bingpu_cmd_destroy(dev, cmd);
+    bingpu_swapchain_destroy(dev, sc);
+    bingpu_device_destroy(dev);
+    return ok;
+}
+
+/* 一条斜边：REPLACE 白四边形盖在黑底上。1× 的边缘只有 0/255 两档，
+ * N× 的 resolve 会把边缘像素平均出中间色 —— 数 0<v<255 的个数即可。 */
+static void scene_diagonal(BgpuDevice dev, BgpuCmd cmd, BgpuTexture t) {
+    begin(cmd, t, 0xFF000000u, 0, 0);
+    const BgpuPipeline p = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, 0);
+    bingpu_cmd_set_pipeline(cmd, p);
+    const BgpuVertex v[4] = {{6.0f, 4.0f, 0, 0, 0, 0xFFFFFFFFu},
+                             {58.0f, 16.0f, 0, 1, 0, 0xFFFFFFFFu},
+                             {6.0f, 52.0f, 0, 0, 1, 0xFFFFFFFFu},
+                             {58.0f, 64.0f, 0, 1, 1, 0xFFFFFFFFu}};
+    bingpu_cmd_draw_quads(cmd, v, 1);
+    bingpu_cmd_end_render(cmd);
+}
+
+static size_t count_midtones(const uint8_t* px, uint32_t w, uint32_t h) {
+    size_t n = 0;
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        const uint8_t v = px[i * 4];
+        if (v > 0 && v < 255) n++;
+    }
+    return n;
+}
+
+/* 两趟 pass：第二趟 begin_render 不带 CLEAR（LOAD）。VK 的 MSAA 附件是独立的，
+ * 内容在上一趟已经 resolve 到单采样镜像 —— 第二趟必须先把它搬回多采样附件，
+ * 否则"上一趟画的东西"会凭空消失（GL 的 msaa FBO 天然保留，这条仍要钉）。 */
+static void scene_two_pass(BgpuDevice dev, BgpuCmd cmd, BgpuTexture t) {
+    const BgpuPipeline p = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, 0);
+    begin(cmd, t, 0xFF000000u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, p);
+    quad(cmd, 8, 8, 24, 24, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+
+    begin_load(cmd, t);
+    bingpu_cmd_set_pipeline(cmd, p);
+    quad(cmd, 40, 40, 56, 56, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+}
+
+static int region_is_white(const uint8_t* px, uint32_t w, uint32_t x0, uint32_t y0, uint32_t x1,
+                           uint32_t y1) {
+    for (uint32_t y = y0; y < y1; y++) {
+        for (uint32_t x = x0; x < x1; x++) {
+            if (px[((size_t)y * w + x) * 4] < 250) return 0;
+        }
+    }
+    return 1;
+}
+
+static void run_msaa_case(BgpuBackendKind kind) {
+    int has_cap = 0;
+    const uint32_t maxs = caps_msaa_max(kind, &has_cap);
+    printf("[msaa(斜边覆盖率)]\n");
+    if (!has_cap || maxs < 4) {
+        printf("  [skip] %s 没有可用的 4× MSAA（BGPU_CAP_MSAA=%d，caps.msaa_samples=%u）\n",
+               bingpu_backend_name(kind), has_cap, maxs);
+        return;
+    }
+    uint8_t* a = (uint8_t*)malloc(64 * 64 * 4);
+    uint8_t* b = (uint8_t*)malloc(64 * 64 * 4);
+    if (!a || !b) {
+        printf("  [skip] 分配失败\n");
+        free(a);
+        free(b);
+        return;
+    }
+    const int ok1 = render_msaa(kind, 0, scene_diagonal, 64, 64, a);
+    const int ok4 = render_msaa(kind, 4, scene_diagonal, 64, 64, b);
+    if (!ok1 || !ok4) {
+        g_fail++;
+        printf("  FAIL msaa: 渲染失败\n");
+        free(a);
+        free(b);
+        return;
+    }
+    const size_t mid1 = count_midtones(a, 64, 64);
+    const size_t mid4 = count_midtones(b, 64, 64);
+    printf("  msaa=1 中间色像素 %zu，msaa=4 中间色像素 %zu（差 %zu）\n", mid1, mid4,
+           mid4 > mid1 ? mid4 - mid1 : 0);
+    CHECK(mid4 > mid1 + 40, "4× 的斜边中间色必须明显多于一截（期望 > +40）");
+    CHECK(mid4 >= mid1 * 3, "4× 的中间色个数至少是 1× 的三倍");
+
+    /* 交换链路径（frame_read）：同一场景、同一档位，结果必须是 resolve 后的单采样图 */
+    uint8_t* c = (uint8_t*)malloc(64 * 64 * 4);
+    if (c && render_swapchain_msaa(kind, 4, scene_diagonal, 64, 64, c)) {
+        const size_t midf = count_midtones(c, 64, 64);
+        printf("  frame_read(msaa=4) 中间色像素 %zu\n", midf);
+        CHECK(midf > mid1 + 40, "frame_read 也必须拿到 resolve 后的抗锯齿边缘");
+    } else {
+        g_fail++;
+        printf("  FAIL msaa: 交换链路径渲染失败\n");
+    }
+    free(c);
+
+    /* LOAD 的 pass 必须保留上一趟内容（VK 需要先把单采样镜像搬回多采样附件） */
+    uint8_t* d = (uint8_t*)malloc(64 * 64 * 4);
+    if (d && render_msaa(kind, 4, scene_two_pass, 64, 64, d)) {
+        const int first = region_is_white(d, 64, 12, 12, 20, 20);
+        const int second = region_is_white(d, 64, 44, 44, 52, 52);
+        printf("  msaa=4 两趟 LOAD：第一趟内容保留=%d，第二趟内容=%d\n", first, second);
+        CHECK(first && second, "MSAA 下 begin_render(load) 必须保留上一趟的内容");
+    } else {
+        g_fail++;
+        printf("  FAIL msaa: 两趟 LOAD 渲染失败\n");
+    }
+    free(d);
+
+    /* 深度附件也必须按同一采样数建：MSAA 下 depth(LESS) 仍要让近处红色胜出 */
+    uint8_t* z = (uint8_t*)malloc(64 * 64 * 4);
+    if (z && render_msaa(kind, 4, scene_depth, 64, 64, z)) {
+        const uint8_t* c0 = z + ((size_t)32 * 64 + 32) * 4;
+        printf("  msaa=4 depth(LESS) 中心像素 R=%u B=%u\n", c0[0], c0[2]);
+        CHECK(c0[0] > 200 && c0[2] < 40, "MSAA 下深度测试必须仍然让近处（红）胜出");
+    } else {
+        g_fail++;
+        printf("  FAIL msaa: 深度路径渲染失败\n");
+    }
+    free(z);
+    free(a);
+    free(b);
+}
+
+/* 棋盘格纹理（2 像素一格）放大到整幅目标；目标 64×64、纹理 256×256 ⇒ 缩小 4×，
+ * 隐式 LOD ≈ 2。mip 链存在时 LOD 2 正好是"每级 4×4 平均"，棋盘格化成纯灰；
+ * 没有 mip 时双线性只在 2 级纹素内插值，输出一圈明显的摩尔纹。 */
+static BgpuTexture make_checker(BgpuDevice dev, uint32_t size, uint32_t block, uint32_t flags) {
+    uint8_t* px = (uint8_t*)malloc((size_t)size * size * 4);
+    if (!px) return BGPU_INVALID;
+    for (uint32_t y = 0; y < size; y++) {
+        for (uint32_t x = 0; x < size; x++) {
+            const uint8_t v = (uint8_t)((((x / block) + (y / block)) & 1) ? 255 : 0);
+            uint8_t* p = px + ((size_t)y * size + x) * 4;
+            p[0] = p[1] = p[2] = v;
+            p[3] = 255;
+        }
+    }
+    BgpuTextureDesc td;
+    memset(&td, 0, sizeof(td));
+    td.struct_size = (uint32_t)sizeof(td);
+    td.width = size;
+    td.height = size;
+    td.format = BGPU_FORMAT_RGBA8;
+    td.flags = flags;
+    BgpuTexture tex = BGPU_INVALID;
+    if (bingpu_texture_create(dev, &td, &tex) != BGPU_OK) {
+        free(px);
+        return BGPU_INVALID;
+    }
+    if (bingpu_texture_upload(tex, NULL, px, size * 4) != BGPU_OK) {
+        printf("  棋盘格上传失败：%s\n", bingpu_last_error());
+        bingpu_texture_destroy(dev, tex);
+        free(px);
+        return BGPU_INVALID;
+    }
+    free(px);
+    return tex;
+}
+
+static int render_mip_scene(BgpuBackendKind kind, uint32_t tex_flags, uint32_t* out_levels,
+                            uint8_t* out) {
+    /* 目标 60 而非 64：256/60 = 4.27 的**非整数**缩小才会让 1× 的双线性采样相位在
+     * 棋盘格上滑动（64 时 4× 整数倍刚好每次落在格心，连 1× 都是纯灰，测不出摩尔纹）。 */
+    const uint32_t w = 60, h = 60;
+    BgpuDeviceDesc dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.struct_size = (uint32_t)sizeof(dd);
+    dd.backend = kind;
+    dd.width = w;
+    dd.height = h;
+    dd.flags = BGPU_DEVICE_HEADLESS;
+    BgpuDevice dev = BGPU_INVALID;
+    if (bingpu_device_create(&dd, &dev) != BGPU_OK) return 0;
+    BgpuTexture target =
+        make_tex(dev, w, h, BGPU_FORMAT_RGBA8, BGPU_TEXTURE_RENDER_TARGET | BGPU_TEXTURE_CPU_READ);
+    BgpuTexture tex = make_checker(dev, 256, 2, tex_flags);
+    if (tex == BGPU_INVALID) {
+        bingpu_device_destroy(dev);
+        return 0;
+    }
+    BgpuTextureInfo ti;
+    memset(&ti, 0, sizeof(ti));
+    ti.struct_size = (uint32_t)sizeof(ti);
+    if (bingpu_texture_info(tex, &ti) == BGPU_OK && out_levels) *out_levels = ti.mip_levels;
+
+    BgpuCmd cmd = BGPU_INVALID;
+    bingpu_cmd_create(dev, &cmd);
+    const BgpuSampler samp = make_sampler(dev, BGPU_FILTER_LINEAR, BGPU_WRAP_CLAMP);
+    const BgpuPipeline p = make_pipe(dev, BGPU_VERTEX_2D, BGPU_BLEND_REPLACE, BGPU_PIPE_TEXTURED);
+    begin(cmd, target, 0xFF000000u, 0, 0);
+    bingpu_cmd_set_pipeline(cmd, p);
+    bingpu_cmd_set_texture(cmd, tex, samp);
+    quad(cmd, 0, 0, (float)w, (float)h, 0xFFFFFFFFu);
+    bingpu_cmd_end_render(cmd);
+    uint32_t stride = 0;
+    const int ok = bingpu_texture_read(target, out, (size_t)w * h * 4, &stride) == BGPU_OK;
+    if (!ok) printf("  棋盘格回读失败：%s\n", bingpu_last_error());
+    bingpu_sampler_destroy(dev, samp);
+    bingpu_pipeline_destroy(dev, p);
+    bingpu_texture_destroy(dev, tex);
+    bingpu_cmd_destroy(dev, cmd);
+    bingpu_device_destroy(dev);
+    return ok;
+}
+
+/* 去掉边缘 8 像素后，R 通道的平均值 / 平均绝对偏差（摩尔纹指标）。 */
+static void gray_stats(const uint8_t* px, uint32_t w, uint32_t h, double* mean, double* mad) {
+    double sum = 0.0;
+    size_t n = 0;
+    for (uint32_t y = 8; y < h - 8; y++) {
+        for (uint32_t x = 8; x < w - 8; x++) {
+            sum += px[((size_t)y * w + x) * 4];
+            n++;
+        }
+    }
+    const double m = n ? sum / (double)n : 0.0;
+    double dev = 0.0;
+    for (uint32_t y = 8; y < h - 8; y++) {
+        for (uint32_t x = 8; x < w - 8; x++) {
+            dev += fabs((double)px[((size_t)y * w + x) * 4] - m);
+        }
+    }
+    *mean = m;
+    *mad = n ? dev / (double)n : 0.0;
+}
+
+static void run_mip_case(BgpuBackendKind kind) {
+    printf("[mip(缩小的棋盘格)]\n");
+    BgpuDeviceDesc dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.struct_size = (uint32_t)sizeof(dd);
+    dd.backend = kind;
+    dd.width = 8;
+    dd.height = 8;
+    dd.flags = BGPU_DEVICE_HEADLESS;
+    BgpuDevice probe = BGPU_INVALID;
+    int has_cap = 0;
+    if (bingpu_device_create(&dd, &probe) == BGPU_OK) {
+        BgpuCaps caps;
+        memset(&caps, 0, sizeof(caps));
+        caps.struct_size = (uint32_t)sizeof(caps);
+        has_cap = bingpu_device_caps(probe, &caps) == BGPU_OK &&
+                  (caps.flags & BGPU_CAP_MIPMAPS) != 0;
+        bingpu_device_destroy(probe);
+    }
+    if (!has_cap) {
+        printf("  [skip] %s 没有 BGPU_CAP_MIPMAPS（MIPMAPS 仍被接受但降级为 1 级）\n",
+               bingpu_backend_name(kind));
+        return;
+    }
+    uint8_t* a = (uint8_t*)malloc(60 * 60 * 4);
+    uint8_t* b = (uint8_t*)malloc(60 * 60 * 4);
+    uint32_t lv0 = 0, lv1 = 0;
+    const int ok0 = render_mip_scene(kind, 0, &lv0, a);
+    const int ok1 = render_mip_scene(kind, BGPU_TEXTURE_MIPMAPS, &lv1, b);
+    if (!ok0 || !ok1) {
+        g_fail++;
+        printf("  FAIL mip: 渲染失败\n");
+        free(a);
+        free(b);
+        return;
+    }
+    double m0 = 0.0, d0 = 0.0, m1 = 0.0, d1 = 0.0;
+    gray_stats(a, 60, 60, &m0, &d0);
+    gray_stats(b, 60, 60, &m1, &d1);
+    printf("  1×（mip_levels=%u）：均值 %.2f，平均绝对偏差 %.2f\n", lv0, m0, d0);
+    printf("  mip（mip_levels=%u）：均值 %.2f，平均绝对偏差 %.2f\n", lv1, m1, d1);
+    CHECK(lv0 == 1, "不带 MIPMAPS 的纹理必须仍是 1 级（默认路径不变）");
+    CHECK(lv1 >= 8, "256×256 的完整 mip 链至少 8 级（floor(log2(256))+1 = 9）");
+    CHECK(d0 > 20.0, "1× 缩小的棋盘格必须能看到明显的摩尔纹（MAD > 20）");
+    CHECK(d1 < 8.0, "mip 后应接近纯灰（MAD < 8）");
+    CHECK(d1 * 4.0 < d0, "mip 的偏差必须比 1× 小一个数量级方向（< 1/4）");
+    CHECK(m1 > 90.0 && m1 < 170.0, "mip 后的灰度应接近棋盘格的平均（约 128）");
+    free(a);
+    free(b);
+}
+
+static void run_quality_cases(BgpuBackendKind kind) {
+    run_msaa_case(kind);
+    run_mip_case(kind);
+}
+
 static int parity_run(const char* label, BgpuBackendKind kind) {
     g_kind = kind;
     printf("%s vs CPU 像素对照（binGPU %s，ABI %u）\n", label, bingpu_version_string(),
@@ -809,6 +1192,9 @@ static int parity_run(const char* label, BgpuBackendKind kind) {
         run_case("perspective(u=0.5625 vs 0.2432)", scene_perspective, 16, 16, 0, 0.0);
     else
         printf("  [skip] perspective：这个后端自报不支持 BGPU_CAP_PERSPECTIVE\n");
+
+    /* 下一版的质量档：只在能力可达时跑，拿不到就 skip（不 fail）。 */
+    run_quality_cases(kind);
 
     printf("\n通过 %d 项，失败 %d 项\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

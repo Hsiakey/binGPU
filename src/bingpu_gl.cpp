@@ -25,7 +25,8 @@
  * 这三条是 GL 后端唯一"和另外两个后端写法不同"的地方，其余逐行同构。
  *
  * 这一版明确没做（写进 docs/backends.md 的欠账）：
- *   · MSAA / mip 链 / 透明窗口 / 多帧飞行（与 VK/D3D11 一致）；
+ *   · 透明窗口 / 多帧飞行（与 VK/D3D11 一致）；MSAA 与 mip 这一版已实现
+ *     （multisample FBO + blit resolve / glGenerateMipmap，见 docs/backends.md）；
  *   · 一个 HWND 只能绑一个 GL 设备（WGL 的上下文绑在 DC 上，`contracts.md` §4 也这么规定）。
  */
 #include "bingpu_backend.h"
@@ -179,6 +180,14 @@ enum : GLenum {
     GL_RGBA8 = 0x8058,
     GL_DEPTH_COMPONENT24 = 0x81A6,
     GL_BGRA = 0x80E1,
+    /* 0.14 质量档 */
+    GL_MAX_SAMPLES = 0x8D57,
+    GL_TEXTURE_MAX_LEVEL = 0x813D,
+    GL_LINEAR_MIPMAP_LINEAR = 0x2703,
+    GL_NEAREST_MIPMAP_NEAREST = 0x2700,
+    GL_RENDERBUFFER_BINDING = 0x8CA7,
+    GL_READ_FRAMEBUFFER_BINDING = 0x8CAA,
+    GL_DRAW_FRAMEBUFFER_BINDING = 0x8CA6,
     GL_BLEND = 0x0BE2,
     GL_SRC_ALPHA = 0x0302,
     GL_ONE_MINUS_SRC_ALPHA = 0x0303,
@@ -282,6 +291,12 @@ struct GlFns {
     void(APIENTRY* glBindRenderbuffer)(GLenum, GLuint) = nullptr;
     void(APIENTRY* glRenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei) = nullptr;
     void(APIENTRY* glDeleteRenderbuffers)(GLsizei, const GLuint*) = nullptr;
+    /* 0.14：MSAA（multisample renderbuffer + blit resolve）与 mip（generate） */
+    void(APIENTRY* glRenderbufferStorageMultisample)(GLenum, GLsizei, GLenum, GLsizei,
+                                                     GLsizei) = nullptr;
+    void(APIENTRY* glBlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint,
+                                      GLbitfield, GLenum) = nullptr;
+    void(APIENTRY* glGenerateMipmap)(GLenum) = nullptr;
 
     /* GL 1.2+ / 2.0 / 3.0 / 3.3（wglGetProcAddress） */
     void(APIENTRY* glBlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum) = nullptr;
@@ -481,6 +496,19 @@ bool loadGlFunctions() {
         if (!swapOk && trace4())
             std::fprintf(stderr, "[gl] wglSwapIntervalEXT 不可用：垂直同步开关会被忽略\n");
     }
+    /* 0.14 的两个质量档入口：它们是 GL 3.0/3.3 core 的一部分，缺了只关掉对应能力，
+     * 不让整个设备建不起来（老驱动上"没有 MSAA/mip"比"没有 GL 后端"好得多）。 */
+    if (!bindP(glProc, "glRenderbufferStorageMultisample",
+               &g_gl.glRenderbufferStorageMultisample) ||
+        !bindP(glProc, "glBlitFramebuffer", &g_gl.glBlitFramebuffer)) {
+        g_gl.glRenderbufferStorageMultisample = nullptr;
+        g_gl.glBlitFramebuffer = nullptr;
+        if (trace4()) std::fprintf(stderr, "[gl] 没有 multisample FBO 入口：MSAA 不可用\n");
+    }
+    if (!bindP(glProc, "glGenerateMipmap", &g_gl.glGenerateMipmap)) {
+        g_gl.glGenerateMipmap = nullptr;
+        if (trace4()) std::fprintf(stderr, "[gl] 没有 glGenerateMipmap：mip 不可用\n");
+    }
 #undef BGPU_GL_FN
     if (trace4()) std::fprintf(stderr, "[gl] loadGlFunctions ok=%d\n", (int)ok);
     return ok;
@@ -665,10 +693,17 @@ struct GlDeviceObj final : Device {
     GLuint prog_shape = 0;
     GLint s_vp = -1, s_target = -1, s_xf0 = -1, s_xf1 = -1, s_flip = -1;
     GLuint def_samp = 0;
+    /* 0.14：带 mip 链的纹理要用 mipmap min filter 的采样器 —— GL 的纹理完整性是按
+     * **采样器**判的，mipmap 采样器配 1 级纹理会不完整（采出来全黑），所以按纹理
+     * 有没有链选两个采样器之一（见 bindTexture）。 */
+    GLuint def_samp_mip = 0;
     BgpuTexture white_handle = BGPU_INVALID;
     GlTextureObj* white = nullptr;
     /* 解析圆角程序是否编译成功（失败就如实上报"没有这个 cap"，而不是画一片黑） */
     bool caps_shape = false;
+    /* 0.14 质量档：msaa_max = GL_MAX_SAMPLES 与本后端承诺档的交集；msaa = 实际档。 */
+    uint32_t msaa_max = 1;
+    uint32_t msaa = 1;
 
     GlDeviceObj(Backend& b, uint32_t flags, uint32_t w, uint32_t h)
         : Device(b, BGPU_INVALID, flags, w, h) {}
@@ -679,6 +714,13 @@ struct GlTextureObj final : Texture {
     GLuint tex = 0;
     GLuint fbo = 0;
     GLuint depth_rb = 0;
+    /* 0.14：MSAA companion（多采样颜色 renderbuffer + 它自己的 FBO）。
+     * 渲染写它，endRender 时 glBlitFramebuffer resolve 回 tex/fbo（或窗口后台缓冲）。 */
+    GLuint msaa_fbo = 0;
+    GLuint msaa_color_rb = 0;
+    GLuint msaa_depth_rb = 0;
+    uint32_t msaa_w = 0, msaa_h = 0;
+    uint32_t msaa_count = 0;
     /* 底层资源的真实尺寸：深度附件挂在**目标**上，所以这里记录的是目标尺寸 */
     uint32_t res_w = 0, res_h = 0;
     /* 交换链借出的**窗口后台缓冲**没有 GL 纹理对象（fbo 恒 0 = 默认帧缓冲） */
@@ -701,6 +743,7 @@ struct GlBufferObj final : Buffer {
 
 struct GlSamplerObj final : Sampler {
     GLuint samp = 0;
+    GLuint samp_mip = 0;   /* min filter 带 mipmap 的变体（只给有 mip 链的纹理用） */
     GlDeviceObj* dev = nullptr;
 
     GlSamplerObj(Backend& b, BgpuDevice owner) : Sampler(b, owner) {}
@@ -751,6 +794,9 @@ struct GlCmdObj final : Cmd {
 GlTextureObj::~GlTextureObj() {
     if (!dev) return;
     /* 上下文必须 current 才能删 GL 对象；设备析构时自己的上下文一定 current */
+    if (msaa_depth_rb) g_gl.glDeleteRenderbuffers(1, &msaa_depth_rb);
+    if (msaa_color_rb) g_gl.glDeleteRenderbuffers(1, &msaa_color_rb);
+    if (msaa_fbo) g_gl.glDeleteFramebuffers(1, &msaa_fbo);
     if (depth_rb) g_gl.glDeleteRenderbuffers(1, &depth_rb);
     if (fbo) g_gl.glDeleteFramebuffers(1, &fbo);
     if (owns_tex && tex) g_gl.glDeleteTextures(1, &tex);
@@ -762,6 +808,7 @@ GlBufferObj::~GlBufferObj() {
 
 GlSamplerObj::~GlSamplerObj() {
     if (dev && samp) g_gl.glDeleteSamplers(1, &samp);
+    if (dev && samp_mip) g_gl.glDeleteSamplers(1, &samp_mip);
 }
 
 GlCmdObj::~GlCmdObj() {
@@ -777,6 +824,7 @@ GlDeviceObj::~GlDeviceObj() {
     if (prog) g_gl.glDeleteProgram(prog);
     if (vao) g_gl.glDeleteVertexArrays(1, &vao);
     if (def_samp) g_gl.glDeleteSamplers(1, &def_samp);
+    if (def_samp_mip) g_gl.glDeleteSamplers(1, &def_samp_mip);
     g_gl.glFinish();
     g_gl.wglMakeCurrent(nullptr, nullptr);
     g_gl.wglDeleteContext(ctx);
@@ -844,6 +892,7 @@ private:
     bool compileProgram(GlDeviceObj& d);
     bool compileShapeProgram(GlDeviceObj& d);
     bool ensureFbo(GlTextureObj& t, GlDeviceObj& d);
+    bool ensureMsaa(GlTextureObj& t, GlDeviceObj& d);
     bool ensureSwapchain(Swapchain& sc, uint32_t w, uint32_t h);
     BgpuResult bindState(GlCmdObj& c, GlDeviceObj& d, GlTextureObj& target, Pipeline& pipe,
                          bool has_depth);
@@ -1160,6 +1209,13 @@ bool GlBackend::initDeviceObjects(GlDeviceObj& d) {    if (!compileProgram(d)) r
     g_gl.glSamplerParameteri(d.def_samp, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     g_gl.glSamplerParameteri(d.def_samp, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     g_gl.glSamplerParameteri(d.def_samp, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (g_gl.glGenerateMipmap) {
+        g_gl.glGenSamplers(1, &d.def_samp_mip);
+        g_gl.glSamplerParameteri(d.def_samp_mip, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        g_gl.glSamplerParameteri(d.def_samp_mip, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        g_gl.glSamplerParameteri(d.def_samp_mip, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        g_gl.glSamplerParameteri(d.def_samp_mip, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     g_gl.glActiveTexture(GL_TEXTURE0);
     g_gl.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     g_gl.glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -1196,6 +1252,36 @@ BgpuResult GlBackend::createDevice(const BgpuDeviceDesc& desc, BgpuDevice* out) 
     }
     /* vsync：默认关（由交换链的 BGPU_DEVICE_VSYNC 决定，与另两个后端一致） */
     if (g_gl.wglSwapIntervalEXT) g_gl.wglSwapIntervalEXT(0);
+
+    /* 0.14 质量档：GL_MAX_SAMPLES 是本设备的硬上限；入口函数不在就当作没有 MSAA。
+     * 只承诺 4 / 8 两档（BgpuDeviceDesc 的校验也只接受这两个值）。 */
+    {
+        GLint max_samples = 0;
+        if (g_gl.glRenderbufferStorageMultisample && g_gl.glBlitFramebuffer) {
+            g_gl.glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+        }
+        if (max_samples >= 8) {
+            d->msaa_max = 8;
+        } else if (max_samples >= 4) {
+            d->msaa_max = 4;
+        } else {
+            d->msaa_max = 1;
+        }
+        const uint32_t want = desc.msaa_samples ? desc.msaa_samples : 1;
+        if (want <= 1) {
+            d->msaa = 1;
+        } else if (d->msaa_max >= want) {
+            d->msaa = want;
+        } else if (d->msaa_max >= 4) {
+            d->msaa = 4;
+        } else {
+            d->msaa = 1;
+        }
+        if (trace4()) {
+            std::fprintf(stderr, "[gl] MSAA：要 %u，GL_MAX_SAMPLES=%d，设备最高 %u，实际 %u\n",
+                         want, (int)max_samples, d->msaa_max, d->msaa);
+        }
+    }
 
     const GLubyte* rend = g_gl.glGetString(GL_RENDERER);
     const GLubyte* ver = g_gl.glGetString(GL_VERSION);
@@ -1264,11 +1350,15 @@ void GlBackend::deviceCaps(Device& dev, BgpuCaps& out) {
     /* ABI 4：解析圆角。只有形状着色器真的编出来了才报 —— 老驱动上退化成"没有这个 cap"，
      * 上层继续用覆盖率模板。 */
     if (d.prog_shape) out.flags |= BGPU_CAP_SHAPE;
+    /* 下一版：真 mip 链（glGenerateMipmap）与 MSAA 质量档（multisample FBO + blit resolve） */
+    if (g_gl.glGenerateMipmap) out.flags |= BGPU_CAP_MIPMAPS;
+    if (d.msaa_max >= 4) out.flags |= BGPU_CAP_MSAA;
     out.max_texture_size = std::min<uint32_t>(BGPU_MAX_TEXTURE_SIZE,
                                               max_tex > 0 ? static_cast<uint32_t>(max_tex)
                                                           : BGPU_MAX_TEXTURE_SIZE);
     out.max_frames_in_flight = 1;
-    out.msaa_samples = 1;   /* 与 CPU 参考后端一致（0 差验收的前提） */
+    /* 能力上限（不是"已开"）；实际档位看交换链信息。 */
+    out.msaa_samples = d.msaa_max;
     out.max_quads_per_draw = BGPU_MAX_QUADS_PER_DRAW;
 }
 
@@ -1323,7 +1413,19 @@ BgpuResult GlBackend::createTexture(Device& dev, const BgpuTextureDesc& desc,
     t->h = desc.height;
     t->fmt = desc.format;
     t->tex_flags = desc.flags;
-    t->mip_levels = 1;   /* 与 CPU/D3D11 一致：接受 MIPMAPS 但降级为 1 级 */
+    /* 默认 1 级；BGPU_TEXTURE_MIPMAPS 时建整条链（上限 16）。默认路径的
+     * glTexImage2D 调用与 0.13.0 完全一样 —— 像素不可能变。 */
+    uint32_t levels = 1;
+    if ((desc.flags & BGPU_TEXTURE_MIPMAPS) && g_gl.glGenerateMipmap) {
+        uint32_t dim = std::max(desc.width, desc.height);
+        while (dim > 1 && levels < 16) {
+            dim >>= 1;
+            levels++;
+        }
+    } else if (desc.mip_levels > 1) {
+        levels = std::min<uint32_t>(desc.mip_levels, 16);
+    }
+    t->mip_levels = levels;
     t->dev = &d;
     t->res_w = desc.width;
     t->res_h = desc.height;
@@ -1338,9 +1440,18 @@ BgpuResult GlBackend::createTexture(Device& dev, const BgpuTextureDesc& desc,
     g_gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     /* 内部**一律 RGBA8**：BGRA8 只是"调用方看到的字节序"，上传时由 GL 换一次、
      * 回读时我们换回来。这样采样/混合只需要一种内部格式，也少一类格式分支。 */
-    g_gl.glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(toGlInternal(desc.format)),
-                      static_cast<GLsizei>(desc.width), static_cast<GLsizei>(desc.height), 0,
-                      toGlExternal(desc.format), GL_UNSIGNED_BYTE, nullptr);
+    for (uint32_t lv = 0; lv < levels; lv++) {
+        const GLsizei lw = static_cast<GLsizei>(std::max(1u, desc.width >> lv));
+        const GLsizei lh = static_cast<GLsizei>(std::max(1u, desc.height >> lv));
+        g_gl.glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(lv),
+                          static_cast<GLint>(toGlInternal(desc.format)), lw, lh, 0,
+                          toGlExternal(desc.format), GL_UNSIGNED_BYTE, nullptr);
+    }
+    if (levels > 1) {
+        /* 让"完整性"按我们真的建出来的链长判（GL 默认 MAX_LEVEL=1000） */
+        g_gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+                             static_cast<GLint>(levels - 1));
+    }
     if (glFail("glTexImage2D") != BGPU_OK) {
         destroyObject(handle);
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "glTexImage2D 失败");
@@ -1404,6 +1515,13 @@ BgpuResult GlBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
     if (glFail("glTexSubImage2D") != BGPU_OK) {
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "glTexSubImage2D 失败");
     }
+    /* 有链就在每次上传后重生成（局部上传同样要重生成，否则缩小后的高一级是旧的） */
+    if (t.mip_levels > 1 && g_gl.glGenerateMipmap) {
+        g_gl.glGenerateMipmap(GL_TEXTURE_2D);
+        if (glFail("glGenerateMipmap") != BGPU_OK) {
+            return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "glGenerateMipmap 失败");
+        }
+    }
     d.bytes_uploaded += static_cast<uint64_t>(b.w) * b.h * bpp;
     return BGPU_OK;
 }
@@ -1455,6 +1573,51 @@ bool GlBackend::ensureFbo(GlTextureObj& t, GlDeviceObj& d) {
     g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
     (void)d;
     return st == GL_FRAMEBUFFER_COMPLETE;
+}
+
+/* MSAA companion：N 采样颜色 renderbuffer + 自己的 FBO。
+ * 尺寸/采样数变了就整套重建（交换链 resize 会走到这里；深度 rb 一起丢掉，
+ * prepareDepth 会在下一次 begin_render 时补回来）。 */
+bool GlBackend::ensureMsaa(GlTextureObj& t, GlDeviceObj& d) {
+    if (d.msaa < 2 || !g_gl.glRenderbufferStorageMultisample) return false;
+    if (t.msaa_fbo && t.msaa_count == d.msaa && t.msaa_w == t.res_w && t.msaa_h == t.res_h) {
+        return true;
+    }
+    if (t.msaa_depth_rb) {
+        g_gl.glDeleteRenderbuffers(1, &t.msaa_depth_rb);
+        t.msaa_depth_rb = 0;
+    }
+    if (t.msaa_color_rb) {
+        g_gl.glDeleteRenderbuffers(1, &t.msaa_color_rb);
+        t.msaa_color_rb = 0;
+    }
+    if (t.msaa_fbo) {
+        g_gl.glDeleteFramebuffers(1, &t.msaa_fbo);
+        t.msaa_fbo = 0;
+    }
+    const uint32_t w = t.res_w ? t.res_w : t.w;
+    const uint32_t h = t.res_h ? t.res_h : t.h;
+    g_gl.glGenRenderbuffers(1, &t.msaa_color_rb);
+    g_gl.glBindRenderbuffer(GL_RENDERBUFFER, t.msaa_color_rb);
+    g_gl.glRenderbufferStorageMultisample(GL_RENDERBUFFER, static_cast<GLsizei>(d.msaa), GL_RGBA8,
+                                          static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+    g_gl.glGenFramebuffers(1, &t.msaa_fbo);
+    g_gl.glBindFramebuffer(GL_FRAMEBUFFER, t.msaa_fbo);
+    g_gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
+                                   t.msaa_color_rb);
+    const GLenum st = g_gl.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g_gl.glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        if (trace4())
+            std::fprintf(stderr, "[gl] MSAA FBO 不完整（0x%X，%ux%u，%u×）\n",
+                         static_cast<unsigned>(st), w, h, d.msaa);
+        return false;
+    }
+    t.msaa_count = d.msaa;
+    t.msaa_w = w;
+    t.msaa_h = h;
+    return true;
 }
 
 /* ---------------------------------------------------------------
@@ -1519,13 +1682,32 @@ BgpuResult GlBackend::createSampler(Device& dev, const BgpuSamplerDesc& desc,
     }
     g_gl.glSamplerParameteri(s->samp, GL_TEXTURE_MAG_FILTER,
                              desc.mag_filter == BGPU_FILTER_NEAREST ? GL_NEAREST : GL_LINEAR);
-    /* MIN 不用 mipmap 版本：我们只有 1 级 mip（固定管线没有 LOD 输入） */
+    /* plain 变体（1 级纹理用）：GL 的 min filter 决定纹理是否"完整"，
+     * 不能给 1 级纹理挂 mipmap 采样器（会采出全黑）。 */
     g_gl.glSamplerParameteri(s->samp, GL_TEXTURE_MIN_FILTER,
                              desc.min_filter == BGPU_FILTER_NEAREST ? GL_NEAREST : GL_LINEAR);
     g_gl.glSamplerParameteri(s->samp, GL_TEXTURE_WRAP_S,
                              desc.wrap_u == BGPU_WRAP_REPEAT ? GL_REPEAT : GL_CLAMP_TO_EDGE);
     g_gl.glSamplerParameteri(s->samp, GL_TEXTURE_WRAP_T,
                              desc.wrap_v == BGPU_WRAP_REPEAT ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+    /* mip 变体（有链的纹理用）：min filter 带 mipmap，三级线性/两级最近 */
+    if (g_gl.glGenerateMipmap) {
+        g_gl.glGenSamplers(1, &s->samp_mip);
+        if (!s->samp_mip) {
+            destroyObject(handle);
+            return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "glGenSamplers(mip) 失败");
+        }
+        g_gl.glSamplerParameteri(s->samp_mip, GL_TEXTURE_MAG_FILTER,
+                                 desc.mag_filter == BGPU_FILTER_NEAREST ? GL_NEAREST : GL_LINEAR);
+        g_gl.glSamplerParameteri(
+            s->samp_mip, GL_TEXTURE_MIN_FILTER,
+            desc.min_filter == BGPU_FILTER_NEAREST ? GL_NEAREST_MIPMAP_NEAREST
+                                                   : GL_LINEAR_MIPMAP_LINEAR);
+        g_gl.glSamplerParameteri(s->samp_mip, GL_TEXTURE_WRAP_S,
+                                 desc.wrap_u == BGPU_WRAP_REPEAT ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+        g_gl.glSamplerParameteri(s->samp_mip, GL_TEXTURE_WRAP_T,
+                                 desc.wrap_v == BGPU_WRAP_REPEAT ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+    }
     *out = handle;
     return BGPU_OK;
 }
@@ -1665,11 +1847,16 @@ BgpuResult GlBackend::bindTexture(GlCmdObj& c, GlDeviceObj& d, Pipeline& pipe) {
     GLuint samp = d.def_samp;
     if ((pipe.pipe_flags & BGPU_PIPE_TEXTURED) && c.tex) {
         tex = static_cast<GlTextureObj*>(c.tex);
-        if (c.samp) samp = static_cast<GlSamplerObj*>(c.samp)->samp;
+        if (c.samp) {
+            GlSamplerObj* so = static_cast<GlSamplerObj*>(c.samp);
+            samp = (tex->mip_levels > 1 && so->samp_mip) ? so->samp_mip : so->samp;
+        }
     }
     if (!tex || !tex->tex) {
         return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "绑定的纹理没有 GL 名字");
     }
+    /* 默认采样器同理：有链用 mip 变体（没链时挂上去会让纹理不完整）。 */
+    if (samp == d.def_samp && tex->mip_levels > 1 && d.def_samp_mip) samp = d.def_samp_mip;
     if (tex->tex != c.last_tex) {
         g_gl.glBindTexture(GL_TEXTURE_2D, tex->tex);
         c.last_tex = tex->tex;
@@ -1869,7 +2056,7 @@ void GlBackend::swapchainInfo(Swapchain& sc, BgpuSwapchainInfo& out) {
     out.height = sc.h;
     out.format = sc.fmt;
     out.image_count = s.is_window ? 2u : 1u;   /* 双缓冲 / 单离屏，与另两个后端一致 */
-    out.msaa_samples = 1;
+    out.msaa_samples = s.gldev ? s.gldev->msaa : 1;   /* 实际生效值 */
     out.present_paces_frames = (sc.sc_flags & BGPU_DEVICE_VSYNC) ? 1u : 0u;
 }
 
@@ -1965,6 +2152,38 @@ BgpuResult GlBackend::prepareDepth(Texture& depth, Texture& target,
     GlTextureObj& tgt = static_cast<GlTextureObj&>(target);
     GlDeviceObj& d = gdevOf(depth.device);
     (void)dt;   /* 深度附件挂在**目标**的 FBO 上（CPU 也是按目标尺寸开数组） */
+    /* 0.14：设备开了 MSAA 时，深度也必须挂在**多采样** FBO 上（采样数不一致
+     * 的附件组合会被 GL 判为不完整）。窗口后台缓冲的深度不再使用。 */
+    if (d.msaa >= 2) {
+        if (!ensureMsaa(tgt, d)) {
+            return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "MSAA FBO 创建失败");
+        }
+        if (tgt.msaa_depth_rb && tgt.msaa_count == d.msaa && tgt.msaa_w == tgt.res_w &&
+            tgt.msaa_h == tgt.res_h) {
+            return BGPU_OK;
+        }
+        if (tgt.msaa_depth_rb) {
+            g_gl.glDeleteRenderbuffers(1, &tgt.msaa_depth_rb);
+            tgt.msaa_depth_rb = 0;
+        }
+        g_gl.glGenRenderbuffers(1, &tgt.msaa_depth_rb);
+        g_gl.glBindRenderbuffer(GL_RENDERBUFFER, tgt.msaa_depth_rb);
+        g_gl.glRenderbufferStorageMultisample(GL_RENDERBUFFER, static_cast<GLsizei>(d.msaa),
+                                              GL_DEPTH_COMPONENT24,
+                                              static_cast<GLsizei>(tgt.res_w),
+                                              static_cast<GLsizei>(tgt.res_h));
+        g_gl.glBindFramebuffer(GL_FRAMEBUFFER, tgt.msaa_fbo);
+        g_gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER,
+                                       tgt.msaa_depth_rb);
+        const GLenum st = g_gl.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        g_gl.glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        if (st != GL_FRAMEBUFFER_COMPLETE) {
+            return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__,
+                        cat("MSAA 深度附件的 FBO 不完整（0x", static_cast<int>(st), "）"));
+        }
+        return BGPU_OK;
+    }
     /* 窗口目标用像素格式自带的 24 位深度缓冲，不用 FBO */
     if (tgt.window_target) return BGPU_OK;
     if (!ensureFbo(tgt, d)) {
@@ -2006,7 +2225,15 @@ BgpuResult GlBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
         cmd.inRender = false;
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "目标的 FBO 创建失败");
     }
-    g_gl.glBindFramebuffer(GL_FRAMEBUFFER, t.window_target ? 0 : t.fbo);
+    /* 0.14：开了 MSAA 就画进多采样 FBO，end_render 时 blit resolve 回目标。
+     * 默认档（d.msaa == 1）下面的绑定与 0.13.0 完全相同。 */
+    const bool use_msaa = d.msaa >= 2;
+    if (use_msaa && !ensureMsaa(t, d)) {
+        cmd.inRender = false;
+        return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "MSAA FBO 创建失败");
+    }
+    g_gl.glBindFramebuffer(GL_FRAMEBUFFER,
+                           use_msaa ? t.msaa_fbo : (t.window_target ? 0 : t.fbo));
     g_gl.glViewport(0, 0, static_cast<GLsizei>(t.res_w), static_cast<GLsizei>(t.res_h));
     /* GL_SCISSOR_TEST 是全局开关，裁剪框的默认值是**建上下文时那个窗口**的大小
      * （离屏设备上是隐藏窗口的 8×8）。不清成整目标的话，clear 只清左上角一小块，
@@ -2049,9 +2276,23 @@ BgpuResult GlBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
 
 BgpuResult GlBackend::endRender(Cmd& cmd) {
     GlCmdObj& c = static_cast<GlCmdObj&>(cmd);
+    GlTextureObj* t = c.target ? static_cast<GlTextureObj*>(c.target) : nullptr;
+    GlDeviceObj& d = *c.gldev;
     BgpuResult r = BackendBase::endRender(cmd);
     if (r != BGPU_OK) return r;
-    (void)c;
+    /* MSAA：把多采样 FBO resolve 回单采样目标（窗口 = 默认帧缓冲，离屏 = t->fbo）。
+     * 两个 FBO 的坐标系都是 GL 窗口坐标（左下原点），所以 rect 一对一，不翻 y。 */
+    if (t && d.msaa >= 2 && t->msaa_fbo) {
+        g_gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, t->msaa_fbo);
+        g_gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, t->window_target ? 0 : t->fbo);
+        g_gl.glBlitFramebuffer(0, 0, static_cast<GLint>(t->res_w), static_cast<GLint>(t->res_h), 0,
+                               0, static_cast<GLint>(t->res_w), static_cast<GLint>(t->res_h),
+                               GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (glFail("msaa resolve") != BGPU_OK) {
+            return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "MSAA resolve 失败");
+        }
+    }
     return BGPU_OK;
 }
 

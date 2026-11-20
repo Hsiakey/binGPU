@@ -20,6 +20,9 @@
  *
  * 用法：bingpu_bench             跑全部并打印表格
  *       bingpu_bench --checksum  只跑校验和（把"是否逐位不变"写成 CI 可比的数字）
+ *       bingpu_bench --backend vulkan [--msaa 4]
+ *                                换执行体跑同一套场景（默认仍是 CPU / 1×）。
+ *                                MSAA 的代价就是同一条命令在 1× 与 4× 下的帧时差。
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -58,6 +61,10 @@ static double now_ms(void) {
 #define ITERATIONS 5
 
 static int g_failures = 0;
+/* 默认仍是 CPU / 1× —— 不带参数跑出来的表格与 0.13.0 一字不差。
+ * --backend / --msaa 只是让同一套场景能换执行体量 MSAA 的代价。 */
+static BgpuBackendKind g_backend = BGPU_BACKEND_CPU;
+static uint32_t g_msaa = 0;
 
 #define CHECK(cond)                                                          \
     do {                                                                     \
@@ -190,10 +197,11 @@ static void env_init(Env* e) {
     BgpuDeviceDesc dd;
     memset(&dd, 0, sizeof(dd));
     dd.struct_size = (uint32_t)sizeof(dd);
-    dd.backend = BGPU_BACKEND_CPU;
+    dd.backend = g_backend;
     dd.width = TARGET_W;
     dd.height = TARGET_H;
     dd.flags = BGPU_DEVICE_HEADLESS;
+    dd.msaa_samples = g_msaa;
     if (bingpu_device_create(&dd, &e->dev) != BGPU_OK) die("device_create");
     if (bingpu_cmd_create(e->dev, &e->cmd) != BGPU_OK) die("cmd_create");
 
@@ -483,13 +491,39 @@ static void print_checksums(Env* e) {
 }
 
 int main(int argc, char** argv) {
-    const int only_checksum = (argc > 1 && strcmp(argv[1], "--checksum") == 0);
+    int only_checksum = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--checksum") == 0) {
+            only_checksum = 1;
+        } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            const char* want = argv[++i];
+            g_backend = BGPU_BACKEND_AUTO;
+            for (uint32_t b = 0; b < bingpu_backend_count(); b++) {
+                const BgpuBackendKind k = bingpu_backend_at(b);
+                if (strcmp(bingpu_backend_name(k), want) == 0) {
+                    g_backend = k;
+                    break;
+                }
+            }
+            if (g_backend == BGPU_BACKEND_AUTO) {
+                printf("未知后端 '%s'（可用：vulkan / gl / d3d11 / cpu / null）\n", want);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--msaa") == 0 && i + 1 < argc) {
+            g_msaa = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else {
+            printf("用法：bingpu_bench [--checksum] [--backend vulkan|gl|d3d11|cpu|null]"
+                   " [--msaa 1|4|8]\n");
+            return 2;
+        }
+    }
 
     Env e;
     env_init(&e);
 
-    printf("binGPU CPU 基准（版本 %s，ABI %u，目标 %ux%u）\n", bingpu_version_string(),
-           bingpu_abi_version(), TARGET_W, TARGET_H);
+    printf("binGPU 基准（版本 %s，ABI %u，后端 %s，msaa=%u，目标 %ux%u）\n",
+           bingpu_version_string(), bingpu_abi_version(), bingpu_backend_name(g_backend),
+           g_msaa ? g_msaa : 1, TARGET_W, TARGET_H);
 
     if (only_checksum) {
         print_checksums(&e);

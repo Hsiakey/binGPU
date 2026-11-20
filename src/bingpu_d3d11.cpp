@@ -10,7 +10,8 @@
  * 规格是 docs/raster_rules.md，验收是 tests/test_d3d11_render.c（与 VK 共用一份
  * 用例表 tests/gpu_parity.h）。所以：
  *   · 顶点变换、top-left 填充规则、预乘混合因子、UV 采样约定全部照抄规格；
- *   · MSAA 这一版**关掉**（与 CPU 一致，caps.msaa_samples == 1）；
+ *   · MSAA / mip 这一版**不做**（caps 报 1、没有 CAP 位；上层按能力留在默认档，
+ *     原因与代价见 docs/backends.md 的"质量档"一节）；
  *   · 纹理/目标内部存**预乘** RGBA8：上传时预乘、回读时反预乘（raster_rules §9）。
  *
  * 构建不依赖 Windows SDK 的 fxc：
@@ -838,7 +839,7 @@ void D3d11Backend::deviceCaps(Device& dev, BgpuCaps& out) {
     if (d.caps_shape) out.flags |= BGPU_CAP_SHAPE;
     out.max_texture_size = BGPU_MAX_TEXTURE_SIZE;
     out.max_frames_in_flight = 1;   /* 立即上下文：Present 之后不等 GPU */
-    out.msaa_samples = 1;           /* 与 CPU 参考后端一致（0 差验收的前提） */
+    out.msaa_samples = 1;           /* D3D11 这一版不做 MSAA（没有 BGPU_CAP_MSAA） */
     out.max_quads_per_draw = BGPU_MAX_QUADS_PER_DRAW;
 }
 
@@ -899,8 +900,8 @@ BgpuResult D3d11Backend::createTexture(Device& dev, const BgpuTextureDesc& desc,
     t->h = desc.height;
     t->fmt = desc.format;
     t->tex_flags = desc.flags;
-    /* mip：固定管线没有 LOD 输入，采样永远取第 0 级 → 接受 MIPMAPS 但降级为 1 级
-     * （与 CPU 一致；info 上报真实值）。 */
+    /* mip：D3D11 这一版不做真链（接受 MIPMAPS 但降级为 1 级，info 如实上报；
+     * 见 docs/backends.md 的质量档一节）。VK/GL 已经给出 BGPU_CAP_MIPMAPS。 */
     t->mip_levels = 1;
     t->dev = &d;
     t->dxgi = toDxgiFormat(desc.format);

@@ -9,7 +9,7 @@
  * 与 CPU 参考后端的关系：CPU 后端是**像素权威**（docs/backends.md），本后端必须和它
  * 逐像素一致 —— 规格是 docs/raster_rules.md，验收是 tests/test_vk_render.c。所以：
  *   · 顶点变换、top-left 填充规则、预乘混合因子、UV 采样约定全部照抄规格；
- *   · MSAA 这一版**关掉**（与 CPU 一致，caps.msaa_samples == 1）；
+ *   · 默认 MSAA 关掉（与 CPU 一致，caps.msaa_samples 报设备上限、实际档由 desc 决定）；
  *   · 纹理/目标内部存**预乘** RGBA8：上传时预乘、回读时反预乘（raster_rules §9）。
  *
  * 构建不依赖 Vulkan SDK：
@@ -20,7 +20,8 @@
  *
  * 这一版明确没做（写进 docs/backends.md 的欠账，不是漏了）：
  *   · 多帧飞行（现在每帧 submit + 等 fence，先要正确、再要重叠）；
- *   · MSAA / mip 链 / 透明窗口（composite alpha）；
+ *   · 透明窗口（composite alpha）；MSAA 与 mip 已实现（见 docs/backends.md
+ *     的质量档一节：多采样 companion + resolve、逐级 blit 生成 mip）；
  *   · 自定义着色器（那要 ABI 2，见 docs/layering.md §4）。
  */
 #include "bingpu_backend.h"
@@ -208,6 +209,7 @@ struct VkFns {
     BGPU_VK_FN(vkCmdDrawIndexed);
     BGPU_VK_FN(vkCmdCopyBufferToImage);
     BGPU_VK_FN(vkCmdCopyImageToBuffer);
+    BGPU_VK_FN(vkCmdBlitImage);
     BGPU_VK_FN(vkCmdPipelineBarrier);
     BGPU_VK_FN(vkQueueSubmit);
     BGPU_VK_FN(vkCreateFence);
@@ -341,6 +343,7 @@ bool loadVulkan() {
     BGPU_LOAD(vkCmdDrawIndexed);
     BGPU_LOAD(vkCmdCopyBufferToImage);
     BGPU_LOAD(vkCmdCopyImageToBuffer);
+    BGPU_LOAD(vkCmdBlitImage);
     BGPU_LOAD(vkCmdPipelineBarrier);
     BGPU_LOAD(vkQueueSubmit);
     BGPU_LOAD(vkCreateFence);
@@ -359,6 +362,29 @@ bool loadVulkan() {
  * --------------------------------------------------------------- */
 inline VkFormat toVkFormat(BgpuFormat f) {
     return f == BGPU_FORMAT_BGRA8 ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+/* 0.14 的 MSAA 档：desc 里只承诺 1/4/8（0 视为 1），这里转成 Vulkan 枚举。 */
+inline VkSampleCountFlagBits toVkSamples(uint32_t n) {
+    if (n >= 8) return VK_SAMPLE_COUNT_8_BIT;
+    if (n >= 4) return VK_SAMPLE_COUNT_4_BIT;
+    return VK_SAMPLE_COUNT_1_BIT;
+}
+
+/* 描述符里的 mip 级数：MIPMAPS 时补全成整条链（上限 16）；否则显式值（0/1 = 1 级）。
+ * **默认路径必须返回 1** —— 返回别的值就等于改了 0 差合同的默认像素。 */
+uint32_t mipLevelsFor(const BgpuTextureDesc& desc) {
+    if (desc.flags & BGPU_TEXTURE_MIPMAPS) {
+        uint32_t full = 1;
+        uint32_t dim = std::max(desc.width, desc.height);
+        while (dim > 1 && full < 16) {
+            dim >>= 1;
+            full++;
+        }
+        return full;
+    }
+    if (desc.mip_levels > 1) return std::min<uint32_t>(desc.mip_levels, 16);
+    return 1;
 }
 
 BgpuResult vkFail(VkResult r, const char* what) {
@@ -501,6 +527,10 @@ struct VkDeviceObj final : Device {
     BgpuTexture white_handle = BGPU_INVALID;
     bool windowed = false;
     bool lost = false;
+    /* 0.14 质量档：msaa_max = 设备能给的上限（caps 上报），msaa = 本次实际选的档。
+     * 默认 1/1 —— 不显式要时与 CPU 参考后端的像素合同一个字不变。 */
+    uint32_t msaa_max = 1;
+    uint32_t msaa = 1;
 
     VkDeviceObj(Backend& b, uint32_t flags, uint32_t w, uint32_t h)
         : Device(b, BGPU_INVALID, flags, w, h) {}
@@ -514,6 +544,18 @@ struct VkTextureObj final : Texture {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkFormat vfmt = VK_FORMAT_R8G8B8A8_UNORM;
     bool is_depth = false;
+    /* 深度图 / 颜色目标的采样数（1 = 普通）。深度附件必须与颜色附件一致。 */
+    uint32_t samples = 1;
+    /* MSAA 颜色附件（companion）：只在设备 msaa > 1 且这张纹理当颜色目标时懒建。
+     * 渲染写它，pass 结束时 resolve 回上面的单采样 image —— 于是采样/回读/uniform
+     * 拿到的永远是单采样结果（docs/backends.md 的质量档一节）。 */
+    VkImage msaa_image = VK_NULL_HANDLE;
+    VkDeviceMemory msaa_mem = VK_NULL_HANDLE;
+    VkImageView msaa_view = VK_NULL_HANDLE;
+    VkImageLayout msaa_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t msaa_samples = 0;    /* companion 的采样数；0 = 还没建 */
+    uint32_t msaa_w = 0, msaa_h = 0;
+    VkFormat msaa_fmt = VK_FORMAT_UNDEFINED;
     /* 交换链借出的目标是**别人的** image/view：析构时绝不能销毁（第一版就是
      * 把交换链的 image 当自己的销毁，窗口烟测直接崩）。 */
     bool own_image = true;
@@ -522,6 +564,10 @@ struct VkTextureObj final : Texture {
     VkTextureObj(Backend& b, BgpuDevice owner) : Texture(b, owner) {}
     ~VkTextureObj() override {
         if (!dev) return;
+        /* companion 是**我们自己**的，无论底层 image 是否借用都要销毁 */
+        if (msaa_view) g_vk.vkDestroyImageView(dev, msaa_view, nullptr);
+        if (msaa_image) g_vk.vkDestroyImage(dev, msaa_image, nullptr);
+        if (msaa_mem) g_vk.vkFreeMemory(dev, msaa_mem, nullptr);
         if (own_image) {
             if (view) g_vk.vkDestroyImageView(dev, view, nullptr);
             if (image) g_vk.vkDestroyImage(dev, image, nullptr);
@@ -606,6 +652,8 @@ struct VkCmdObj final : Cmd {
     VkDevice dev = VK_NULL_HANDLE;
     VkFormat color_fmt = VK_FORMAT_UNDEFINED;
     VkFormat depth_fmt = VK_FORMAT_UNDEFINED;
+    /* 当前 pass 的采样数（1 或设备的 msaa 档）：管线缓存键必须带上它。 */
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 
     /* 顶点流：每帧重置、按需增长；draw_quads 追加后一次 draw_indexed 画出 */
     VkBuffer vbuf = VK_NULL_HANDLE;
@@ -745,12 +793,18 @@ protected:
 private:
     BgpuResult transition(VkCmdObj& c, VkTextureObj& t, VkImageLayout want);
     BgpuResult transitionImpl(VkCmdObj& c, VkTextureObj& t, VkImageLayout want, bool force);
+    /* 只对一段 mip 范围插 barrier（mip 生成时逐级换布局用）。 */
+    void barrierRange(VkCmdObj& c, VkTextureObj& t, VkImageLayout from, VkImageLayout to,
+                      uint32_t base_level, uint32_t level_count);
+    /* 懒建 / 复用 MSAA 颜色 companion（失败返回 false）。 */
+    bool ensureMsaa(VkTextureObj& t, VkDeviceObj& d);
+    void transitionMsaa(VkCmdObj& c, VkTextureObj& t, VkImageLayout want);
     bool createDescPool(VkDeviceObj& d);
     VkDescriptorSet allocDescSet(VkCmdObj& c, VkDeviceObj& d);
     void resetDescSets(VkCmdObj& c, VkDeviceObj& d);
     bool beginRecording(VkCmdObj& c, VkDeviceObj& dev);
     VkPipeline pipelineFor(VkPipelineObj& p, VkDeviceObj& dev, VkFormat color_fmt,
-                           VkFormat depth_fmt);
+                           VkFormat depth_fmt, VkSampleCountFlagBits samples);
     bool ensureVertexSpace(VkCmdObj& c, VkDeviceObj& dev, uint64_t need);
     bool ensureIndexSpace(VkCmdObj& c, VkDeviceObj& dev, uint64_t quads);
     bool allocHostBuffer(VkDeviceObj& dev, uint64_t bytes, VkBuffer* buf, VkDeviceMemory* mem,
@@ -913,6 +967,37 @@ BgpuResult VkBackend::createDevice(const BgpuDeviceDesc& desc, BgpuDevice* out) 
     d->windowed = desc.native_window != nullptr;
     g_vk.vkGetDeviceQueue(vkdev, qfam, 0, &d->queue);
 
+    /* 0.14 质量档：设备能给到的 MSAA 上限。颜色与深度两种附件都要支持同一个采样数
+     * （深度图在 prepareDepth 里按同一个档建），所以取交集。对外只承诺 4 / 8 ——
+     * BgpuDeviceDesc 的校验只接受这两个值。默认（desc.msaa_samples 为 0/1）仍是 1。 */
+    {
+        VkPhysicalDeviceProperties props{};
+        g_vk.vkGetPhysicalDeviceProperties(chosen, &props);
+        const VkSampleCountFlags common = props.limits.framebufferColorSampleCounts &
+                                          props.limits.framebufferDepthSampleCounts;
+        if (common & VK_SAMPLE_COUNT_8_BIT) {
+            d->msaa_max = 8;
+        } else if (common & VK_SAMPLE_COUNT_4_BIT) {
+            d->msaa_max = 4;
+        } else {
+            d->msaa_max = 1;
+        }
+        const uint32_t want = desc.msaa_samples ? desc.msaa_samples : 1;
+        if (want <= 1) {
+            d->msaa = 1;
+        } else if (d->msaa_max >= want) {
+            d->msaa = want;
+        } else if (d->msaa_max >= 4) {
+            d->msaa = 4;   /* 要 8 但设备只到 4：降级到能给的最高档 */
+        } else {
+            d->msaa = 1;
+        }
+        if (std::getenv("BINGPU_VK_TRACE")) {
+            std::fprintf(stderr, "[vk] MSAA：要 %u，设备最高 %u，实际 %u\n", want, d->msaa_max,
+                         d->msaa);
+        }
+    }
+
     VkCommandPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1021,7 +1106,11 @@ BgpuResult VkBackend::createDevice(const BgpuDeviceDesc& desc, BgpuDevice* out) 
         sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
         sci.magFilter = VK_FILTER_LINEAR;
         sci.minFilter = VK_FILTER_LINEAR;
-        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        /* 默认采样器也打开 mipmap LINEAR：没有 mip 链的纹理 LOD 只会取到 0 级，
+         * 像素与以前完全一样；带链的纹理由这里按 LOD 取级（否则 maxLod=0 恒取 0 级）。 */
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.minLod = 0.0f;
+        sci.maxLod = VK_LOD_CLAMP_NONE;
         sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -1088,9 +1177,14 @@ void VkBackend::deviceCaps(Device& dev, BgpuCaps& out) {
                 BGPU_CAP_LIGHTING | BGPU_CAP_PERSPECTIVE;
     /* ABI 4：解析圆角 —— 片元着色器里算 SDF 覆盖率。模块建不出来就没有这一位。 */
     if (d.caps_shape) out.flags |= BGPU_CAP_SHAPE;
+    /* 下一版（ABI 仍 4，只加枚举值）：真 mip 链与 MSAA 质量档。
+     * mip 链走 vkCmdBlitImage 逐级降采样，固定管线不需要 LOD 输入（隐式 LOD）。 */
+    out.flags |= BGPU_CAP_MIPMAPS;
+    if (d.msaa_max >= 4) out.flags |= BGPU_CAP_MSAA;
     out.max_texture_size = BGPU_MAX_TEXTURE_SIZE;
     out.max_frames_in_flight = 1;   /* 每帧 submit + 等 fence */
-    out.msaa_samples = 1;           /* 与 CPU 参考后端一致（0 差验收的前提） */
+    /* 能力上限，不是"已开"：实际档位看交换链信息。默认设备仍报 1（没开）。 */
+    out.msaa_samples = d.msaa_max;
     out.max_quads_per_draw = BGPU_MAX_QUADS_PER_DRAW;
 }
 
@@ -1125,10 +1219,10 @@ BgpuResult VkBackend::createTexture(Device& dev, const BgpuTextureDesc& desc,
         return fail(BGPU_ERR_INVALID_ARGUMENT, __FILE__, __LINE__,
                     cat("纹理超过上限 ", BGPU_MAX_TEXTURE_SIZE));
     }
-    /* mip：与 CPU/GL/D3D11 一致 —— 接受 BGPU_TEXTURE_MIPMAPS 但**降级为 1 级**
-     * （固定管线没有 LOD 输入，采样永远取第 0 级；info 里报真实值）。
-     * 这一版以前直接 UNSUPPORTED，于是同一个 binUI 在 VK 上连贴图都建不出来，
-     * 而 GL 上一切正常 —— 设备层的"能力差异"不该变成"上层要分支"。 */
+    /* mip：默认 1 级（与 CPU/D3D11 的默认路径逐位一致）。带 BGPU_TEXTURE_MIPMAPS 时
+     * 建**真链**（floor(log2(max(w,h)))+1，上限 16），上传后逐级 blit 生成；
+     * 采样器的 mipmap mode 也在这条路上打开（见 createSampler）。 */
+    const uint32_t levels = mipLevelsFor(desc);
     const uint64_t handle = makeObject<VkTextureObj>(*this, d.self);
     if (handle == BGPU_INVALID) return failOom(__FILE__, __LINE__);
     VkTextureObj* t = static_cast<VkTextureObj*>(lookupObject(handle, kObjTexture));
@@ -1136,7 +1230,7 @@ BgpuResult VkBackend::createTexture(Device& dev, const BgpuTextureDesc& desc,
     t->h = desc.height;
     t->fmt = desc.format;
     t->tex_flags = desc.flags;
-    t->mip_levels = 1;
+    t->mip_levels = levels;
     t->dev = d.dev;
     t->vfmt = toVkFormat(desc.format);
 
@@ -1145,7 +1239,7 @@ BgpuResult VkBackend::createTexture(Device& dev, const BgpuTextureDesc& desc,
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = t->vfmt;
     ici.extent = {desc.width, desc.height, 1};
-    ici.mipLevels = 1;
+    ici.mipLevels = levels;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -1181,7 +1275,7 @@ BgpuResult VkBackend::createTexture(Device& dev, const BgpuTextureDesc& desc,
     vci.image = t->image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vci.format = t->vfmt;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
     vr = g_vk.vkCreateImageView(d.dev, &vci, nullptr, &t->view);
     if (vr != VK_SUCCESS) {
         destroyObject(handle);
@@ -1221,7 +1315,8 @@ BgpuResult VkBackend::transitionImpl(VkCmdObj& c, VkTextureObj& t, VkImageLayout
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = t.image;
-    b.subresourceRange = {aspect, 0, 1, 0, 1};
+    /* 整张图一起转（mip 链的所有级；非 mip 纹理就是 1 级，与以前逐位相同） */
+    b.subresourceRange = {aspect, 0, t.mip_levels, 0, 1};
 
     VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
@@ -1268,6 +1363,41 @@ BgpuResult VkBackend::transitionImpl(VkCmdObj& c, VkTextureObj& t, VkImageLayout
     g_vk.vkCmdPipelineBarrier(c.cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
     t.layout = want;
     return BGPU_OK;
+}
+
+/* 单段 barrier（mip 生成时每一级的布局是**分开**的，不能整张图一把转）。
+ * 只覆盖 mip 生成用到的三种迁移；其它组合走 transitionImpl。 */
+void VkBackend::barrierRange(VkCmdObj& c, VkTextureObj& t, VkImageLayout from,
+                             VkImageLayout to, uint32_t base_level, uint32_t level_count) {
+    VkImageMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = t.image;
+    b.subresourceRange = {t.is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                          base_level, level_count, 0, 1};
+    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if (from == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    } else if (from == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    } else {
+        b.srcAccessMask = 0;
+    }
+    if (to == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    } else if (to == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    } else if (to == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    } else {
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    }
+    g_vk.vkCmdPipelineBarrier(c.cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
 bool VkBackend::createDescPool(VkDeviceObj& d) {
@@ -1393,7 +1523,39 @@ BgpuResult VkBackend::textureUpload(Texture& tex, const BgpuBox* box, const void
         region.imageExtent = {b.w, b.h, 1};
         g_vk.vkCmdCopyBufferToImage(cb, staging, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                     1, &region);
-        transition(tmp_cmd, t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (t.mip_levels > 1) {
+            /* 逐级 blit 降采样（LINEAR）：level i-1 → level i，直到 1×1。
+             * 每级的布局单独转 —— 整张图的 barrier 无法表达"0 级已 SRC、末级仍 DST"。
+             * 这是 BGPU_TEXTURE_MIPMAPS 唯一改变像素的地方，默认 1 级路径不进来。 */
+            const uint32_t levels = t.mip_levels;
+            for (uint32_t i = 1; i < levels; i++) {
+                barrierRange(tmp_cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, i - 1, 1);
+                const uint32_t sw = std::max(1u, t.w >> (i - 1));
+                const uint32_t sh = std::max(1u, t.h >> (i - 1));
+                const uint32_t dw = std::max(1u, t.w >> i);
+                const uint32_t dh = std::max(1u, t.h >> i);
+                VkImageBlit blit{};
+                blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+                blit.srcOffsets[0] = {0, 0, 0};
+                blit.srcOffsets[1] = {static_cast<int32_t>(sw), static_cast<int32_t>(sh), 1};
+                blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+                blit.dstOffsets[0] = {0, 0, 0};
+                blit.dstOffsets[1] = {static_cast<int32_t>(dw), static_cast<int32_t>(dh), 1};
+                g_vk.vkCmdBlitImage(cb, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.image,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                                    VK_FILTER_LINEAR);
+            }
+            for (uint32_t i = 0; i < levels; i++) {
+                const VkImageLayout from = (i + 1 == levels)
+                                               ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                               : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrierRange(tmp_cmd, t, from, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, i, 1);
+            }
+            t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        } else {
+            transition(tmp_cmd, t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
         g_vk.vkEndCommandBuffer(cb);
         g_vk.vkResetFences(d.dev, 1, &d.fence);
         VkSubmitInfo si{};
@@ -1557,7 +1719,13 @@ BgpuResult VkBackend::createSampler(Device& dev, const BgpuSamplerDesc& desc,
     sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     sci.magFilter = desc.mag_filter == BGPU_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     sci.minFilter = desc.min_filter == BGPU_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    /* mip 滤法跟着 min 走（LINEAR → 三级线性，NEAREST → 最近级）。maxLod 必须显式
+     * 设成 CLAMP_NONE：VkSamplerCreateInfo 零初始化时 maxLod = 0，采样永远只取 0 级，
+     * 那样"有 mip 链"也等于没有。 */
+    sci.mipmapMode = desc.min_filter == BGPU_FILTER_NEAREST ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                                                            : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.minLod = 0.0f;
+    sci.maxLod = VK_LOD_CLAMP_NONE;
     sci.addressModeU = desc.wrap_u == BGPU_WRAP_REPEAT ? VK_SAMPLER_ADDRESS_MODE_REPEAT
                                                        : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.addressModeV = desc.wrap_v == BGPU_WRAP_REPEAT ? VK_SAMPLER_ADDRESS_MODE_REPEAT
@@ -1591,9 +1759,10 @@ BgpuResult VkBackend::createPipeline(Device& dev, const BgpuPipelineDesc& desc,
  * 管线：按 (布局, 混合, flags, 颜色格式, 深度格式) 建一次并缓存
  * --------------------------------------------------------------- */
 VkPipeline VkBackend::pipelineFor(VkPipelineObj& p, VkDeviceObj& dev, VkFormat color_fmt,
-                                  VkFormat depth_fmt) {
+                                  VkFormat depth_fmt, VkSampleCountFlagBits samples) {
     const uint64_t key = (static_cast<uint64_t>(color_fmt) << 40) |
                          (static_cast<uint64_t>(depth_fmt) << 24) |
+                         (static_cast<uint64_t>(samples) << 20) |
                          (static_cast<uint64_t>(p.layout) << 16) |
                          (static_cast<uint64_t>(p.blend) << 8) | p.pipe_flags;
     auto it = p.cache.find(key);
@@ -1679,7 +1848,7 @@ VkPipeline VkBackend::pipelineFor(VkPipelineObj& p, VkDeviceObj& dev, VkFormat c
 
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = samples;   /* 必须与 pass 的附件采样数一致 */
 
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -2115,8 +2284,104 @@ void VkBackend::swapchainInfo(Swapchain& sc, BgpuSwapchainInfo& out) {
     out.height = sc.h;
     out.format = sc.fmt;
     out.image_count = static_cast<uint32_t>(static_cast<VkSwapchainObj&>(sc).views.size());
-    out.msaa_samples = 1;
+    /* 实际生效值：设备建的时候按 desc.msaa_samples 选过档，这里如实报。 */
+    out.msaa_samples = static_cast<VkSwapchainObj&>(sc).dev
+                           ? static_cast<VkDeviceObj*>(static_cast<VkSwapchainObj&>(sc).dev)->msaa
+                           : 1;
     out.present_paces_frames = (sc.sc_flags & BGPU_DEVICE_VSYNC) ? 1 : 0;
+}
+
+/* MSAA 颜色 companion：与目标同尺寸、同格式、N 采样，只当颜色附件。
+ * 尺寸/格式/采样数变了就重建（交换链 resize 会走到这里）。 */
+bool VkBackend::ensureMsaa(VkTextureObj& t, VkDeviceObj& d) {
+    if (d.msaa < 2) return false;
+    if (t.msaa_image && t.msaa_samples == d.msaa && t.msaa_w == t.w && t.msaa_h == t.h &&
+        t.msaa_fmt == t.vfmt) {
+        return true;
+    }
+    if (t.msaa_view) {
+        g_vk.vkDestroyImageView(d.dev, t.msaa_view, nullptr);
+        t.msaa_view = VK_NULL_HANDLE;
+    }
+    if (t.msaa_image) {
+        g_vk.vkDestroyImage(d.dev, t.msaa_image, nullptr);
+        t.msaa_image = VK_NULL_HANDLE;
+    }
+    if (t.msaa_mem) {
+        g_vk.vkFreeMemory(d.dev, t.msaa_mem, nullptr);
+        t.msaa_mem = VK_NULL_HANDLE;
+    }
+    t.msaa_samples = 0;
+    t.msaa_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = t.vfmt;
+    ici.extent = {t.w, t.h, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = toVkSamples(d.msaa);
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (g_vk.vkCreateImage(d.dev, &ici, nullptr, &t.msaa_image) != VK_SUCCESS) {
+        if (trace2()) std::fprintf(stderr, "[vk] MSAA companion 建图失败 %ux%u\n", t.w, t.h);
+        return false;
+    }
+    VkMemoryRequirements req{};
+    g_vk.vkGetImageMemoryRequirements(d.dev, t.msaa_image, &req);
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = pickMemoryType(d.phys, req.memoryTypeBits, 0);
+    if (g_vk.vkAllocateMemory(d.dev, &mai, nullptr, &t.msaa_mem) != VK_SUCCESS) return false;
+    if (g_vk.vkBindImageMemory(d.dev, t.msaa_image, t.msaa_mem, 0) != VK_SUCCESS) return false;
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = t.msaa_image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = t.vfmt;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (g_vk.vkCreateImageView(d.dev, &vci, nullptr, &t.msaa_view) != VK_SUCCESS) return false;
+    t.msaa_samples = d.msaa;
+    t.msaa_w = t.w;
+    t.msaa_h = t.h;
+    t.msaa_fmt = t.vfmt;
+    return true;
+}
+
+/* companion 的布局迁移（它只有颜色附件 / 传输两种用途，比 transitionImpl 简单）。 */
+void VkBackend::transitionMsaa(VkCmdObj& c, VkTextureObj& t, VkImageLayout want) {
+    if (t.msaa_layout == want || t.msaa_image == VK_NULL_HANDLE) return;
+    VkImageMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.oldLayout = t.msaa_layout;
+    b.newLayout = want;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = t.msaa_image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (want == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask =
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dst_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    } else if (want == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else {
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    if (t.msaa_layout == VK_IMAGE_LAYOUT_UNDEFINED) b.srcAccessMask = 0;
+    g_vk.vkCmdPipelineBarrier(c.cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    t.msaa_layout = want;
 }
 
 BgpuResult VkBackend::frameBegin(Swapchain& sc_, Cmd& cmd, BgpuTexture* out) {
@@ -2173,6 +2438,14 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "命令缓冲开始记录失败");
     }
     c.color_fmt = t.vfmt;
+    /* 0.14：设备开了 MSAA 时，所有颜色目标（画布 / 图层 / 离屏）都走"多采样附件 +
+     * pass 末 resolve 回单采样"这一条路。默认 msaa == 1 时 use_msaa 恒 false，
+     * 下面的命令与 0.13.0 逐字节相同。 */
+    const bool use_msaa = d.msaa >= 2 && !t.is_depth;
+    if (use_msaa && !ensureMsaa(t, d)) {
+        cmd.inRender = false;
+        return fail(BGPU_ERR_OUT_OF_MEMORY, __FILE__, __LINE__, "MSAA 颜色附件创建失败");
+    }
     VkImageView depth_view = VK_NULL_HANDLE;
     c.depth_fmt = VK_FORMAT_UNDEFINED;
     if (depth) {
@@ -2180,10 +2453,40 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
         c.depth_fmt = dt.vfmt;
         depth_view = dt.view;
     }
-    if (transitionImpl(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, /*force=*/true) !=
-        BGPU_OK) {
-        cmd.inRender = false;
-        return BGPU_ERR_BACKEND_FAILED;
+    if (use_msaa) {
+        /* LOAD 的 pass 必须先从**单采样镜像**把已有内容搬进多采样附件 —— 上一趟
+         * 结束时内容已经 resolve 到单采样镜像里，多采样附件本身不保留它。
+         * （没有 CLEAR 又没有历史内容的帧这里搬的是未定义数据，与不用 MSAA 时
+         *  loadOp=LOAD 的语义一致。） */
+        if (!(desc.flags & BGPU_RENDER_CLEAR_COLOR)) {
+            if (transitionImpl(c, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, /*force=*/false) !=
+                BGPU_OK) {
+                cmd.inRender = false;
+                return BGPU_ERR_BACKEND_FAILED;
+            }
+            transitionMsaa(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[1] = {static_cast<int32_t>(t.w), static_cast<int32_t>(t.h), 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.dstOffsets[1] = {static_cast<int32_t>(t.w), static_cast<int32_t>(t.h), 1};
+            g_vk.vkCmdBlitImage(c.cb, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.msaa_image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        }
+        if (transitionImpl(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, /*force=*/true) !=
+            BGPU_OK) {
+            cmd.inRender = false;
+            return BGPU_ERR_BACKEND_FAILED;
+        }
+        transitionMsaa(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        c.samples = toVkSamples(d.msaa);
+    } else {
+        if (transitionImpl(c, t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, /*force=*/true) !=
+            BGPU_OK) {
+            cmd.inRender = false;
+            return BGPU_ERR_BACKEND_FAILED;
+        }
+        c.samples = VK_SAMPLE_COUNT_1_BIT;
     }
     if (depth) {
         transition(c, static_cast<VkTextureObj&>(*depth), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
@@ -2191,8 +2494,15 @@ BgpuResult VkBackend::beginRender(Cmd& cmd, Texture& target, Texture* depth,
 
     VkRenderingAttachmentInfo color_att{};
     color_att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_att.imageView = t.view;
+    color_att.imageView = use_msaa ? t.msaa_view : t.view;
     color_att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (use_msaa) {
+        /* 动态渲染的 resolve：vkCmdEndRendering 时自动把 N 个样本平均进单采样镜像。
+         * 之后 frame_read / 采样 / 下一次 LOAD 看到的都是单采样结果。 */
+        color_att.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        color_att.resolveImageView = t.view;
+        color_att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
     color_att.loadOp = (desc.flags & BGPU_RENDER_CLEAR_COLOR) ? VK_ATTACHMENT_LOAD_OP_CLEAR
                                                               : VK_ATTACHMENT_LOAD_OP_LOAD;
     color_att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2369,6 +2679,8 @@ BgpuResult VkBackend::prepareDepth(Texture& depth, Texture& target,
     VkDeviceObj& d = static_cast<VkDeviceObj&>(*lookupObject(depth.device, kObjDevice));
     dt.is_depth = true;
     dt.vfmt = VK_FORMAT_D32_SFLOAT;
+    /* 深度附件必须与颜色附件同样的采样数：设备开了 MSAA 就按同一个档建。 */
+    dt.samples = d.msaa >= 2 ? d.msaa : 1;
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ici.imageType = VK_IMAGE_TYPE_2D;
@@ -2376,7 +2688,7 @@ BgpuResult VkBackend::prepareDepth(Texture& depth, Texture& target,
     ici.extent = {dt.w, dt.h, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.samples = toVkSamples(dt.samples);
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -2418,7 +2730,7 @@ BgpuResult VkBackend::rasterQuads(Cmd& cmd, const BgpuVertex* verts, uint32_t qu
     }
     VkTextureObj& target = static_cast<VkTextureObj&>(*c.target);
 
-    VkPipeline pipe = pipelineFor(p, d, target.vfmt, c.depth_fmt);
+    VkPipeline pipe = pipelineFor(p, d, target.vfmt, c.depth_fmt, c.samples);
     if (pipe == VK_NULL_HANDLE) {
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "管线创建失败");
     }
@@ -2522,7 +2834,7 @@ BgpuResult VkBackend::rasterShapes(Cmd& cmd, const BgpuShapeVertex* verts,
     }
     VkTextureObj& target = static_cast<VkTextureObj&>(*c.target);
 
-    VkPipeline pipe = pipelineFor(p, d, target.vfmt, c.depth_fmt);
+    VkPipeline pipe = pipelineFor(p, d, target.vfmt, c.depth_fmt, c.samples);
     if (pipe == VK_NULL_HANDLE) {
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "管线创建失败");
     }
@@ -2581,7 +2893,7 @@ BgpuResult VkBackend::rasterIndexed(Cmd& cmd, Buffer& vb, uint32_t vertex_offset
         return fail(BGPU_ERR_STATE, __FILE__, __LINE__, "draw 时不在渲染里");
     }
     VkTextureObj& target = static_cast<VkTextureObj&>(*c.target);
-    VkPipeline pipe = pipelineFor(p, d, target.vfmt, c.depth_fmt);
+    VkPipeline pipe = pipelineFor(p, d, target.vfmt, c.depth_fmt, c.samples);
     if (pipe == VK_NULL_HANDLE) {
         return fail(BGPU_ERR_BACKEND_FAILED, __FILE__, __LINE__, "管线创建失败");
     }

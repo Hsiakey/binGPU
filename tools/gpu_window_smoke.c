@@ -6,7 +6,11 @@
  * 跑一遍，所以给它一个固定的位置。
  *
  * 用法（make smoke 会把三个后端各跑一遍）：
- *     build-mingw/bin/gpu_window_smoke vk | d3d11 | gl
+ *     build-mingw/bin/gpu_window_smoke vk | d3d11 | gl [msaa]
+ *
+ * 第三个参数是 MSAA 档（1/4/8，省略 = 设备默认 1×）。窗口路径的 MSAA 是
+ * "多采样附件 → pass 末 resolve 到交换链图像"，与 HEADLESS 那条是两段实现，
+ * 所以开档之后也要手动跑一次（D3D11 不支持，会自己降级为 1×）。
  *
  * 判据（三个后端必须给出同一组数字）：
  *   · 3 帧 clear 的颜色经 present → frame_read 往返**逐字节相等**；
@@ -44,8 +48,10 @@ static BgpuBackendKind parse_kind(const char* s) {
 
 int main(int argc, char** argv) {
     const BgpuBackendKind kind = parse_kind(argc > 1 ? argv[1] : NULL);
-    printf("窗口路径烟测：%s（binGPU %s / ABI %u）\n", bingpu_backend_name(kind),
-           bingpu_version_string(), bingpu_abi_version());
+    const uint32_t want_msaa =
+        (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 10) : 0;
+    printf("窗口路径烟测：%s（binGPU %s / ABI %u，msaa 请求=%u）\n", bingpu_backend_name(kind),
+           bingpu_version_string(), bingpu_abi_version(), want_msaa ? want_msaa : 1);
     if (!bingpu_backend_available(kind)) {
         printf("跳过：这台机器没有可用的 %s 后端\n", bingpu_backend_name(kind));
         return 0;
@@ -78,6 +84,7 @@ int main(int argc, char** argv) {
     dd.width = 480;
     dd.height = 320;
     dd.flags = BGPU_DEVICE_VSYNC;
+    dd.msaa_samples = want_msaa;
     BgpuDevice dev = BGPU_INVALID;
     CHECK(bingpu_device_create(&dd, &dev) == BGPU_OK, "device_create(窗口)");
     if (g_fail) return 1;
@@ -98,8 +105,8 @@ int main(int argc, char** argv) {
     memset(&si, 0, sizeof(si));
     si.struct_size = (uint32_t)sizeof(si);
     CHECK(bingpu_swapchain_info(sc, &si) == BGPU_OK, "swapchain_info");
-    printf("  交换链 %ux%u 图数=%u present_paces=%u\n", si.width, si.height, si.image_count,
-           si.present_paces_frames);
+    printf("  交换链 %ux%u 图数=%u msaa=%u present_paces=%u\n", si.width, si.height,
+           si.image_count, si.msaa_samples, si.present_paces_frames);
 
     BgpuPipelineDesc pd;
     memset(&pd, 0, sizeof(pd));

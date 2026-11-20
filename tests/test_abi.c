@@ -84,7 +84,7 @@ static void test_version(void) {
      * 枚举值全部是追加，旧二进制调用方不受影响。
      *   ABI 4 = 0.12.0 追加 BGPU_VERTEX_SHAPE / BgpuShapeVertex / BGPU_PIPE_SHAPE /
      *           BGPU_CAP_SHAPE / bingpu_cmd_draw_shapes。既有结构体与签名未动。 */
-    CHECK_EQ(BINGPU_ABI_VERSION, 4u);
+    CHECK_EQ(BINGPU_ABI_VERSION, 5u);
     /* 结构体布局是 ABI 的一部分（头里也 static_assert 了，这里再钉一次） */
     CHECK_EQ(sizeof(BgpuVertex), 24u);
     CHECK_EQ(sizeof(BgpuMeshVertex), 40u);
