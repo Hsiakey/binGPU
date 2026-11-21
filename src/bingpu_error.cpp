@@ -223,12 +223,11 @@ int backendAvailable(BgpuBackendKind kind) noexcept {
  * 逐后端（对应 docs/backends.md "质量档"一节）：
  *   · VULKAN → 4：18 页对 docs/pixels 基线 0 像素差异（最大通道差 ≤7），
  *                真 mip + 多目标 MSAA 都在 0.15.0 修通；
- *   · GL     → 1：**窗口**路径 4× 还会丢内容，见 docs/backends.md **欠账 12**
- *                （circle 94.6% / max 255、shadow 95.9%、svg-filter 9.1%，同页 1×
- *                都是 0；照搬 VK 的延迟释放无改善 ⇒ 是 GL multisample FBO /
- *                glBlitFramebuffer resolve 这条链自己的问题）。headless 用例在 GL 上
- *                4× 是逐像素对的，但调用方要的是窗口，所以这里不给 4 —— 等欠账 12
- *                补上窗口用例再放开，那之前上层不许自己偷偷开（那正是要消掉的钉子）;
+ *   · GL     → 1：4× 在"**离屏纹理目标**（画进去，之后被当采样源）"这条路上还会丢内容，
+ *                见 docs/backends.md **欠账 12**（circle 94.558% / max 255、shadow 95.898%，
+ *                同页 1× 与 VK 4× 都是 0）。2026-11-21 重测把范围从"窗口"收窄到这条：
+ *                headless 同样复现，关掉延迟 resolve / 显式 resolve 都不改善，而"直接画进
+ *                交换链目标"的 4× 是逐像素对的。上层不许自己偷偷开 4×（那正是要消掉的钉子）;
  *   · D3D11  → 1：D3D11 后端的 MSAA 还没做（欠账 3），caps 也报 1，不谎报；
  *   · CPU / NULL / 一个都不可用 → 1：参考实现恒等于 1。
  *

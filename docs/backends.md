@@ -276,7 +276,7 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
 | 后端 | `plan.msaa_samples` | 理由 |
 |---|---|---|
 | `BGPU_BACKEND_VULKAN` | **4** | 18 页对 `binUI/docs/pixels` 基线 0 像素差异（最大通道差 ≤7），多目标 MSAA 与真 mip 都在 0.15.0 修通 |
-| `BGPU_BACKEND_GL` | **1** | **窗口**路径 4× 还会丢内容，见下面欠账 12（照搬 VK 的延迟释放无改善）；headless 用例在 GL 上 4× 是逐像素对的，等窗口用例补上再放开 |
+| `BGPU_BACKEND_GL` | **1** | 4× 在"离屏纹理目标（画完再被采样）"这条路上还会丢内容，见欠账 12；**2026-11-21 重测：不是窗口特有，headless 同样复现**；直接画进交换链目标的 4× 是逐像素对的 |
 | `BGPU_BACKEND_D3D11` | 1 | D3D11 后端的 MSAA 还没做（欠账 3），caps 也报 1，不谎报 |
 | `BGPU_BACKEND_CPU` / `NULL` / 一个都不可用 | 1 | 参考实现恒为 1 |
 
@@ -350,8 +350,9 @@ framebuffer 的一个挂点。按 [`layering.md`](layering.md) §4 的推论，�
   `GlTextureObj::msaa_pending` 置上，等被采样（`ensureSampleResolved`）、回读
   （`texture_read` / `frame_read`）、呈现（`presentFrame`）或显式
   `bingpu_cmd_resolve_target` 时再 blit（GL 是即时执行，补完把 FBO 绑回当前目标即可）。
-  **注意**：GL 的 4× **窗口**路径仍受欠账 12 限制（`render_plan` 对 GL 只给 1×），
-  这条延迟机制只是让"显式要 4× 的调用方"也拿到同样的语义，不改变欠账 12 的判断。
+- **注意**：GL 的 4× 仍受欠账 12 限制（`render_plan` 对 GL 只给 1×）。这条延迟机制
+  只是让"显式要 4× 的调用方"也拿到同样的语义，不改变欠账 12 的判断 —— 2026-11-21 的重测还把
+  它的范围从"窗口路径"收窄到了"**离屏纹理目标 + 之后被采样**"（见欠账 12）。
 - 代价与 VK 同量级；默认档走的是原来的单采样 FBO / 单级 `glTexImage2D`，没有额外对象。
 
 ### 延迟 resolve（0.16.0 / ABI 6）：消掉"每进出一次目标就 1×→4× blit + resolve"的往返
@@ -516,14 +517,36 @@ present/状态那 300 行相当，不需要命令缓冲模拟（`contracts.md` �
     1.06–1.16 ms/帧，差在噪声内。
     **GL 后端还有同一形状的欠账**（记在下面第 12 条），所以 binUI 的 `binui_gpu` 只对
     VK 放开 4×，GL 继续钉 1×。
-12. **GL 后端的 MSAA 在窗口路径上还会丢内容**（0.15.0 记录，未修）：`binGPU` 的 headless
-    用例（`tests/gpu_parity.h`，含帧中多目标 / 两趟 + 中途采样 / 帧中销毁目标）在 GL 上
-    与 VK 逐像素一致（0 差异），但 binUI 的窗口路径在 4× 下与基线还对不上 ——
-    `circle` 94.6%、`shadow` 95.9%、`svg-filter` 9.1%（同一页 1× 是 0）。
-    VK 已修的"帧中途销毁"在 GL 上做同样处理（延迟删除）**没有改善**，说明是 GL
-    multisample FBO / `glBlitFramebuffer` resolve 这条链自己的问题（多目标 + 窗口默认
-    帧缓冲的组合）。修它要先补一条**窗口路径**的 GL 用例（现在的 headless 用例覆盖不到），
-    再按 VK 的同一份判据验收。
+12. **GL 后端的 MSAA 在"离屏纹理目标"上还会丢内容**（0.15.0 记录；2026-11-21 重测，
+    范围收窄、仍未修）：4× 下**画进一张离屏纹理、之后再把这张纹理当采样源**这条路，
+    1× 镜像拿到的内容是空的。
+    - **不是窗口特有**：bin2d 的 GPU 执行体本来就是 headless（`BINUI2D_GPU=1` + `bin2d_shot`），
+      照样复现；`BINGPU_NO_AUTO_DEFER=1`（关自动延迟 resolve）与显式
+      `bingpu_cmd_resolve_target()` 都不改变结果 ⇒ 与"延迟 resolve 的时机"无关。
+    - **不是多采样渲染本身**：同一台机器上把纹理四边形 / SDF 形状**直接画进交换链目标**的
+      4× 与 VK 逐像素一致（0 差异）。
+    - 归因表（2026-11-21 实测；出图用 `bin2D/build-mingw/tmp/bin2d_shot_gl.exe`，
+      对拍用 `binUI/build-mingw/bin/pixel_diff.exe` 对 `docs/pixels`，容差 0.5%）：
+
+      | 场景 | GL 1× | GL 4× | VK 4× |
+      |---|---|---|---|
+      | `circle`（420×140） | 0.000% / max 0 | **94.558% / max 255** | 0.000% / max 0 |
+      | `shadow`（640×400） | 0.002% / max 9 | **95.898% / max 255** | 0.000% / max 7 |
+      | 最小复现（256×256：图层纹理 + 8 笔带裁剪的纹理四边形 → 采样合成） | 0 | **94.40%** | 0 |
+
+    - **分段结论：三段里坏在第二段。** ① 渲染：8 笔 draw 都落在正确的 `msaa_fbo` 上
+      （viewport / scissor 420×140 正确、逐笔 `glGetError()==0`）；② resolve：
+      `glBlitFramebuffer(… GL_COLOR_BUFFER_BIT, GL_NEAREST)` 也返回无错，源 rb 实测
+      420×140 / 4 采样、目标 fbo 就是该纹理；③ 但**解析之后 1× 纹理读回全 0**
+      （`bingpu_texture_read` 与直接 `glReadPixels` 都是 0）。同一段在"目标是交换链目标、
+      且不再被采样"时是正常的。
+    - 最小复现的通道差是 **R252 G252 B128 A0** —— alpha 完全一致、只有 RGB 丢；
+      与"图层的 1× 镜像为空 → 合成趟乘出 0"一致（最终整页透明）。
+    - 结论：**GL 继续钉 1×**（`msaaFor()` 本来就只给 1×，不存在"plan 选 4× 但实际坏"的
+      中间态）。复现物留在 gitignored 目录：`binGPU/build-mingw/tmp/gl_msaa_probe.cpp`
+      （binGPU 级最小复现）+ `BIN2D_BGPU_BACKEND=gl BIN2D_BGPU_MSAA=4`（bin2d 级，见 bin2D 的
+      CHANGELOG）。谁要接手：先把"图层纹理 + 采样"这条 GL 用例补进 `tests/gpu_parity.h`
+      （现在只有 headless 交换链 / 直接目标，覆盖不到这条），再按 VK 的同一份判据验收。
 13. **D3D11 的延迟 resolve**：这一版**明确不做**。D3D11 没有 MSAA（欠账 3），
     `BGPU_RENDER_DEFER_RESOLVE` 对它是 no-op，`bingpu_cmd_resolve_target` 走
     `Backend::resolveTarget` 的默认实现（直接 `BGPU_OK`）—— "没有多采样就没有挂起的

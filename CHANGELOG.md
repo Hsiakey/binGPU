@@ -4,6 +4,34 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。`ABI` 指的是 `BINGPU_ABI_VERSION`
 （结构体布局 / 函数签名 / 枚举值一变就 +1，与语义化版本无关）。
 
+## [未发布] - 2026-11-21 【ABI 6 不变】
+
+**C1：把"GL 窗口路径 4× MSAA 坏"这件事量清楚、钉死成结论（不改后端代码）。**
+
+结论先说：**GL 继续 1×，`msaaFor()` 一个字没动** —— 它本来就只给 GL 1×，所以不存在
+"plan 选了 4× 但实际坏"的中间态。这一条真正修掉的是**归因**：欠账 12 原来记的是
+"窗口路径丢内容"，实测证明**与窗口无关**，范围收窄到"**离屏纹理目标 + 之后被采样**"。
+
+三条轴逐个否掉：
+
+- **不是窗口特有**：bin2d 的 GPU 执行体（`BINUI2D_GPU=1` + `bin2d_shot`，纯 headless）
+  4× 下照样复现；`circle` 94.558% / max 255、`shadow` 95.898%，同页 1× 是 0.000% / 0.002%，
+  VK 4× 是 0.000% / max 7。
+- **不是延迟 resolve 的时机**：`BINGPU_NO_AUTO_DEFER=1` 与显式
+  `bingpu_cmd_resolve_target()` 结果一字不差。
+- **不是多采样渲染本身**：同一台机器上把纹理四边形 / SDF 形状**直接画进交换链目标**的
+  4×，GL 与 VK 逐像素一致（0 差异）。
+
+分段（渲染 → resolve → 回读）坏在**第二段**：① 8 笔 draw 都落在正确的 `msaa_fbo` 上
+（viewport/scissor 420×140 正确、逐笔 `glGetError()==0`）；② `glBlitFramebuffer(…,
+GL_NEAREST)` 返回无错、源 rb 实测 420×140 / 4 采样；③ 但**解析后的 1× 纹理读回全 0**
+（`bingpu_texture_read` 与直接 `glReadPixels` 都 0）。最小复现的通道差是
+**R252 G252 B128 A0** —— alpha 完全一致、只有 RGB 丢，与"1× 镜像为空、合成趟乘出 0"一致。
+
+复现物（都不入库）：`build-mingw/tmp/gl_msaa_probe.cpp`（binGPU 级最小复现，256×256 图层
++ 纹理 + 采样合成，94.40%）；bin2d 级用 `BIN2D_BGPU_BACKEND=gl BIN2D_BGPU_MSAA=4`
+（见 bin2D 的 CHANGELOG）。完整归因表写进 `docs/backends.md` 欠账 12。
+
 ## [0.16.0] - 2026-11-21 【ABI 5 → 6】
 
 **消掉"每进出一次目标就 1×→4× 回灌 + pass 末 resolve"的往返。** 触发场景是 binUI 的
